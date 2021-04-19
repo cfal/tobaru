@@ -62,14 +62,7 @@ async fn process_stream(
             Box::new(target_stream)
         };
 
-    let (src_to_dest_bytes, dest_to_src_bytes) =
-        copy_bidirectional::copy_bidirectional(&mut stream, &mut target_stream, 8192).await?;
-    debug!(
-        "Copied: {} bytes to source, {} bytes to dest",
-        dest_to_src_bytes, src_to_dest_bytes
-    );
-
-    Ok(())
+    copy_bidirectional::copy_bidirectional(&mut stream, &mut target_stream, 8192).await
 }
 
 struct TargetData {

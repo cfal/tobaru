@@ -14,7 +14,6 @@ struct CopyBuffer {
     read_done: bool,
     pos: usize,
     cap: usize,
-    amt: u64,
     buf: Box<[u8]>,
 }
 
@@ -24,7 +23,6 @@ impl CopyBuffer {
             read_done: false,
             pos: 0,
             cap: 0,
-            amt: 0,
             buf: vec![0; size].into_boxed_slice(),
         }
     }
@@ -34,7 +32,7 @@ impl CopyBuffer {
         cx: &mut Context<'_>,
         mut reader: Pin<&mut R>,
         mut writer: Pin<&mut W>,
-    ) -> Poll<io::Result<u64>>
+    ) -> Poll<io::Result<()>>
     where
         R: AsyncRead + ?Sized,
         W: AsyncWrite + ?Sized,
@@ -66,7 +64,6 @@ impl CopyBuffer {
                     )));
                 } else {
                     self.pos += i;
-                    self.amt += i as u64;
                 }
             }
 
@@ -74,7 +71,7 @@ impl CopyBuffer {
             // data and finish the transfer.
             if self.pos == self.cap && self.read_done {
                 ready!(writer.as_mut().poll_flush(cx))?;
-                return Poll::Ready(Ok(self.amt));
+                return Poll::Ready(Ok(()));
             }
         }
     }
@@ -82,8 +79,8 @@ impl CopyBuffer {
 
 enum TransferState {
     Running(CopyBuffer),
-    ShuttingDown(u64),
-    Done(u64),
+    ShuttingDown,
+    Done,
 }
 
 struct CopyBidirectional<'a, A: ?Sized, B: ?Sized> {
@@ -98,7 +95,7 @@ fn transfer_one_direction<A, B>(
     state: &mut TransferState,
     r: &mut A,
     w: &mut B,
-) -> Poll<io::Result<u64>>
+) -> Poll<io::Result<()>>
 where
     A: AsyncRead + AsyncWrite + Unpin + ?Sized,
     B: AsyncRead + AsyncWrite + Unpin + ?Sized,
@@ -109,15 +106,15 @@ where
     loop {
         match state {
             TransferState::Running(buf) => {
-                let count = ready!(buf.poll_copy(cx, r.as_mut(), w.as_mut()))?;
-                *state = TransferState::ShuttingDown(count);
+                ready!(buf.poll_copy(cx, r.as_mut(), w.as_mut()))?;
+                *state = TransferState::ShuttingDown;
             }
-            TransferState::ShuttingDown(count) => {
+            TransferState::ShuttingDown => {
                 ready!(w.as_mut().poll_shutdown(cx))?;
 
-                *state = TransferState::Done(*count);
+                *state = TransferState::Done;
             }
-            TransferState::Done(count) => return Poll::Ready(Ok(*count)),
+            TransferState::Done => return Poll::Ready(Ok(())),
         }
     }
 }
@@ -127,7 +124,7 @@ where
     A: AsyncRead + AsyncWrite + Unpin + ?Sized,
     B: AsyncRead + AsyncWrite + Unpin + ?Sized,
 {
-    type Output = io::Result<(u64, u64)>;
+    type Output = io::Result<()>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // Unpack self into mut refs to each field to avoid borrow check issues.
@@ -142,11 +139,11 @@ where
         let b_to_a = transfer_one_direction(cx, b_to_a, &mut *b, &mut *a)?;
 
         // It is not a problem if ready! returns early because transfer_one_direction for the
-        // other direction will keep returning TransferState::Done(count) in future calls to poll
-        let a_to_b = ready!(a_to_b);
-        let b_to_a = ready!(b_to_a);
+        // other direction will keep returning TransferState::Done in future calls to poll
+        ready!(a_to_b);
+        ready!(b_to_a);
 
-        Poll::Ready(Ok((a_to_b, b_to_a)))
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -181,7 +178,7 @@ pub async fn copy_bidirectional<A, B>(
     a: &mut A,
     b: &mut B,
     buffer_size: usize,
-) -> Result<(u64, u64), std::io::Error>
+) -> Result<(), std::io::Error>
 where
     A: AsyncRead + AsyncWrite + Unpin + ?Sized,
     B: AsyncRead + AsyncWrite + Unpin + ?Sized,
