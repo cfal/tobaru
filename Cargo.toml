@@ -1,0 +1,19 @@
+[package]
+name = "tobaru"
+version = "0.1.0"
+edition = "2018"
+
+[dependencies]
+env_logger = "*"
+ipnet = "*"
+json = "*"
+log = "*"
+tokio = { version = "*", features = ["io-util", "macros", "net", "rt-multi-thread"] }
+native-tls = "*"
+openssl = "*"
+tokio-native-tls = "*"
+treebitmap = "*"
+
+[profile.release]
+opt-level = 3
+lto = true
