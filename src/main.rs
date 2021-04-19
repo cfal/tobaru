@@ -10,7 +10,7 @@ use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use log::{debug, error, info, warn};
+use log::{debug, error, warn};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::Builder;
@@ -51,7 +51,7 @@ async fn process_stream(
     };
 
     debug!(
-        "Forwarding: {} -> {}:{}",
+        "Forwarding: {} to {}:{}",
         addr.ip(),
         &target_address.address,
         &target_address.port
@@ -175,12 +175,16 @@ async fn run(server_config: ServerConfig) -> std::io::Result<()> {
             Some((_, _, d)) => d.clone(),
             None => {
                 // Not allowed.
-                info!("Unknown address, not allowing: {}", addr.ip());
+                warn!("Unknown address, not allowing: {}", addr.ip());
                 continue;
             }
         };
 
-        tokio::spawn(async move { process_stream(stream, addr, target_data).await });
+        tokio::spawn(async move {
+            if let Err(e) = process_stream(stream, addr, target_data).await {
+                error!("Finished with error: {:?}", e);
+            }
+        });
     }
 }
 
