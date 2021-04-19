@@ -16,6 +16,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::Builder;
 use treebitmap::IpLookupTable;
 
+const BUFFER_SIZE: usize = 8192;
+
 trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send {}
 
 impl AsyncStream for TcpStream {}
@@ -62,7 +64,7 @@ async fn process_stream(
             Box::new(target_stream)
         };
 
-    copy_bidirectional::copy_bidirectional(&mut stream, &mut target_stream, 8192).await
+    copy_bidirectional::copy_bidirectional(&mut stream, &mut target_stream, BUFFER_SIZE).await
 }
 
 struct TargetData {
