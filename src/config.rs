@@ -201,6 +201,10 @@ fn parse_target_object(
             .collect()
     };
 
+    if target_addresses.is_empty() {
+        panic!("No target addresses specified.");
+    }
+
     let allowlist = match obj["allowlist"].take() {
         JsonValue::String(s) => lookup_ip_mask(&s, ip_groups),
         JsonValue::Short(s) => lookup_ip_mask(s.as_str(), ip_groups),
