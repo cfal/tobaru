@@ -1,4 +1,5 @@
-use std::io::{Error, ErrorKind, Read};
+use std::fs::File;
+use std::io::{Error, ErrorKind, Read, Result};
 
 use native_tls::Identity;
 use openssl::pkcs12::Pkcs12;
@@ -6,12 +7,12 @@ use openssl::pkey::PKey;
 use openssl::stack::Stack;
 use openssl::x509::X509;
 
-pub fn create_identity(cert_path: &str, key_path: &str) -> std::io::Result<Identity> {
-    let mut cert_file = std::fs::File::open(cert_path)?;
+pub fn create_identity(cert_path: &str, key_path: &str) -> Result<Identity> {
+    let mut cert_file = File::open(cert_path)?;
     let mut cert_bytes = vec![];
     cert_file.read_to_end(&mut cert_bytes)?;
 
-    let mut key_file = std::fs::File::open(key_path)?;
+    let mut key_file = File::open(key_path)?;
     let mut key_bytes = vec![];
     key_file.read_to_end(&mut key_bytes)?;
 
