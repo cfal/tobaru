@@ -24,7 +24,7 @@ impl AsyncStream for tokio_native_tls::TlsStream<TcpStream> {}
 
 async fn process_stream(
     stream: TcpStream,
-    _addr: std::net::SocketAddr,
+    addr: std::net::SocketAddr,
     target_data: Arc<TargetData>,
 ) -> std::io::Result<()> {
     // TODO: do both accept() and connect() at the same time to speed things up?
@@ -47,6 +47,8 @@ async fn process_stream(
     } else {
         &target_data.address_data[0]
     };
+
+    debug!("Forwarding: {} -> {}", addr.ip(), &target_address.address);
 
     let target_stream = TcpStream::connect(&target_address.address).await?;
     let mut target_stream: Box<dyn AsyncStream> =
