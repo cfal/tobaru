@@ -10,7 +10,7 @@ use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use log::{debug, error, warn};
+use log::{debug, error, info, warn};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::Builder;
@@ -155,7 +155,7 @@ async fn run(server_config: ServerConfig) -> std::io::Result<()> {
     }
 
     let listener = TcpListener::bind(server_address).await.unwrap();
-    debug!("Now listening: {}", listener.local_addr().unwrap());
+    info!("Listening: {}", listener.local_addr().unwrap());
 
     loop {
         let (stream, addr) = match listener.accept().await {
