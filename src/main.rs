@@ -1,6 +1,7 @@
 #![feature(available_concurrency)]
 
 mod config;
+mod copy_bidirectional;
 mod native_tls_util;
 
 use config::ServerConfig;
@@ -59,10 +60,8 @@ async fn process_stream(
             Box::new(target_stream)
         };
 
-    // TODO: tokio::io::copy (which copy_bidirectional relies on) uses a 2048 byte buffer, switch to a
-    // larger buffer.
     let (src_to_dest_bytes, dest_to_src_bytes) =
-        tokio::io::copy_bidirectional(&mut stream, &mut target_stream).await?;
+        copy_bidirectional::copy_bidirectional(&mut stream, &mut target_stream, 8192).await?;
     debug!(
         "Copied: {} bytes to source, {} bytes to dest",
         dest_to_src_bytes, src_to_dest_bytes
@@ -206,7 +205,6 @@ fn main() {
 
     let runtime = Builder::new_multi_thread()
         .worker_threads(num_threads)
-        .thread_stack_size(512000)
         .enable_io()
         .build()
         .expect("Could not build tokio runtime");

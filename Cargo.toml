@@ -5,6 +5,7 @@ edition = "2018"
 
 [dependencies]
 env_logger = "*"
+futures-core = "*"
 ipnet = "*"
 json = "*"
 log = "*"

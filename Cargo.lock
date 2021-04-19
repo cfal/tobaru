@@ -97,6 +97,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "00b0228411908ca8685dba7fc2cdd70ec9990a6e753e89b6ac91a84c40fbaf4b"
 
 [[package]]
+name = "futures-core"
+version = "0.3.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "098cd1c6dda6ca01650f1a37a794245eb73181d0d4d4e955e2f3c37db7af1815"
+
+[[package]]
 name = "getrandom"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -442,6 +448,7 @@ name = "tobaru"
 version = "0.1.0"
 dependencies = [
  "env_logger",
+ "futures-core",
  "ipnet",
  "json",
  "log",
