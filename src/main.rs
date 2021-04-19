@@ -50,13 +50,19 @@ async fn process_stream(
         &target_data.address_data[0]
     };
 
-    debug!("Forwarding: {} -> {}", addr.ip(), &target_address.address);
+    debug!(
+        "Forwarding: {} -> {}:{}",
+        addr.ip(),
+        &target_address.address,
+        &target_address.port
+    );
 
-    let target_stream = TcpStream::connect(&target_address.address).await?;
+    let target_stream =
+        TcpStream::connect((target_address.address.as_str(), target_address.port)).await?;
     let mut target_stream: Box<dyn AsyncStream> =
         if let Some(ref connector) = target_address.tls_connector {
             let tls_stream = connector
-                .connect("yahoo.com", target_stream)
+                .connect(&target_address.address, target_stream)
                 .await
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
             Box::new(tls_stream)
@@ -75,6 +81,7 @@ struct TargetData {
 
 struct TargetAddressData {
     pub address: String,
+    pub port: u16,
     pub tls_connector: Option<tokio_native_tls::TlsConnector>,
 }
 
@@ -100,6 +107,7 @@ async fn run(server_config: ServerConfig) -> std::io::Result<()> {
             .map(|target_address| {
                 TargetAddressData {
                     address: target_address.address,
+                    port: target_address.port,
                     tls_connector: if target_address.tls {
                         // TODO: support different configs/certs.
                         let c = native_tls::TlsConnector::builder()

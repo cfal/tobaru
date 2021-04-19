@@ -22,6 +22,7 @@ pub struct TargetAddress {
     // it could be updated without restarting the process depending on
     // the system's DNS settings.
     pub address: String,
+    pub port: u16,
     pub tls: bool,
 }
 
@@ -243,7 +244,10 @@ fn parse_target_address(mut obj: JsonValue) -> TargetAddress {
         TargetAddress {
             address: obj["address"]
                 .take_string()
-                .expect("Address key is not a string"),
+                .expect("Target address is not a string"),
+            port: obj["port"]
+                .as_u16()
+                .expect("Target port is not a valid number"),
             tls: obj["tls"].as_bool().unwrap_or(false),
         }
     } else if obj.is_string() {
@@ -260,7 +264,8 @@ fn parse_target_address(mut obj: JsonValue) -> TargetAddress {
         };
 
         TargetAddress {
-            address: format!("{}:{}", s, port_str),
+            address: s,
+            port: port_str.parse().expect("Invalid target port"),
             tls,
         }
     } else {
