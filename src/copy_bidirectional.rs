@@ -1,7 +1,7 @@
 // Forked from tokio's copy.rs and copy_bidirectional.rs in order to customize
 // the buffer size.
 
-use futures_core::ready;
+use futures_util::ready;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use std::future::Future;

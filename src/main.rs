@@ -17,6 +17,7 @@ use tokio::runtime::Builder;
 use treebitmap::IpLookupTable;
 
 const BUFFER_SIZE: usize = 8192;
+const ACCEPT_AND_CONNECT_TOGETHER: bool = true;
 
 trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send {}
 
@@ -24,22 +25,43 @@ impl AsyncStream for TcpStream {}
 
 impl AsyncStream for tokio_native_tls::TlsStream<TcpStream> {}
 
+async fn setup_source_stream(
+    stream: TcpStream,
+    tls_acceptor: &Option<tokio_native_tls::TlsAcceptor>,
+) -> std::io::Result<Box<dyn AsyncStream>> {
+    if let Some(acceptor) = tls_acceptor {
+        let tls_stream = acceptor
+            .accept(stream)
+            .await
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        Ok(Box::new(tls_stream))
+    } else {
+        Ok(Box::new(stream))
+    }
+}
+
+async fn setup_target_stream(
+    target_address: &TargetAddressData,
+) -> std::io::Result<Box<dyn AsyncStream>> {
+    let target_stream =
+        TcpStream::connect((target_address.address.as_str(), target_address.port)).await?;
+
+    if let Some(ref connector) = target_address.tls_connector {
+        let tls_stream = connector
+            .connect(&target_address.address, target_stream)
+            .await
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        Ok(Box::new(tls_stream))
+    } else {
+        Ok(Box::new(target_stream))
+    }
+}
+
 async fn process_stream(
     stream: TcpStream,
     addr: std::net::SocketAddr,
     target_data: Arc<TargetData>,
 ) -> std::io::Result<()> {
-    // TODO: do both accept() and connect() at the same time to speed things up?
-    let mut stream: Box<dyn AsyncStream> = if let Some(ref acceptor) = target_data.tls_acceptor {
-        let tls_stream = acceptor
-            .accept(stream)
-            .await
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-        Box::new(tls_stream)
-    } else {
-        Box::new(stream)
-    };
-
     let target_address = if target_data.address_data.len() > 1 {
         // fetch_add wraps around on overflow.
         let index = target_data
@@ -50,6 +72,18 @@ async fn process_stream(
         &target_data.address_data[0]
     };
 
+    let (mut source_stream, mut target_stream) = if ACCEPT_AND_CONNECT_TOGETHER {
+        futures_util::try_join!(
+            setup_source_stream(stream, &target_data.tls_acceptor),
+            setup_target_stream(&target_address)
+        )?
+    } else {
+        (
+            setup_source_stream(stream, &target_data.tls_acceptor).await?,
+            setup_target_stream(&target_address).await?,
+        )
+    };
+
     debug!(
         "Forwarding: {} to {}:{}",
         addr.ip(),
@@ -57,20 +91,8 @@ async fn process_stream(
         &target_address.port
     );
 
-    let target_stream =
-        TcpStream::connect((target_address.address.as_str(), target_address.port)).await?;
-    let mut target_stream: Box<dyn AsyncStream> =
-        if let Some(ref connector) = target_address.tls_connector {
-            let tls_stream = connector
-                .connect(&target_address.address, target_stream)
-                .await
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-            Box::new(tls_stream)
-        } else {
-            Box::new(target_stream)
-        };
-
-    copy_bidirectional::copy_bidirectional(&mut stream, &mut target_stream, BUFFER_SIZE).await
+    copy_bidirectional::copy_bidirectional(&mut source_stream, &mut target_stream, BUFFER_SIZE)
+        .await
 }
 
 struct TargetData {
