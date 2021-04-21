@@ -3,17 +3,26 @@ name = "tobaru"
 version = "0.1.0"
 edition = "2018"
 
+[features]
+default = ["tls-native"]
+tls-native = ["openssl", "tokio-native-tls", "native-tls"]
+tls-rustls = ["rustls", "tokio-rustls", "webpki"]
+
 [dependencies]
+async-trait = "*"
 env_logger = "*"
 futures-util = "*"
 ipnet = "*"
 json = "*"
 log = "*"
+native-tls = { version = "*", optional = true }
+openssl = { version = "*", optional = true }
+rustls = { version = "*", features = ["dangerous_configuration"], optional = true }
 tokio = { version = "*", features = ["io-util", "macros", "net", "rt-multi-thread"] }
-native-tls = "*"
-openssl = "*"
-tokio-native-tls = "*"
+tokio-native-tls = { version = "*", optional = true }
+tokio-rustls = { version = "*", features = ["dangerous_configuration"], optional = true }
 treebitmap = "*"
+webpki = { version = "*", optional = true }
 
 [profile.release]
 opt-level = 3
