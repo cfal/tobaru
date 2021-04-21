@@ -1,17 +1,26 @@
 #![feature(available_concurrency)]
 
+#[cfg(all(feature = "tls-native", feature = "tls-rustls"))]
+compile_error!("only one of tls-native or tls-rustls can be enabled.");
+
+mod async_tls;
 mod config;
 mod copy_bidirectional;
-mod native_tls_util;
+#[cfg(feature = "tls-native")]
+mod native_tls;
+#[cfg(feature = "tls-rustls")]
+mod rustls;
 
+use async_tls::{AsyncStream, AsyncTlsAcceptor, AsyncTlsConnector, AsyncTlsFactory};
 use config::ServerConfig;
 
+use std::fs::File;
+use std::io::Read;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use log::{debug, error, info, warn};
-use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::Builder;
 use treebitmap::IpLookupTable;
@@ -19,22 +28,23 @@ use treebitmap::IpLookupTable;
 const BUFFER_SIZE: usize = 8192;
 const ACCEPT_AND_CONNECT_TOGETHER: bool = true;
 
-trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send {}
+#[cfg(feature = "tls-native")]
+fn create_tls_factory() -> native_tls::NativeTlsFactory {
+    native_tls::NativeTlsFactory::new()
+}
 
-impl AsyncStream for TcpStream {}
-
-impl AsyncStream for tokio_native_tls::TlsStream<TcpStream> {}
+#[cfg(feature = "tls-rustls")]
+fn create_tls_factory() -> rustls::RustlsFactory {
+    rustls::RustlsFactory::new()
+}
 
 async fn setup_source_stream(
     stream: TcpStream,
-    tls_acceptor: &Option<tokio_native_tls::TlsAcceptor>,
+    tls_acceptor: &Option<Box<dyn AsyncTlsAcceptor>>,
 ) -> std::io::Result<Box<dyn AsyncStream>> {
     if let Some(acceptor) = tls_acceptor {
-        let tls_stream = acceptor
-            .accept(stream)
-            .await
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-        Ok(Box::new(tls_stream))
+        let tls_stream = acceptor.accept(stream).await?;
+        Ok(tls_stream)
     } else {
         Ok(Box::new(stream))
     }
@@ -49,9 +59,8 @@ async fn setup_target_stream(
     if let Some(ref connector) = target_address.tls_connector {
         let tls_stream = connector
             .connect(&target_address.address, target_stream)
-            .await
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-        Ok(Box::new(tls_stream))
+            .await?;
+        Ok(tls_stream)
     } else {
         Ok(Box::new(target_stream))
     }
@@ -96,7 +105,7 @@ async fn process_stream(
 }
 
 struct TargetData {
-    pub tls_acceptor: Option<tokio_native_tls::TlsAcceptor>,
+    pub tls_acceptor: Option<Box<dyn AsyncTlsAcceptor>>,
     pub address_data: Vec<TargetAddressData>,
     pub next_address_index: AtomicUsize,
 }
@@ -104,10 +113,13 @@ struct TargetData {
 struct TargetAddressData {
     pub address: String,
     pub port: u16,
-    pub tls_connector: Option<tokio_native_tls::TlsConnector>,
+    pub tls_connector: Option<Box<dyn AsyncTlsConnector>>,
 }
 
-async fn run(server_config: ServerConfig) -> std::io::Result<()> {
+async fn run(
+    server_config: ServerConfig,
+    tls_factory: Arc<dyn AsyncTlsFactory>,
+) -> std::io::Result<()> {
     let ServerConfig {
         server_address,
         target_configs,
@@ -117,8 +129,15 @@ async fn run(server_config: ServerConfig) -> std::io::Result<()> {
 
     for target_config in target_configs {
         let tls_acceptor = if let Some(cfg) = target_config.server_tls_config {
-            let identity = native_tls_util::create_identity(&cfg.cert_path, &cfg.key_path).unwrap();
-            Some(native_tls::TlsAcceptor::new(identity).unwrap().into())
+            let mut cert_file = File::open(&cfg.cert_path)?;
+            let mut cert_bytes = vec![];
+            cert_file.read_to_end(&mut cert_bytes)?;
+
+            let mut key_file = File::open(&cfg.key_path)?;
+            let mut key_bytes = vec![];
+            key_file.read_to_end(&mut key_bytes)?;
+
+            Some(tls_factory.create_acceptor(&cert_bytes, &key_bytes))
         } else {
             None
         };
@@ -126,22 +145,14 @@ async fn run(server_config: ServerConfig) -> std::io::Result<()> {
         let address_data = target_config
             .target_addresses
             .into_iter()
-            .map(|target_address| {
-                TargetAddressData {
-                    address: target_address.address,
-                    port: target_address.port,
-                    tls_connector: if target_address.tls {
-                        // TODO: support different configs/certs.
-                        let c = native_tls::TlsConnector::builder()
-                            .danger_accept_invalid_certs(true)
-                            .danger_accept_invalid_hostnames(true)
-                            .build()
-                            .unwrap();
-                        Some(c.into())
-                    } else {
-                        None
-                    },
-                }
+            .map(|target_address| TargetAddressData {
+                address: target_address.address,
+                port: target_address.port,
+                tls_connector: if target_address.tls {
+                    Some(tls_factory.create_connector())
+                } else {
+                    None
+                },
             })
             .collect();
 
@@ -213,6 +224,8 @@ async fn run(server_config: ServerConfig) -> std::io::Result<()> {
 fn main() {
     env_logger::init();
 
+    let tls_factory: Arc<dyn AsyncTlsFactory> = Arc::new(create_tls_factory());
+
     let config_paths: Vec<String> = std::env::args().skip(1).collect();
     let mut server_configs: Vec<ServerConfig> = config::load_configs(config_paths);
 
@@ -241,10 +254,12 @@ fn main() {
         .expect("Could not build tokio runtime");
 
     for server_config in server_configs {
-        runtime.spawn(async move { run(server_config).await });
+        let cloned_factory = tls_factory.clone();
+        runtime.spawn(async move { run(server_config, cloned_factory).await });
     }
 
+    let cloned_factory = tls_factory.clone();
     runtime
-        .block_on(async move { run(last_config).await })
+        .block_on(async move { run(last_config, cloned_factory).await })
         .unwrap();
 }
