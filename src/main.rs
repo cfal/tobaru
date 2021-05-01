@@ -6,6 +6,7 @@ compile_error!("only one of tls-native or tls-rustls can be enabled.");
 mod async_tls;
 mod config;
 mod copy_bidirectional;
+mod iptables_util;
 #[cfg(feature = "tls-native")]
 mod native_tls;
 #[cfg(feature = "tls-rustls")]
@@ -126,6 +127,7 @@ async fn run(
     let ServerConfig {
         server_address,
         target_configs,
+        use_iptables,
     } = server_config;
 
     let mut lookup_table = IpLookupTable::new();
@@ -186,6 +188,14 @@ async fn run(
         return Ok(());
     }
 
+    if use_iptables {
+        let ip_masks: Vec<(std::net::Ipv6Addr, u32)> = lookup_table
+            .iter()
+            .map(|(addr, masklen, _)| (addr, masklen))
+            .collect();
+        iptables_util::configure_iptables(server_address, &ip_masks);
+    }
+
     for entry in lookup_table.iter() {
         debug!("Lookup table entry: {:?} (masklen {})", &entry.0, &entry.1);
     }
@@ -229,7 +239,16 @@ fn main() {
 
     let tls_factory: Arc<dyn AsyncTlsFactory> = Arc::new(create_tls_factory());
 
-    let config_paths: Vec<String> = std::env::args().skip(1).collect();
+    let mut config_paths = vec![];
+    let mut clear_iptables_only = false;
+    for arg in std::env::args().skip(1) {
+        if arg == "--clear-iptables" {
+            clear_iptables_only = true;
+        } else {
+            config_paths.push(arg);
+        }
+    }
+
     let mut server_configs: Vec<ServerConfig> = config::load_configs(config_paths);
 
     if server_configs.is_empty() {
@@ -238,6 +257,17 @@ fn main() {
     }
 
     debug!("Loaded server configs: {:#?}", &server_configs);
+
+    for server_config in server_configs.iter() {
+        if server_config.use_iptables {
+            iptables_util::clear_iptables(server_config.server_address);
+        }
+    }
+
+    if clear_iptables_only {
+        info!("iptables cleared, exiting.");
+        return;
+    }
 
     let last_config = server_configs.pop().unwrap();
 

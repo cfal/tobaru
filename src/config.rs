@@ -2,12 +2,13 @@ use json::JsonValue;
 use log::debug;
 
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
-    pub server_address: String,
+    pub server_address: SocketAddr,
     pub target_configs: Vec<TargetConfig>,
+    pub use_iptables: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -157,7 +158,13 @@ fn parse_server_object(
     mut obj: JsonValue,
     ip_groups: &HashMap<String, Vec<IpMask>>,
 ) -> ServerConfig {
-    let server_address = obj["bindAddress"].take_string().expect("No bind address");
+    let server_address = obj["bindAddress"]
+        .take_string()
+        .expect("No bind address")
+        .to_socket_addrs()
+        .expect("Invalid bind address")
+        .next()
+        .expect("Unable to resolve bind address");
 
     let target_configs = if obj.has_key("target") {
         vec![parse_target_object(obj["target"].take(), ip_groups)]
@@ -172,9 +179,12 @@ fn parse_server_object(
             .collect()
     };
 
+    let use_iptables = obj["iptables"].as_bool().unwrap_or(false);
+
     ServerConfig {
         server_address,
         target_configs,
+        use_iptables,
     }
 }
 
