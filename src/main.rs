@@ -28,6 +28,7 @@ use treebitmap::IpLookupTable;
 
 const BUFFER_SIZE: usize = 8192;
 const ACCEPT_AND_CONNECT_TOGETHER: bool = false;
+const TARGET_SET_NODELAY: bool = false;
 
 #[cfg(feature = "tls-native")]
 fn create_tls_factory() -> native_tls::NativeTlsFactory {
@@ -57,8 +58,9 @@ async fn setup_target_stream(
     let target_stream =
         TcpStream::connect((target_address.address.as_str(), target_address.port)).await?;
 
-    // We want commands to be piped through asap in most cases.
-    target_stream.set_nodelay(true)?;
+    if TARGET_SET_NODELAY {
+        target_stream.set_nodelay(true)?;
+    }
 
     if let Some(ref connector) = target_address.tls_connector {
         let tls_stream = connector
