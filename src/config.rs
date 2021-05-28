@@ -96,6 +96,11 @@ fn load_ip_groups(obj: &mut JsonValue, ip_groups: &mut HashMap<String, Vec<IpMas
 }
 
 fn convert_ip_mask(mask_str: &str) -> IpMask {
+    if mask_str == "all" {
+        // Special string meaning all IPs should be accepted.
+        return (Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0), 0);
+    }
+
     let tokens: Vec<&str> = mask_str.split('/').collect();
     let (ip_str, mask_str) = if tokens.len() == 1 {
         (mask_str, "")
