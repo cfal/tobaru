@@ -108,7 +108,7 @@ fn convert_ip_mask(mask_str: &str) -> IpMask {
     match ip_str.parse::<Ipv6Addr>() {
         Ok(i) => {
             let masklen = if mask_str.len() == 0 {
-                32
+                128
             } else {
                 mask_str.parse().expect("Could not parse ipv6 mask")
             };
