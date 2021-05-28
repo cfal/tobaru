@@ -27,7 +27,7 @@ use tokio::runtime::Builder;
 use treebitmap::IpLookupTable;
 
 const BUFFER_SIZE: usize = 8192;
-const ACCEPT_AND_CONNECT_TOGETHER: bool = true;
+const ACCEPT_AND_CONNECT_TOGETHER: bool = false;
 
 #[cfg(feature = "tls-native")]
 fn create_tls_factory() -> native_tls::NativeTlsFactory {
