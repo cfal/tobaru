@@ -3,6 +3,7 @@
 #[cfg(all(feature = "tls-native", feature = "tls-rustls"))]
 compile_error!("only one of tls-native or tls-rustls can be enabled.");
 
+mod async_stream;
 mod async_tls;
 mod config;
 mod copy_bidirectional;
@@ -12,7 +13,8 @@ mod native_tls;
 #[cfg(feature = "tls-rustls")]
 mod rustls;
 
-use async_tls::{AsyncStream, AsyncTlsAcceptor, AsyncTlsConnector, AsyncTlsFactory};
+use async_stream::AsyncStream;
+use async_tls::{AsyncTlsAcceptor, AsyncTlsConnector, AsyncTlsFactory};
 use config::ServerConfig;
 
 use std::fs::File;
@@ -22,6 +24,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use log::{debug, error, info, warn};
+use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::Builder;
 use treebitmap::IpLookupTable;
@@ -74,7 +77,7 @@ async fn setup_target_stream(
 
 async fn process_stream(
     stream: TcpStream,
-    addr: std::net::SocketAddr,
+    addr: &std::net::SocketAddr,
     target_data: Arc<TargetData>,
 ) -> std::io::Result<()> {
     let target_address = if target_data.address_data.len() > 1 {
@@ -87,27 +90,100 @@ async fn process_stream(
         &target_data.address_data[0]
     };
 
-    let (mut source_stream, mut target_stream) = if ACCEPT_AND_CONNECT_TOGETHER {
-        futures_util::try_join!(
-            setup_source_stream(stream, &target_data.tls_acceptor),
-            setup_target_stream(&target_address)
-        )?
-    } else {
-        (
-            setup_source_stream(stream, &target_data.tls_acceptor).await?,
-            setup_target_stream(&target_address).await?,
-        )
-    };
-
     debug!(
-        "Forwarding: {} to {}:{}",
+        "Starting: {}:{} to {}:{}",
         addr.ip(),
+        addr.port(),
         &target_address.address,
         &target_address.port
     );
 
-    copy_bidirectional::copy_bidirectional(&mut source_stream, &mut target_stream, BUFFER_SIZE)
-        .await
+    let (mut source_stream, mut target_stream) = if ACCEPT_AND_CONNECT_TOGETHER {
+        let (source_result, target_result) = futures_util::join!(
+            setup_source_stream(stream, &target_data.tls_acceptor),
+            setup_target_stream(&target_address)
+        );
+
+        if source_result.is_err() || target_result.is_err() {
+            if let Ok(mut source_stream) = source_result {
+                let _ = source_stream.try_shutdown().await;
+                let _ = read_remaining(source_stream);
+                return target_result.map(|_| ());
+            }
+            if let Ok(mut target_stream) = target_result {
+                let _ = target_stream.try_shutdown().await;
+                let _ = read_remaining(target_stream);
+                return source_result.map(|_| ());
+            }
+            // Both were errors, just return one.
+            return source_result.map(|_| ());
+        }
+
+        (source_result.unwrap(), target_result.unwrap())
+    } else {
+        let mut source_stream = setup_source_stream(stream, &target_data.tls_acceptor).await?;
+        let target_stream = match setup_target_stream(&target_address).await {
+            Ok(s) => s,
+            Err(e) => {
+                source_stream.try_shutdown().await?;
+                return Err(e);
+            }
+        };
+        (source_stream, target_stream)
+    };
+
+    debug!(
+        "Copying: {}:{} to {}:{}",
+        addr.ip(),
+        addr.port(),
+        &target_address.address,
+        &target_address.port
+    );
+
+    let copy_result =
+        copy_bidirectional::copy_bidirectional(&mut source_stream, &mut target_stream, BUFFER_SIZE)
+            .await;
+
+    debug!(
+        "Shutdown: {}:{} to {}:{}",
+        addr.ip(),
+        addr.port(),
+        &target_address.address,
+        &target_address.port
+    );
+
+    let (_, _) = futures_util::join!(source_stream.try_shutdown(), target_stream.try_shutdown());
+
+    debug!(
+        "Read remaining: {}:{} to {}:{}",
+        addr.ip(),
+        addr.port(),
+        &target_address.address,
+        &target_address.port
+    );
+
+    let (_, _) = futures_util::join!(read_remaining(source_stream), read_remaining(target_stream));
+
+    debug!(
+        "Done: {}:{} to {}:{}",
+        addr.ip(),
+        addr.port(),
+        &target_address.address,
+        &target_address.port
+    );
+
+    copy_result?;
+
+    Ok(())
+}
+
+async fn read_remaining(mut stream: Box<dyn AsyncStream>) {
+    let mut buf = [0u8; 1024];
+    while let Ok(count) = stream.read(&mut buf).await {
+        if count == 0 {
+            break;
+        }
+    }
 }
 
 struct TargetData {
@@ -229,8 +305,10 @@ async fn run(
         };
 
         tokio::spawn(async move {
-            if let Err(e) = process_stream(stream, addr, target_data).await {
-                error!("Finished with error: {:?}", e);
+            if let Err(e) = process_stream(stream, &addr, target_data).await {
+                error!("{}:{} finished with error: {:?}", addr.ip(), addr.port(), e);
+            } else {
+                debug!("{}:{} finished successfully", addr.ip(), addr.port());
             }
         });
     }

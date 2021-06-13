@@ -1,4 +1,5 @@
-use crate::async_tls::{AsyncStream, AsyncTlsAcceptor, AsyncTlsConnector, AsyncTlsFactory};
+use crate::async_stream::AsyncStream;
+use crate::async_tls::{AsyncTlsAcceptor, AsyncTlsConnector, AsyncTlsFactory};
 
 use std::io::{Error, ErrorKind, Result};
 
@@ -8,10 +9,16 @@ use openssl::pkcs12::Pkcs12;
 use openssl::pkey::PKey;
 use openssl::stack::Stack;
 use openssl::x509::X509;
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
 #[async_trait]
-impl AsyncStream for tokio_native_tls::TlsStream<TcpStream> {}
+impl AsyncStream for tokio_native_tls::TlsStream<TcpStream> {
+    async fn try_shutdown(&mut self) -> std::io::Result<()> {
+        let _ = self.shutdown().await;
+        self.get_mut().get_mut().get_mut().try_shutdown().await
+    }
+}
 
 #[async_trait]
 impl AsyncTlsAcceptor for tokio_native_tls::TlsAcceptor {

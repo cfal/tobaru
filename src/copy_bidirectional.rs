@@ -1,5 +1,7 @@
-// Forked from tokio's copy.rs and copy_bidirectional.rs in order to customize
-// the buffer size.
+// Forked from tokio's copy.rs and copy_bidirectional.rs.
+//
+// Changes:
+// - Customizable buffer size
 
 use futures_util::ready;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -78,7 +80,7 @@ impl CopyBuffer {
 }
 
 enum TransferState {
-    Running(CopyBuffer),
+    Running,
     ShuttingDown,
     Done,
 }
@@ -86,6 +88,8 @@ enum TransferState {
 struct CopyBidirectional<'a, A: ?Sized, B: ?Sized> {
     a: &'a mut A,
     b: &'a mut B,
+    a_buf: CopyBuffer,
+    b_buf: CopyBuffer,
     a_to_b: TransferState,
     b_to_a: TransferState,
 }
@@ -93,25 +97,25 @@ struct CopyBidirectional<'a, A: ?Sized, B: ?Sized> {
 fn transfer_one_direction<A, B>(
     cx: &mut Context<'_>,
     state: &mut TransferState,
+    buf: &mut CopyBuffer,
     r: &mut A,
     w: &mut B,
 ) -> Poll<io::Result<()>>
 where
-    A: AsyncRead + AsyncWrite + Unpin + ?Sized,
-    B: AsyncRead + AsyncWrite + Unpin + ?Sized,
+    A: AsyncRead + Unpin + ?Sized,
+    B: AsyncWrite + Unpin + ?Sized,
 {
     let mut r = Pin::new(r);
     let mut w = Pin::new(w);
 
     loop {
         match state {
-            TransferState::Running(buf) => {
+            TransferState::Running => {
                 ready!(buf.poll_copy(cx, r.as_mut(), w.as_mut()))?;
                 *state = TransferState::ShuttingDown;
             }
             TransferState::ShuttingDown => {
                 ready!(w.as_mut().poll_shutdown(cx))?;
-
                 *state = TransferState::Done;
             }
             TransferState::Done => return Poll::Ready(Ok(())),
@@ -131,17 +135,19 @@ where
         let CopyBidirectional {
             a,
             b,
+            a_buf,
+            b_buf,
             a_to_b,
             b_to_a,
         } = &mut *self;
 
-        let a_to_b = transfer_one_direction(cx, a_to_b, &mut *a, &mut *b)?;
-        let b_to_a = transfer_one_direction(cx, b_to_a, &mut *b, &mut *a)?;
+        let a_to_b = transfer_one_direction(cx, a_to_b, &mut *a_buf, &mut *a, &mut *b);
+        let b_to_a = transfer_one_direction(cx, b_to_a, &mut *b_buf, &mut *b, &mut *a);
 
         // It is not a problem if ready! returns early because transfer_one_direction for the
         // other direction will keep returning TransferState::Done in future calls to poll
-        ready!(a_to_b);
-        ready!(b_to_a);
+        ready!(a_to_b)?;
+        ready!(b_to_a)?;
 
         Poll::Ready(Ok(()))
     }
@@ -186,8 +192,10 @@ where
     CopyBidirectional {
         a,
         b,
-        a_to_b: TransferState::Running(CopyBuffer::new(buffer_size)),
-        b_to_a: TransferState::Running(CopyBuffer::new(buffer_size)),
+        a_buf: CopyBuffer::new(buffer_size),
+        b_buf: CopyBuffer::new(buffer_size),
+        a_to_b: TransferState::Running,
+        b_to_a: TransferState::Running,
     }
     .await
 }
