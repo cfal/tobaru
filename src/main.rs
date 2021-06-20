@@ -24,7 +24,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use log::{debug, error, info, warn};
-use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::Builder;
 use treebitmap::IpLookupTable;
@@ -107,12 +106,10 @@ async fn process_stream(
         if source_result.is_err() || target_result.is_err() {
             if let Ok(mut source_stream) = source_result {
                 let _ = source_stream.try_shutdown().await;
-                let _ = read_remaining(source_stream);
                 return target_result.map(|_| ());
             }
             if let Ok(mut target_stream) = target_result {
                 let _ = target_stream.try_shutdown().await;
-                let _ = read_remaining(target_stream);
                 return source_result.map(|_| ());
             }
             // Both were errors, just return one.
@@ -155,16 +152,6 @@ async fn process_stream(
     let (_, _) = futures_util::join!(source_stream.try_shutdown(), target_stream.try_shutdown());
 
     debug!(
-        "Read remaining: {}:{} to {}:{}",
-        addr.ip(),
-        addr.port(),
-        &target_address.address,
-        &target_address.port
-    );
-
-    let (_, _) = futures_util::join!(read_remaining(source_stream), read_remaining(target_stream));
-
-    debug!(
         "Done: {}:{} to {}:{}",
         addr.ip(),
         addr.port(),
@@ -175,15 +162,6 @@ async fn process_stream(
     copy_result?;
 
     Ok(())
-}
-
-async fn read_remaining(mut stream: Box<dyn AsyncStream>) {
-    let mut buf = [0u8; 1024];
-    while let Ok(count) = stream.read(&mut buf).await {
-        if count == 0 {
-            break;
-        }
-    }
 }
 
 struct TargetData {
