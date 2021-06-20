@@ -55,6 +55,7 @@ async fn setup_source_stream(
 }
 
 async fn setup_target_stream(
+    addr: &std::net::SocketAddr,
     target_address: &TargetAddressData,
 ) -> std::io::Result<Box<dyn AsyncStream>> {
     let target_stream =
@@ -63,6 +64,8 @@ async fn setup_target_stream(
     if TARGET_SET_NODELAY {
         target_stream.set_nodelay(true)?;
     }
+
+    debug!("Connected to remote: {} using local addr {}", addr, target_stream.local_addr().unwrap());
 
     if let Some(ref connector) = target_address.tls_connector {
         let tls_stream = connector
@@ -100,7 +103,7 @@ async fn process_stream(
     let (mut source_stream, mut target_stream) = if ACCEPT_AND_CONNECT_TOGETHER {
         let (source_result, target_result) = futures_util::join!(
             setup_source_stream(stream, &target_data.tls_acceptor),
-            setup_target_stream(&target_address)
+            setup_target_stream(addr, &target_address)
         );
 
         if source_result.is_err() || target_result.is_err() {
@@ -119,7 +122,7 @@ async fn process_stream(
         (source_result.unwrap(), target_result.unwrap())
     } else {
         let mut source_stream = setup_source_stream(stream, &target_data.tls_acceptor).await?;
-        let target_stream = match setup_target_stream(&target_address).await {
+        let target_stream = match setup_target_stream(addr, &target_address).await {
             Ok(s) => s,
             Err(e) => {
                 source_stream.try_shutdown().await?;
