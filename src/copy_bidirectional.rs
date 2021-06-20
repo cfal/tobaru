@@ -141,16 +141,14 @@ where
             b_to_a,
         } = &mut *self;
 
-        // Return early on Poll::Ready(Err(e)), see TryV2 impl of Poll.
-        let a_to_b = transfer_one_direction(cx, a_to_b, &mut *a_buf, &mut *a, &mut *b)?;
-        let b_to_a = transfer_one_direction(cx, b_to_a, &mut *b_buf, &mut *b, &mut *a)?;
+        let a_to_b = transfer_one_direction(cx, a_to_b, &mut *a_buf, &mut *a, &mut *b);
+        let b_to_a = transfer_one_direction(cx, b_to_a, &mut *b_buf, &mut *b, &mut *a);
 
-        // It is not a problem if ready! returns early because transfer_one_direction for the
-        // other direction will keep returning TransferState::Done in future calls to poll
-        ready!(a_to_b);
-        ready!(b_to_a);
-
-        Poll::Ready(Ok(()))
+        if a_to_b.is_ready() {
+            a_to_b
+        } else {
+            b_to_a
+        }
     }
 }
 
