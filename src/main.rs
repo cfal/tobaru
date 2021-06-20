@@ -28,7 +28,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::Builder;
 use treebitmap::IpLookupTable;
 
-const BUFFER_SIZE: usize = 8192;
+const BUFFER_SIZE: usize = 16384;
 const ACCEPT_AND_CONNECT_TOGETHER: bool = false;
 const TARGET_SET_NODELAY: bool = false;
 
@@ -65,7 +65,11 @@ async fn setup_target_stream(
         target_stream.set_nodelay(true)?;
     }
 
-    debug!("Connected to remote: {} using local addr {}", addr, target_stream.local_addr().unwrap());
+    debug!(
+        "Connected to remote: {} using local addr {}",
+        addr,
+        target_stream.local_addr().unwrap()
+    );
 
     if let Some(ref connector) = target_address.tls_connector {
         let tls_stream = connector
