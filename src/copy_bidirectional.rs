@@ -39,41 +39,67 @@ impl CopyBuffer {
         R: AsyncRead + ?Sized,
         W: AsyncWrite + ?Sized,
     {
+        let mut read_pending = false;
+        let mut write_pending = false;
         loop {
-            // If our buffer is empty, then we need to read some data to
-            // continue.
-            if self.pos == self.cap && !self.read_done {
+            let mut did_action = false;
+
+            // If our buffer has some space, let's read up!
+            if !read_pending && !self.read_done && self.cap < self.buf.len() {
                 let me = &mut *self;
-                let mut buf = ReadBuf::new(&mut me.buf);
-                ready!(reader.as_mut().poll_read(cx, &mut buf))?;
-                let n = buf.filled().len();
-                if n == 0 {
-                    self.read_done = true;
-                } else {
-                    self.pos = 0;
-                    self.cap = n;
+                let mut buf = ReadBuf::new(&mut me.buf[me.cap..]);
+                match reader.as_mut().poll_read(cx, &mut buf) {
+                    Poll::Pending => {
+                        read_pending = true;
+                    }
+                    Poll::Ready(val) => {
+                        val?;
+                        let n = buf.filled().len();
+                        if n == 0 {
+                            self.read_done = true;
+                        } else {
+                            self.cap += n;
+                        }
+                    }
                 }
+                did_action = true;
             }
 
             // If our buffer has some data, let's write it out!
-            while self.pos < self.cap {
+            if !write_pending && self.pos < self.cap {
                 let me = &mut *self;
-                let i = ready!(writer.as_mut().poll_write(cx, &me.buf[me.pos..me.cap]))?;
-                if i == 0 {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "write zero byte into writer",
-                    )));
-                } else {
-                    self.pos += i;
-                }
+                match writer.as_mut().poll_write(cx, &me.buf[me.pos..me.cap]) {
+                    Poll::Pending => {
+                        write_pending = true;
+                    }
+                    Poll::Ready(val) => {
+                        let i = val?;
+                        if i == 0 {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::WriteZero,
+                                "write zero byte into writer",
+                            )));
+                        } else {
+                            self.pos += i;
+                            if self.pos == self.cap {
+                                self.pos = 0;
+                                self.cap = 0;
+                            }
+                        }
+                    }
+                };
+                did_action = true;
             }
 
             // If we've written all the data and we've seen EOF, flush out the
             // data and finish the transfer.
-            if self.pos == self.cap && self.read_done {
+            if self.read_done && self.cap == 0 {
                 ready!(writer.as_mut().poll_flush(cx))?;
                 return Poll::Ready(Ok(()));
+            }
+
+            if !did_action {
+                return Poll::Pending;
             }
         }
     }
