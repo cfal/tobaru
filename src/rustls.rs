@@ -4,6 +4,7 @@ use crate::async_tls::{AsyncTlsAcceptor, AsyncTlsConnector, AsyncTlsFactory};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use rustls::Session;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
@@ -26,7 +27,10 @@ impl AsyncTlsAcceptor for tokio_rustls::TlsAcceptor {
     async fn accept(&self, stream: TcpStream) -> std::io::Result<Box<dyn AsyncStream>> {
         tokio_rustls::TlsAcceptor::accept(&self, stream)
             .await
-            .map(|s| Box::new(s) as Box<dyn AsyncStream>)
+            .map(|mut s| {
+                s.get_mut().1.set_buffer_limit(8192);
+                Box::new(s) as Box<dyn AsyncStream>
+            })
     }
 }
 
@@ -42,7 +46,10 @@ impl AsyncTlsConnector for tokio_rustls::TlsConnector {
 
         tokio_rustls::TlsConnector::connect(&self, domain, stream)
             .await
-            .map(|s| Box::new(s) as Box<dyn AsyncStream>)
+            .map(|mut s| {
+                s.get_mut().1.set_buffer_limit(8192);
+                Box::new(s) as Box<dyn AsyncStream>
+            })
     }
 }
 
