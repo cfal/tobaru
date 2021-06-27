@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2018"
 
 [features]
-default = ["tls-native"]
+default = ["tls-rustls"]
 tls-native = ["openssl", "tokio-native-tls", "native-tls"]
 tls-rustls = ["rustls", "tokio-rustls", "webpki"]
 
