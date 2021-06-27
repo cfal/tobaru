@@ -1,4 +1,5 @@
-use crate::async_tls::{AsyncStream, AsyncTlsAcceptor, AsyncTlsConnector, AsyncTlsFactory};
+use crate::async_stream::AsyncStream;
+use crate::async_tls::{AsyncTlsAcceptor, AsyncTlsConnector, AsyncTlsFactory};
 
 use std::sync::Arc;
 
@@ -9,16 +10,14 @@ use tokio::net::TcpStream;
 #[async_trait]
 impl AsyncStream for tokio_rustls::client::TlsStream<TcpStream> {
     async fn try_shutdown(&mut self) -> std::io::Result<()> {
-        let _ = self.shutdown().await;
-        self.get_mut().try_shutdown().await
+        self.shutdown().await
     }
 }
 
 #[async_trait]
 impl AsyncStream for tokio_rustls::server::TlsStream<TcpStream> {
-    async fn try_shutdown(self) -> std::io::Result<()> {
-        let _ = self.shutdown().await;
-        self.get_mut().try_shutdown().await
+    async fn try_shutdown(&mut self) -> std::io::Result<()> {
+        self.shutdown().await
     }
 }
 

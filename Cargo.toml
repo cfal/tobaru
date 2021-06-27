@@ -22,7 +22,7 @@ tokio = { version = "*", features = ["io-util", "macros", "net", "rt-multi-threa
 tokio-native-tls = { version = "*", optional = true }
 tokio-rustls = { version = "*", features = ["dangerous_configuration"], optional = true }
 treebitmap = "*"
-webpki = { version = "*", optional = true }
+webpki = { version = "0.21.4", optional = true }
 
 [profile.release]
 opt-level = 3
