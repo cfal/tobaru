@@ -53,6 +53,8 @@ pub fn configure_iptables(socket_addr: SocketAddr, ip_masks: &[(Ipv6Addr, u32)])
         run(
             IP6TABLES_PATH,
             &[
+                "--wait",
+                "5",
                 "-A",
                 "INPUT",
                 "--protocol",
@@ -74,6 +76,8 @@ pub fn configure_iptables(socket_addr: SocketAddr, ip_masks: &[(Ipv6Addr, u32)])
             run(
                 IPTABLES_PATH,
                 &[
+                    "--wait",
+                    "5",
                     "-A",
                     "INPUT",
                     "--protocol",
@@ -97,6 +101,8 @@ pub fn configure_iptables(socket_addr: SocketAddr, ip_masks: &[(Ipv6Addr, u32)])
         run(
             program,
             &[
+                "--wait",
+                "5",
                 "-A",
                 "INPUT",
                 "--protocol",
@@ -118,13 +124,16 @@ pub fn clear_iptables(socket_addr: SocketAddr) {
     let comment = create_comment(&socket_addr);
     for program in &[IPTABLES_PATH, IP6TABLES_PATH] {
         // Iterate through line backwards so that rule numbers don't change as we remove them.
-        for line in run(program, &["-n", "-L", "INPUT", "--line-numbers"])
-            .into_iter()
-            .rev()
+        for line in run(
+            program,
+            &["--wait", "5", "-n", "-L", "INPUT", "--line-numbers"],
+        )
+        .into_iter()
+        .rev()
         {
             if line.find(&comment).is_some() {
                 let rule_number = line.trim_start().split(' ').next().unwrap();
-                run(program, &["-D", "INPUT", rule_number]);
+                run(program, &["--wait", "5", "-D", "INPUT", rule_number]);
             }
         }
     }
