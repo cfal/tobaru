@@ -2,6 +2,9 @@
 //
 // Changes:
 // - Customizable buffer size
+// - Don't bother initializing buffer
+// - Read and write whenever there's a space
+// - Circular buffer
 
 use futures_util::ready;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -14,18 +17,24 @@ use std::task::{Context, Poll};
 #[derive(Debug)]
 struct CopyBuffer {
     read_done: bool,
-    pos: usize,
-    cap: usize,
+    start_index: usize,
+    cache_length: usize,
+    size: usize,
     buf: Box<[u8]>,
 }
 
 impl CopyBuffer {
     pub fn new(size: usize) -> Self {
+        let mut buf = Vec::with_capacity(size);
+        unsafe {
+            buf.set_len(size);
+        }
         Self {
             read_done: false,
-            pos: 0,
-            cap: 0,
-            buf: vec![0; size].into_boxed_slice(),
+            start_index: 0,
+            cache_length: 0,
+            size,
+            buf: buf.into_boxed_slice(),
         }
     }
 
@@ -45,9 +54,17 @@ impl CopyBuffer {
             let mut did_action = false;
 
             // If our buffer has some space, let's read up!
-            if !read_pending && !self.read_done && self.cap < self.buf.len() {
+            if !read_pending && !self.read_done && self.cache_length < self.size {
+                let unused_start_index = (self.start_index + self.cache_length) % self.size;
+                let unused_end_index_exclusive = if unused_start_index < self.start_index {
+                    self.start_index
+                } else {
+                    self.size
+                };
+
                 let me = &mut *self;
-                let mut buf = ReadBuf::new(&mut me.buf[me.cap..]);
+                let mut buf =
+                    ReadBuf::new(&mut me.buf[unused_start_index..unused_end_index_exclusive]);
                 match reader.as_mut().poll_read(cx, &mut buf) {
                     Poll::Pending => {
                         read_pending = true;
@@ -58,7 +75,7 @@ impl CopyBuffer {
                         if n == 0 {
                             self.read_done = true;
                         } else {
-                            self.cap += n;
+                            self.cache_length += n;
                         }
                     }
                 }
@@ -66,24 +83,35 @@ impl CopyBuffer {
             }
 
             // If our buffer has some data, let's write it out!
-            if !write_pending && self.pos < self.cap {
+            // Loop and try to write out as much as possible to minimize forwarding
+            // latency, and so that we increase the chance we have an optimal read
+            // with start_index at zero.
+            while !write_pending && self.cache_length > 0 {
+                let used_start_index = self.start_index;
+                let used_end_index_exclusive =
+                    std::cmp::min(self.start_index + self.cache_length, self.size);
+
                 let me = &mut *self;
-                match writer.as_mut().poll_write(cx, &me.buf[me.pos..me.cap]) {
+                match writer
+                    .as_mut()
+                    .poll_write(cx, &me.buf[used_start_index..used_end_index_exclusive])
+                {
                     Poll::Pending => {
                         write_pending = true;
                     }
                     Poll::Ready(val) => {
-                        let i = val?;
-                        if i == 0 {
+                        let written = val?;
+                        if written == 0 {
                             return Poll::Ready(Err(io::Error::new(
                                 io::ErrorKind::WriteZero,
                                 "write zero byte into writer",
                             )));
                         } else {
-                            self.pos += i;
-                            if self.pos == self.cap {
-                                self.pos = 0;
-                                self.cap = 0;
+                            self.cache_length -= written;
+                            if self.cache_length == 0 {
+                                self.start_index = 0;
+                            } else {
+                                self.start_index = (self.start_index + written) % self.size;
                             }
                         }
                     }
@@ -93,7 +121,7 @@ impl CopyBuffer {
 
             // If we've written all the data and we've seen EOF, flush out the
             // data and finish the transfer.
-            if self.read_done && self.cap == 0 {
+            if self.read_done && self.cache_length == 0 {
                 ready!(writer.as_mut().poll_flush(cx))?;
                 return Poll::Ready(Ok(()));
             }
