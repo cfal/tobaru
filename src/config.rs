@@ -87,10 +87,11 @@ fn load_ip_groups(obj: &mut JsonValue, ip_groups: &mut HashMap<String, Vec<IpMas
             .map(|obj| {
                 let ip_str = obj
                     .as_str()
-                    .expect("Invalid ip range value, expected string");
-                convert_ip_mask(ip_str)
+                    .expect("Invalid ip group entry, expected string");
+                lookup_ip_mask(ip_str, ip_groups)
             })
-            .collect();
+            .collect::<Vec<Vec<IpMask>>>()
+            .concat();
         ip_groups.insert(group_name.to_string(), ip_strs);
     }
 }
