@@ -48,13 +48,11 @@ impl CopyBuffer {
         R: AsyncRead + ?Sized,
         W: AsyncWrite + ?Sized,
     {
-        let mut read_pending = false;
-        let mut write_pending = false;
         loop {
-            let mut did_action = false;
+            let mut read_pending = false;
 
             // If our buffer has some space, let's read up!
-            if !read_pending && !self.read_done && self.cache_length < self.size {
+            if !self.read_done && self.cache_length < self.size {
                 let unused_start_index = (self.start_index + self.cache_length) % self.size;
                 let unused_end_index_exclusive = if unused_start_index < self.start_index {
                     self.start_index
@@ -66,9 +64,6 @@ impl CopyBuffer {
                 let mut buf =
                     ReadBuf::new(&mut me.buf[unused_start_index..unused_end_index_exclusive]);
                 match reader.as_mut().poll_read(cx, &mut buf) {
-                    Poll::Pending => {
-                        read_pending = true;
-                    }
                     Poll::Ready(val) => {
                         val?;
                         let n = buf.filled().len();
@@ -78,15 +73,17 @@ impl CopyBuffer {
                             self.cache_length += n;
                         }
                     }
+                    Poll::Pending => {
+                        read_pending = true;
+                    }
                 }
-                did_action = true;
             }
 
             // If our buffer has some data, let's write it out!
             // Loop and try to write out as much as possible to minimize forwarding
             // latency, and so that we increase the chance we have an optimal read
             // with start_index at zero.
-            while !write_pending && self.cache_length > 0 {
+            while self.cache_length > 0 {
                 let used_start_index = self.start_index;
                 let used_end_index_exclusive =
                     std::cmp::min(self.start_index + self.cache_length, self.size);
@@ -96,9 +93,6 @@ impl CopyBuffer {
                     .as_mut()
                     .poll_write(cx, &me.buf[used_start_index..used_end_index_exclusive])
                 {
-                    Poll::Pending => {
-                        write_pending = true;
-                    }
                     Poll::Ready(val) => {
                         let written = val?;
                         if written == 0 {
@@ -115,8 +109,13 @@ impl CopyBuffer {
                             }
                         }
                     }
-                };
-                did_action = true;
+                    Poll::Pending => {
+                        // Previously we set a write_pending flag, and kept going until
+                        // both read and write were pending, but this might starve other
+                        // tasks.
+                        return Poll::Pending;
+                    }
+                }
             }
 
             // If we've written all the data and we've seen EOF, flush out the
@@ -126,7 +125,11 @@ impl CopyBuffer {
                 return Poll::Ready(Ok(()));
             }
 
-            if !did_action {
+            if read_pending {
+                // If we got here,
+                // 1) we hit read_pending on the current iteration.
+                // 2) all data has been written successfully
+                // 3) there is no data left to write and we need to read more.
                 return Poll::Pending;
             }
         }
