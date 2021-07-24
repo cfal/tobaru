@@ -28,7 +28,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::Builder;
 use treebitmap::IpLookupTable;
 
-const BUFFER_SIZE: usize = 16384;
+const BUFFER_SIZE: usize = 8192;
 const ACCEPT_AND_CONNECT_TOGETHER: bool = false;
 const TARGET_SET_NODELAY: bool = false;
 
