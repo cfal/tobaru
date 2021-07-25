@@ -29,8 +29,6 @@ use tokio::runtime::Builder;
 use treebitmap::IpLookupTable;
 
 const BUFFER_SIZE: usize = 8192;
-const ACCEPT_AND_CONNECT_TOGETHER: bool = false;
-const TARGET_SET_NODELAY: bool = false;
 
 #[cfg(feature = "tls-native")]
 fn create_tls_factory() -> native_tls::NativeTlsFactory {
@@ -57,12 +55,15 @@ async fn setup_source_stream(
 async fn setup_target_stream(
     addr: &std::net::SocketAddr,
     target_address: &TargetAddressData,
+    tcp_nodelay: bool,
 ) -> std::io::Result<Box<dyn AsyncStream>> {
     let target_stream =
         TcpStream::connect((target_address.address.as_str(), target_address.port)).await?;
 
-    if TARGET_SET_NODELAY {
-        target_stream.set_nodelay(true)?;
+    if tcp_nodelay {
+        if let Err(e) = target_stream.set_nodelay(true) {
+            error!("Failed to set tcp_nodelay: {}", e);
+        }
     }
 
     debug!(
@@ -104,10 +105,10 @@ async fn process_stream(
         &target_address.port
     );
 
-    let (mut source_stream, mut target_stream) = if ACCEPT_AND_CONNECT_TOGETHER {
+    let (mut source_stream, mut target_stream) = if target_data.early_connect {
         let (source_result, target_result) = futures_util::join!(
             setup_source_stream(stream, &target_data.tls_acceptor),
-            setup_target_stream(addr, &target_address)
+            setup_target_stream(addr, &target_address, target_data.tcp_nodelay)
         );
 
         if source_result.is_err() || target_result.is_err() {
@@ -126,13 +127,14 @@ async fn process_stream(
         (source_result.unwrap(), target_result.unwrap())
     } else {
         let mut source_stream = setup_source_stream(stream, &target_data.tls_acceptor).await?;
-        let target_stream = match setup_target_stream(addr, &target_address).await {
-            Ok(s) => s,
-            Err(e) => {
-                source_stream.try_shutdown().await?;
-                return Err(e);
-            }
-        };
+        let target_stream =
+            match setup_target_stream(addr, &target_address, target_data.tcp_nodelay).await {
+                Ok(s) => s,
+                Err(e) => {
+                    source_stream.try_shutdown().await?;
+                    return Err(e);
+                }
+            };
         (source_stream, target_stream)
     };
 
@@ -175,6 +177,8 @@ struct TargetData {
     pub tls_acceptor: Option<Box<dyn AsyncTlsAcceptor>>,
     pub address_data: Vec<TargetAddressData>,
     pub next_address_index: AtomicUsize,
+    pub early_connect: bool,
+    pub tcp_nodelay: bool,
 }
 
 struct TargetAddressData {
@@ -228,6 +232,8 @@ async fn run(
             tls_acceptor,
             address_data,
             next_address_index: AtomicUsize::new(0),
+            early_connect: target_config.early_connect,
+            tcp_nodelay: target_config.tcp_nodelay,
         });
 
         for (addr, masklen) in target_config.allowlist.into_iter() {

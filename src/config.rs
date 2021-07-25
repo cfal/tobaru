@@ -1,5 +1,5 @@
 use json::JsonValue;
-use log::debug;
+use log::{debug, warn};
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
@@ -34,6 +34,8 @@ pub struct TargetConfig {
     pub server_tls_config: Option<TlsConfig>,
     pub target_addresses: Vec<TargetAddress>,
     pub allowlist: Vec<IpMask>,
+    pub early_connect: bool,
+    pub tcp_nodelay: bool,
 }
 
 pub fn load_configs(config_paths: Vec<String>) -> Vec<ServerConfig> {
@@ -232,10 +234,28 @@ fn parse_target_object(
         invalid => panic!("Invalid allowlist value: {}", invalid),
     };
 
+    let early_connect = match obj["early_connect"].take() {
+        JsonValue::Boolean(b) => b,
+        JsonValue::Null => false,
+        invalid => panic!("Invalid early_connect value: {}", invalid),
+    };
+
+    if early_connect {
+        warn!("Enabling early connect, this can cause excessive target connections on unauthorized connections.");
+    }
+
+    let tcp_nodelay = match obj["tcp_nodelay"].take() {
+        JsonValue::Boolean(b) => b,
+        JsonValue::Null => false,
+        invalid => panic!("Invalid tcp_nodelay value: {}", invalid),
+    };
+
     TargetConfig {
         server_tls_config,
         target_addresses,
         allowlist,
+        early_connect,
+        tcp_nodelay,
     }
 }
 
