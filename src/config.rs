@@ -15,6 +15,7 @@ pub struct ServerConfig {
 pub struct TlsConfig {
     pub cert_path: String,
     pub key_path: String,
+    pub optional: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -276,6 +277,7 @@ fn parse_tls_object(mut obj: JsonValue) -> TlsConfig {
     TlsConfig {
         cert_path: obj["cert"].take_string().expect("No cert path"),
         key_path: obj["key"].take_string().expect("No key path"),
+        optional: obj["optional"].as_bool().unwrap_or(false),
     }
 }
 

@@ -40,12 +40,73 @@ fn create_tls_factory() -> rustls::RustlsFactory {
     rustls::RustlsFactory::new()
 }
 
+async fn peek_tls_client_hello(stream: &TcpStream) -> std::io::Result<bool> {
+    // Logic was taken from boost docs:
+    // https://www.boost.org/doc/libs/1_70_0/libs/beast/doc/html/beast/using_io/writing_composed_operations/detect_ssl.html
+
+    let mut buf = [0u8; 9];
+    for _ in 0..3 {
+        let count = stream.peek(&mut buf).await?;
+
+        if count >= 1 {
+            // Require the first byte to be 0x16, indicating a TLS handshake record
+            if buf[0] != 0x16 {
+                return Ok(false);
+            }
+
+            if count >= 5 {
+                // Calculate the record payload size
+                let length: u32 = ((buf[3] as u32) << 8) + (buf[4] as u32);
+
+                // A ClientHello message payload is at least 34 bytes.
+                // There can be multiple handshake messages in the same record.
+                if length < 34 {
+                    return Ok(false);
+                }
+
+                if count >= 6 {
+                    // The handshake_type must be 0x01 == client_hello
+                    if buf[5] != 0x01 {
+                        return Ok(false);
+                    }
+
+                    if count >= 9 {
+                        // Calculate the message payload size
+                        let size: u32 =
+                            ((buf[6] as u32) << 16) + ((buf[7] as u32) << 8) + (buf[8] as u32);
+
+                        // The message payload can't be bigger than the enclosing record
+                        if size + 4 > length {
+                            return Ok(false);
+                        }
+
+                        // This can only be a TLS client_hello message
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
+
+    // If we get here, then we didn't have enough bytes after several iterations
+    // of the for loop. It could be possible that the client expects a server response
+    // first before sending more bytes, so just assume it's not a TLS connection.
+    Ok(false)
+}
+
 async fn setup_source_stream(
     stream: TcpStream,
-    tls_acceptor: &Option<Box<dyn AsyncTlsAcceptor>>,
+    server_tls_data: &Option<TargetTlsData>,
 ) -> std::io::Result<Box<dyn AsyncStream>> {
-    if let Some(acceptor) = tls_acceptor {
-        let tls_stream = acceptor.accept(stream).await?;
+    if let Some(data) = server_tls_data {
+        if data.optional {
+            let is_tls_client_hello = peek_tls_client_hello(&stream).await?;
+            if !is_tls_client_hello {
+                return Ok(Box::new(stream));
+            }
+        }
+        let tls_stream = data.acceptor.accept(stream).await?;
         Ok(tls_stream)
     } else {
         Ok(Box::new(stream))
@@ -107,7 +168,7 @@ async fn process_stream(
 
     let (mut source_stream, mut target_stream) = if target_data.early_connect {
         let (source_result, target_result) = futures_util::join!(
-            setup_source_stream(stream, &target_data.tls_acceptor),
+            setup_source_stream(stream, &target_data.server_tls_data),
             setup_target_stream(addr, &target_address, target_data.tcp_nodelay)
         );
 
@@ -126,7 +187,7 @@ async fn process_stream(
 
         (source_result.unwrap(), target_result.unwrap())
     } else {
-        let mut source_stream = setup_source_stream(stream, &target_data.tls_acceptor).await?;
+        let mut source_stream = setup_source_stream(stream, &target_data.server_tls_data).await?;
         let target_stream =
             match setup_target_stream(addr, &target_address, target_data.tcp_nodelay).await {
                 Ok(s) => s,
@@ -174,11 +235,16 @@ async fn process_stream(
 }
 
 struct TargetData {
-    pub tls_acceptor: Option<Box<dyn AsyncTlsAcceptor>>,
+    pub server_tls_data: Option<TargetTlsData>,
     pub address_data: Vec<TargetAddressData>,
     pub next_address_index: AtomicUsize,
     pub early_connect: bool,
     pub tcp_nodelay: bool,
+}
+
+struct TargetTlsData {
+    pub acceptor: Box<dyn AsyncTlsAcceptor>,
+    pub optional: bool,
 }
 
 struct TargetAddressData {
@@ -200,7 +266,7 @@ async fn run(
     let mut lookup_table = IpLookupTable::new();
 
     for target_config in target_configs {
-        let tls_acceptor = if let Some(cfg) = target_config.server_tls_config {
+        let server_tls_data = if let Some(cfg) = target_config.server_tls_config {
             let mut cert_file = File::open(&cfg.cert_path)?;
             let mut cert_bytes = vec![];
             cert_file.read_to_end(&mut cert_bytes)?;
@@ -209,7 +275,10 @@ async fn run(
             let mut key_bytes = vec![];
             key_file.read_to_end(&mut key_bytes)?;
 
-            Some(tls_factory.create_acceptor(&cert_bytes, &key_bytes))
+            Some(TargetTlsData {
+                acceptor: tls_factory.create_acceptor(&cert_bytes, &key_bytes),
+                optional: cfg.optional,
+            })
         } else {
             None
         };
@@ -229,7 +298,7 @@ async fn run(
             .collect();
 
         let target_data = Arc::new(TargetData {
-            tls_acceptor,
+            server_tls_data,
             address_data,
             next_address_index: AtomicUsize::new(0),
             early_connect: target_config.early_connect,
@@ -354,6 +423,7 @@ fn main() {
     let runtime = Builder::new_multi_thread()
         .worker_threads(num_threads)
         .enable_io()
+        .enable_time()
         .build()
         .expect("Could not build tokio runtime");
 

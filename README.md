@@ -6,6 +6,7 @@ Port forwarding tool written in Rust with advanced features, such as:
 - **iptables support**: Automatically configures iptables to drop packets from unallowed ranges.
 - **Multiple target addresses**: Forwards to different target addresses based on IP.
 - **TLS encryption/decryption**: Accepts unencrypted and TLS-enabled connections, and connects to both unencrypted and TLS-enabled destinations.
+- **TLS detection**: Allows clients to optionally use TLS, and forward them without the TLS layer if they aren't.
 - **IP groups**: named groups of IPs that can be reused amongst different server configurations.
 
 ## Usage
@@ -134,7 +135,9 @@ Connections from addresses that are not specified in `allowlist` will either be 
         // Enable TLS by specifying the path to the certificate and private key.
         "serverTls": {
           "cert": "/path/to/cert.pem",
-          "key": "/path/to/key.pem"
+          "key": "/path/to/key.pem",
+          // Allow clients to connect without TLS.
+          "optional": true
         },
 
         // Also connect to the destination HTTPS server using TLS.
