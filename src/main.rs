@@ -89,6 +89,8 @@ async fn peek_tls_client_hello(stream: &TcpStream) -> std::io::Result<bool> {
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
     }
 
+    debug!("Unable to fetch all bytes to determine TLS.");
+
     // If we get here, then we didn't have enough bytes after several iterations
     // of the for loop. It could be possible that the client expects a server response
     // first before sending more bytes, so just assume it's not a TLS connection.
@@ -102,6 +104,7 @@ async fn setup_source_stream(
     if let Some(data) = server_tls_data {
         if data.optional {
             let is_tls_client_hello = peek_tls_client_hello(&stream).await?;
+            debug!("Finished tls client hello check: {}", is_tls_client_hello);
             if !is_tls_client_hello {
                 return Ok(Box::new(stream));
             }
