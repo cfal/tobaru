@@ -65,7 +65,7 @@ impl std::fmt::Display for UdpTargetAddress {
 pub struct UdpTargetConfig {
     pub target_addresses: Vec<UdpTargetAddress>,
     pub allowlist: Vec<IpMask>,
-    pub association_timeout_ms: usize,
+    pub association_timeout_secs: Option<u32>,
 }
 
 pub fn load_configs(config_paths: Vec<String>) -> Vec<ServerConfig> {
@@ -399,14 +399,12 @@ fn parse_udp_target_object(
         invalid => panic!("Invalid allowlist value: {}", invalid),
     };
 
-    let association_timeout_ms = obj["association_timeout_ms"]
-        .as_usize()
-        .unwrap_or(60000usize);
+    let association_timeout_secs = obj["association_timeout_secs"].as_u32();
 
     UdpTargetConfig {
         target_addresses,
         allowlist,
-        association_timeout_ms,
+        association_timeout_secs,
     }
 }
 

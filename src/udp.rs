@@ -18,12 +18,16 @@ use crate::iptables_util::{configure_iptables, Protocol};
 use crate::tokio_util::resolve_host;
 
 const MAX_UDP_PACKET_SIZE: usize = 65536;
+
+const MIN_ASSOCIATION_TIMEOUT_SECS: u32 = 5;
+
 // Informed by https://stackoverflow.com/questions/14856639/udp-hole-punching-timeout
-const ASSOCIATION_TIMEOUT_SECS: u32 = 200;
+const DEFAULT_ASSOCIATION_TIMEOUT_SECS: u32 = 200;
 
 struct UdpTargetData {
     addresses: Vec<UdpTargetAddress>,
     next_address_index: AtomicUsize,
+    association_timeout_secs: u32,
 }
 
 fn get_timestamp_secs() -> u32 {
@@ -46,10 +50,26 @@ pub async fn run_udp_server(
     let mut lookup_table = IpLookupTable::new();
     let mut associations: HashMap<(SocketAddr, UdpTargetAddress), Association> = HashMap::new();
 
+    let mut min_association_timeout_secs: u32 = 0;
+
     for target_config in target_configs {
+        let association_timeout_secs = std::cmp::max(
+            MIN_ASSOCIATION_TIMEOUT_SECS,
+            target_config
+                .association_timeout_secs
+                .unwrap_or(DEFAULT_ASSOCIATION_TIMEOUT_SECS),
+        );
+        if min_association_timeout_secs == 0 {
+            min_association_timeout_secs = association_timeout_secs;
+        } else {
+            min_association_timeout_secs =
+                std::cmp::min(min_association_timeout_secs, association_timeout_secs);
+        }
+
         let target_data = Arc::new(UdpTargetData {
             addresses: target_config.target_addresses,
             next_address_index: AtomicUsize::new(0),
+            association_timeout_secs,
         });
 
         for (addr, masklen) in target_config.allowlist.into_iter() {
@@ -91,7 +111,7 @@ pub async fn run_udp_server(
     let mut buf = [0u8; MAX_UDP_PACKET_SIZE];
 
     let mut cleanup_interval = tokio::time::interval(tokio::time::Duration::from_secs(
-        ASSOCIATION_TIMEOUT_SECS as u64,
+        min_association_timeout_secs as u64,
     ));
 
     loop {
@@ -137,7 +157,8 @@ pub async fn run_udp_server(
                                 let new_assoc = Association::new(
                                     addr,
                                     server_socket.clone(),
-                                    target_address.clone()
+                                    target_address.clone(),
+                                    target_data.association_timeout_secs,
                                 );
                                 v.insert(new_assoc)
                                     .try_send(copied_msg)
@@ -158,8 +179,7 @@ pub async fn run_udp_server(
                 let current_timestamp = get_timestamp_secs();
                 let mut cleanup_keys = vec![];
                 for (key, val) in associations.iter() {
-                    if current_timestamp - val.get_last_active() >= ASSOCIATION_TIMEOUT_SECS {
-                        val.abort();
+                    if val.maybe_abort(current_timestamp) {
                         cleanup_keys.push(key.clone());
                     }
                 }
@@ -182,6 +202,7 @@ struct Association {
     last_active: Arc<AtomicU32>,
     tx: Sender<AssociationMessage>,
     join_handle: JoinHandle<()>,
+    timeout_secs: u32,
 }
 
 impl Association {
@@ -189,6 +210,7 @@ impl Association {
         client_address: SocketAddr,
         server_socket: Arc<UdpSocket>,
         target_address: UdpTargetAddress,
+        timeout_secs: u32,
     ) -> Self {
         let last_active = Arc::new(AtomicU32::new(get_timestamp_secs()));
         let cloned_last_active = last_active.clone();
@@ -212,6 +234,17 @@ impl Association {
             last_active,
             tx,
             join_handle,
+            timeout_secs,
+        }
+    }
+
+    fn maybe_abort(&self, current_timestamp: u32) -> bool {
+        let last_active = self.last_active.load(Ordering::SeqCst);
+        if current_timestamp - last_active >= self.timeout_secs {
+            self.abort();
+            true
+        } else {
+            false
         }
     }
 
@@ -230,10 +263,6 @@ impl Association {
                 }
             }
         }
-    }
-
-    fn get_last_active(&self) -> u32 {
-        self.last_active.load(Ordering::SeqCst)
     }
 
     fn try_send(&self, data: Box<[u8]>) -> std::io::Result<()> {
