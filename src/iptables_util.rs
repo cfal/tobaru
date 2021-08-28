@@ -5,6 +5,20 @@ use std::process::{Command, Output};
 const IPTABLES_PATH: &str = "/usr/sbin/iptables";
 const IP6TABLES_PATH: &str = "/usr/sbin/ip6tables";
 
+pub enum Protocol {
+    Tcp,
+    Udp,
+}
+
+impl Protocol {
+    fn as_str(&self) -> &'static str {
+        match self {
+            &Protocol::Tcp => "tcp",
+            &Protocol::Udp => "udp",
+        }
+    }
+}
+
 fn run(program: &str, args: &[&str]) -> Vec<String> {
     debug!("Running {} with arguments: {:?}", program, args);
     let Output {
@@ -45,7 +59,11 @@ fn format_ipv6(addr: &Ipv6Addr) -> String {
         .join(":")
 }
 
-pub fn configure_iptables(socket_addr: SocketAddr, ip_masks: &[(Ipv6Addr, u32)]) {
+pub fn configure_iptables(
+    protocol: Protocol,
+    socket_addr: SocketAddr,
+    ip_masks: &[(Ipv6Addr, u32)],
+) {
     let comment = create_comment(&socket_addr);
     let port_str = socket_addr.port().to_string();
 
@@ -58,7 +76,7 @@ pub fn configure_iptables(socket_addr: SocketAddr, ip_masks: &[(Ipv6Addr, u32)])
                 "-A",
                 "INPUT",
                 "--protocol",
-                "tcp",
+                protocol.as_str(),
                 "--dport",
                 &port_str,
                 "-s",
@@ -81,7 +99,7 @@ pub fn configure_iptables(socket_addr: SocketAddr, ip_masks: &[(Ipv6Addr, u32)])
                     "-A",
                     "INPUT",
                     "--protocol",
-                    "tcp",
+                    protocol.as_str(),
                     "--dport",
                     &port_str,
                     "-s",
@@ -106,7 +124,7 @@ pub fn configure_iptables(socket_addr: SocketAddr, ip_masks: &[(Ipv6Addr, u32)])
                 "-A",
                 "INPUT",
                 "--protocol",
-                "tcp",
+                protocol.as_str(),
                 "--dport",
                 &port_str,
                 "-j",

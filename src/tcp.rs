@@ -12,7 +12,7 @@ use crate::async_stream::AsyncStream;
 use crate::async_tls::{AsyncTlsAcceptor, AsyncTlsConnector, AsyncTlsFactory};
 use crate::config::TcpTargetConfig;
 use crate::copy_bidirectional::copy_bidirectional;
-use crate::iptables_util::configure_iptables;
+use crate::iptables_util::{configure_iptables, Protocol};
 
 struct TcpTargetData {
     pub server_tls_data: Option<ServerTlsData>,
@@ -109,7 +109,7 @@ pub async fn run_tcp_server(
             .iter()
             .map(|(addr, masklen, _)| (addr, masklen))
             .collect();
-        configure_iptables(server_address, &ip_masks);
+        configure_iptables(Protocol::Tcp, server_address, &ip_masks);
     }
 
     for entry in lookup_table.iter() {
