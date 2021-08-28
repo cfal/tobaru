@@ -8,6 +8,7 @@ use std::time::SystemTime;
 use log::{debug, error, info, warn};
 use tokio::net::UdpSocket;
 use tokio::select;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::task::JoinHandle;
 use treebitmap::IpLookupTable;
@@ -216,8 +217,18 @@ impl Association {
 
     fn abort(&self) {
         if let Err(e) = self.tx.try_send(AssociationMessage::Finish) {
-            error!("Failed to cancel association: {}", e);
-            self.join_handle.abort();
+            // There must be a ton of messages on the backlog?
+            match e {
+                TrySendError::Full(_) => {
+                    // Set last active to 0, which is used as another indicator
+                    // to break.
+                    self.last_active.store(0, Ordering::Relaxed);
+                }
+                TrySendError::Closed(_) => {
+                    // If the channel is already closed, then the task must
+                    // already have ended and it got dropped.
+                }
+            }
         }
     }
 
@@ -260,7 +271,9 @@ async fn run_forward_task(
                                 error!("Failed to forward data, send was too slow.");
                             }
                         }
-                        last_active.store(get_timestamp_secs(), Ordering::Relaxed);
+                        if last_active.swap(get_timestamp_secs(), Ordering::Relaxed) == 0 {
+                            break;
+                        }
                     }
                     Some(AssociationMessage::Finish) => {
                         break;
@@ -279,7 +292,9 @@ async fn run_forward_task(
                 if let Err(e) = server_socket.try_send_to(&buf[0..len], client_address) {
                     error!("Failed to relay response: {}", e);
                 }
-                last_active.store(get_timestamp_secs(), Ordering::Relaxed);
+                if last_active.swap(get_timestamp_secs(), Ordering::Relaxed) == 0 {
+                    break;
+                }
             }
         }
     }
