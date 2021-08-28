@@ -18,7 +18,7 @@ log = "*"
 native-tls = { version = "*", optional = true }
 openssl = { version = "*", optional = true }
 rustls = { version = "*", features = ["dangerous_configuration"], optional = true }
-tokio = { version = "*", features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
+tokio = { version = "*", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "time"] }
 tokio-native-tls = { version = "*", optional = true }
 tokio-rustls = { version = "*", features = ["dangerous_configuration"], optional = true }
 treebitmap = "*"

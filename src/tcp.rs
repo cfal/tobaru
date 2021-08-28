@@ -1,10 +1,10 @@
-use std::fs::File;
-use std::io::Read;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use log::{debug, error, info, warn};
+use tokio::fs::File;
+use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 use treebitmap::IpLookupTable;
 
@@ -45,13 +45,13 @@ pub async fn run_tcp_server(
 
     for target_config in target_configs {
         let server_tls_data = if let Some(cfg) = target_config.server_tls_config {
-            let mut cert_file = File::open(&cfg.cert_path)?;
+            let mut cert_file = File::open(&cfg.cert_path).await?;
             let mut cert_bytes = vec![];
-            cert_file.read_to_end(&mut cert_bytes)?;
+            cert_file.read_to_end(&mut cert_bytes).await?;
 
-            let mut key_file = File::open(&cfg.key_path)?;
+            let mut key_file = File::open(&cfg.key_path).await?;
             let mut key_bytes = vec![];
-            key_file.read_to_end(&mut key_bytes)?;
+            key_file.read_to_end(&mut key_bytes).await?;
 
             Some(ServerTlsData {
                 acceptor: tls_factory.create_acceptor(&cert_bytes, &key_bytes),
