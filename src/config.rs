@@ -7,19 +7,18 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub server_address: SocketAddr,
-    pub target_configs: Vec<TargetConfig>,
     pub use_iptables: bool,
+    pub target_configs: TargetConfigs,
 }
 
 #[derive(Debug, Clone)]
-pub struct TlsConfig {
-    pub cert_path: String,
-    pub key_path: String,
-    pub optional: bool,
+pub enum TargetConfigs {
+    Tcp(Vec<TcpTargetConfig>),
+    Udp(Vec<UdpTargetConfig>),
 }
 
 #[derive(Debug, Clone)]
-pub struct TargetAddress {
+pub struct TcpTargetAddress {
     // We don't convert to SocketAddr here so that if it's a hostname,
     // it could be updated without restarting the process depending on
     // the system's DNS settings.
@@ -31,12 +30,35 @@ pub struct TargetAddress {
 pub type IpMask = (Ipv6Addr, u32);
 
 #[derive(Debug, Clone)]
-pub struct TargetConfig {
-    pub server_tls_config: Option<TlsConfig>,
-    pub target_addresses: Vec<TargetAddress>,
+pub struct TlsConfig {
+    pub cert_path: String,
+    pub key_path: String,
+    pub optional: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct TcpTargetConfig {
+    pub target_addresses: Vec<TcpTargetAddress>,
     pub allowlist: Vec<IpMask>,
+    pub server_tls_config: Option<TlsConfig>,
     pub early_connect: bool,
     pub tcp_nodelay: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct UdpTargetAddress {
+    // We don't convert to SocketAddr here so that if it's a hostname,
+    // it could be updated without restarting the process depending on
+    // the system's DNS settings.
+    pub address: String,
+    pub port: u16,
+}
+
+#[derive(Debug, Clone)]
+pub struct UdpTargetConfig {
+    pub target_addresses: Vec<UdpTargetAddress>,
+    pub allowlist: Vec<IpMask>,
+    pub association_timeout_ms: usize,
 }
 
 pub fn load_configs(config_paths: Vec<String>) -> Vec<ServerConfig> {
@@ -175,32 +197,55 @@ fn parse_server_object(
         .next()
         .expect("Unable to resolve bind address");
 
-    let target_configs = if obj.has_key("target") {
-        vec![parse_target_object(obj["target"].take(), ip_groups)]
-    } else {
-        let target_objs = match obj["targets"].take() {
-            JsonValue::Array(v) => v,
-            _ => panic!("Invalid targets"),
-        };
-        target_objs
-            .into_iter()
-            .map(|target_obj| parse_target_object(target_obj, ip_groups))
-            .collect()
-    };
-
     let use_iptables = obj["iptables"].as_bool().unwrap_or(false);
+
+    let target_configs = match obj["protocol"].as_str().unwrap_or("tcp") {
+        "tcp" => {
+            let target_configs = if obj.has_key("target") {
+                vec![parse_tcp_target_object(obj["target"].take(), ip_groups)]
+            } else {
+                let target_objs = match obj["targets"].take() {
+                    JsonValue::Array(v) => v,
+                    _ => panic!("Invalid targets"),
+                };
+                target_objs
+                    .into_iter()
+                    .map(|target_obj| parse_tcp_target_object(target_obj, ip_groups))
+                    .collect()
+            };
+            TargetConfigs::Tcp(target_configs)
+        }
+        "udp" => {
+            let target_configs = if obj.has_key("target") {
+                vec![parse_udp_target_object(obj["target"].take(), ip_groups)]
+            } else {
+                let target_objs = match obj["targets"].take() {
+                    JsonValue::Array(v) => v,
+                    _ => panic!("Invalid targets"),
+                };
+                target_objs
+                    .into_iter()
+                    .map(|target_obj| parse_udp_target_object(target_obj, ip_groups))
+                    .collect()
+            };
+            TargetConfigs::Udp(target_configs)
+        }
+        unknown_protocol => {
+            panic!("Unknown protocol value: {}", unknown_protocol);
+        }
+    };
 
     ServerConfig {
         server_address,
-        target_configs,
         use_iptables,
+        target_configs,
     }
 }
 
-fn parse_target_object(
+fn parse_tcp_target_object(
     mut obj: JsonValue,
     ip_groups: &HashMap<String, Vec<IpMask>>,
-) -> TargetConfig {
+) -> TcpTargetConfig {
     let server_tls_config = if obj.has_key("serverTls") {
         Some(parse_tls_object(obj["serverTls"].take()))
     } else {
@@ -208,7 +253,7 @@ fn parse_target_object(
     };
 
     let target_addresses = if obj.has_key("address") {
-        vec![parse_target_address(obj["address"].take())]
+        vec![parse_tcp_target_address(obj["address"].take())]
     } else {
         let addresses_objs = match obj["addresses"].take() {
             JsonValue::Array(v) => v,
@@ -216,7 +261,7 @@ fn parse_target_object(
         };
         addresses_objs
             .into_iter()
-            .map(parse_target_address)
+            .map(parse_tcp_target_address)
             .collect()
     };
 
@@ -251,7 +296,7 @@ fn parse_target_object(
         invalid => panic!("Invalid tcp_nodelay value: {}", invalid),
     };
 
-    TargetConfig {
+    TcpTargetConfig {
         server_tls_config,
         target_addresses,
         allowlist,
@@ -281,9 +326,9 @@ fn parse_tls_object(mut obj: JsonValue) -> TlsConfig {
     }
 }
 
-fn parse_target_address(mut obj: JsonValue) -> TargetAddress {
+fn parse_tcp_target_address(mut obj: JsonValue) -> TcpTargetAddress {
     if obj.is_object() {
-        TargetAddress {
+        TcpTargetAddress {
             address: obj["address"]
                 .take_string()
                 .expect("Target address is not a string"),
@@ -305,10 +350,79 @@ fn parse_target_address(mut obj: JsonValue) -> TargetAddress {
             (port_str, false)
         };
 
-        TargetAddress {
+        TcpTargetAddress {
             address: s,
             port: port_str.parse().expect("Invalid target port"),
             tls,
+        }
+    } else {
+        panic!("Invalid target address: {}", obj);
+    }
+}
+
+fn parse_udp_target_object(
+    mut obj: JsonValue,
+    ip_groups: &HashMap<String, Vec<IpMask>>,
+) -> UdpTargetConfig {
+    let target_addresses = if obj.has_key("address") {
+        vec![parse_udp_target_address(obj["address"].take())]
+    } else {
+        let addresses_objs = match obj["addresses"].take() {
+            JsonValue::Array(v) => v,
+            _ => panic!("Invalid target addresses"),
+        };
+        addresses_objs
+            .into_iter()
+            .map(parse_udp_target_address)
+            .collect()
+    };
+
+    if target_addresses.is_empty() {
+        panic!("No target addresses specified.");
+    }
+
+    let allowlist = match obj["allowlist"].take() {
+        JsonValue::String(s) => lookup_ip_mask(&s, ip_groups),
+        JsonValue::Short(s) => lookup_ip_mask(s.as_str(), ip_groups),
+        JsonValue::Array(v) => v
+            .into_iter()
+            .map(|v| lookup_ip_mask(v.as_str().expect("Invalid allowlist entry"), ip_groups))
+            .collect::<Vec<Vec<IpMask>>>()
+            .concat(),
+        invalid => panic!("Invalid allowlist value: {}", invalid),
+    };
+
+    let association_timeout_ms = obj["association_timeout_ms"]
+        .as_usize()
+        .unwrap_or(60000usize);
+
+    UdpTargetConfig {
+        target_addresses,
+        allowlist,
+        association_timeout_ms,
+    }
+}
+
+fn parse_udp_target_address(mut obj: JsonValue) -> UdpTargetAddress {
+    if obj.is_object() {
+        UdpTargetAddress {
+            address: obj["address"]
+                .take_string()
+                .expect("Target address is not a string"),
+            port: obj["port"]
+                .as_u16()
+                .expect("Target port is not a valid number"),
+        }
+    } else if obj.is_string() {
+        let mut s = obj.take_string().unwrap();
+        let i = s.rfind(':').expect("No port separator in address string");
+        let port_str = s.split_off(i + 1);
+        // Remove the colon.
+        s.pop();
+
+        UdpTargetAddress {
+            address: s,
+            port: port_str.parse().expect("Invalid target port"),
         }
     } else {
         panic!("Invalid target address: {}", obj);

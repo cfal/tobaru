@@ -15,11 +15,10 @@ mod rustls;
 
 use async_stream::AsyncStream;
 use async_tls::{AsyncTlsAcceptor, AsyncTlsConnector, AsyncTlsFactory};
-use config::ServerConfig;
 
 use std::fs::File;
 use std::io::Read;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -27,6 +26,8 @@ use log::{debug, error, info, warn};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::Builder;
 use treebitmap::IpLookupTable;
+
+use crate::config::{ServerConfig, TargetConfigs, TcpTargetConfig, UdpTargetConfig};
 
 const BUFFER_SIZE: usize = 8192;
 
@@ -99,7 +100,7 @@ async fn peek_tls_client_hello(stream: &TcpStream) -> std::io::Result<bool> {
 
 async fn setup_source_stream(
     stream: TcpStream,
-    server_tls_data: &Option<TargetTlsData>,
+    server_tls_data: &Option<ServerTlsData>,
 ) -> std::io::Result<Box<dyn AsyncStream>> {
     if let Some(data) = server_tls_data {
         if data.optional {
@@ -149,7 +150,7 @@ async fn setup_target_stream(
 async fn process_stream(
     stream: TcpStream,
     addr: &std::net::SocketAddr,
-    target_data: Arc<TargetData>,
+    target_data: Arc<TcpTargetData>,
 ) -> std::io::Result<()> {
     let target_address = if target_data.address_data.len() > 1 {
         // fetch_add wraps around on overflow.
@@ -237,15 +238,15 @@ async fn process_stream(
     Ok(())
 }
 
-struct TargetData {
-    pub server_tls_data: Option<TargetTlsData>,
+struct TcpTargetData {
+    pub server_tls_data: Option<ServerTlsData>,
     pub address_data: Vec<TargetAddressData>,
     pub next_address_index: AtomicUsize,
     pub early_connect: bool,
     pub tcp_nodelay: bool,
 }
 
-struct TargetTlsData {
+struct ServerTlsData {
     pub acceptor: Box<dyn AsyncTlsAcceptor>,
     pub optional: bool,
 }
@@ -262,10 +263,26 @@ async fn run(
 ) -> std::io::Result<()> {
     let ServerConfig {
         server_address,
-        target_configs,
         use_iptables,
+        target_configs,
     } = server_config;
 
+    match target_configs {
+        TargetConfigs::Tcp(target_configs) => {
+            return run_tcp(tls_factory, server_address, use_iptables, target_configs).await;
+        }
+        TargetConfigs::Udp(target_configs) => {
+            return run_udp(server_address, use_iptables, target_configs).await;
+        }
+    }
+}
+
+async fn run_tcp(
+    tls_factory: Arc<dyn AsyncTlsFactory>,
+    server_address: SocketAddr,
+    use_iptables: bool,
+    target_configs: Vec<TcpTargetConfig>,
+) -> std::io::Result<()> {
     let mut lookup_table = IpLookupTable::new();
 
     for target_config in target_configs {
@@ -278,7 +295,7 @@ async fn run(
             let mut key_bytes = vec![];
             key_file.read_to_end(&mut key_bytes)?;
 
-            Some(TargetTlsData {
+            Some(ServerTlsData {
                 acceptor: tls_factory.create_acceptor(&cert_bytes, &key_bytes),
                 optional: cfg.optional,
             })
@@ -300,7 +317,7 @@ async fn run(
             })
             .collect();
 
-        let target_data = Arc::new(TargetData {
+        let target_data = Arc::new(TcpTargetData {
             server_tls_data,
             address_data,
             next_address_index: AtomicUsize::new(0),
@@ -375,6 +392,14 @@ async fn run(
             }
         });
     }
+}
+
+async fn run_udp(
+    server_address: SocketAddr,
+    use_iptables: bool,
+    target_configs: Vec<UdpTargetConfig>,
+) -> std::io::Result<()> {
+    panic!("TODO");
 }
 
 fn main() {
