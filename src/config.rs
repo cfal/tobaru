@@ -45,13 +45,20 @@ pub struct TcpTargetConfig {
     pub tcp_nodelay: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct UdpTargetAddress {
     // We don't convert to SocketAddr here so that if it's a hostname,
     // it could be updated without restarting the process depending on
     // the system's DNS settings.
     pub address: String,
     pub port: u16,
+}
+
+impl std::fmt::Display for UdpTargetAddress {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        // Use `self.number` to refer to each positional data point.
+        write!(f, "{}:{}", self.address, self.port)
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -10,9 +10,10 @@ mod copy_bidirectional;
 mod iptables_util;
 #[cfg(feature = "tls-native")]
 mod native_tls;
-#[cfg(feature = "tls-rustls")]
 mod rustls;
 mod tcp;
+#[cfg(feature = "tls-rustls")]
+mod tokio_util;
 mod udp;
 
 use std::sync::Arc;
@@ -35,10 +36,7 @@ fn create_tls_factory() -> rustls::RustlsFactory {
     rustls::RustlsFactory::new()
 }
 
-async fn run(
-    server_config: ServerConfig,
-    tls_factory: Arc<dyn AsyncTlsFactory>,
-) -> std::io::Result<()> {
+async fn run(server_config: ServerConfig, tls_factory: Arc<dyn AsyncTlsFactory>) {
     let ServerConfig {
         server_address,
         use_iptables,
@@ -47,10 +45,18 @@ async fn run(
 
     match target_configs {
         TargetConfigs::Tcp(target_configs) => {
-            return run_tcp_server(tls_factory, server_address, use_iptables, target_configs).await;
+            // TODO: restart or panic?
+            if let Err(e) =
+                run_tcp_server(tls_factory, server_address, use_iptables, target_configs).await
+            {
+                error!("TCP forwarder finished with error: {}", e);
+            }
         }
         TargetConfigs::Udp(target_configs) => {
-            return run_udp_server(server_address, use_iptables, target_configs).await;
+            // TODO: restart or panic?
+            if let Err(e) = run_udp_server(server_address, use_iptables, target_configs).await {
+                error!("UDP forwarder finished with error: {}", e);
+            }
         }
     }
 }
@@ -110,11 +116,13 @@ fn main() {
 
     for server_config in server_configs {
         let cloned_factory = tls_factory.clone();
-        runtime.spawn(async move { run(server_config, cloned_factory).await });
+        runtime.spawn(async move {
+            run(server_config, cloned_factory).await;
+        });
     }
 
     let cloned_factory = tls_factory.clone();
-    runtime
-        .block_on(async move { run(last_config, cloned_factory).await })
-        .unwrap();
+    runtime.block_on(async move {
+        run(last_config, cloned_factory).await;
+    })
 }

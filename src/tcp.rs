@@ -13,6 +13,7 @@ use crate::async_tls::{AsyncTlsAcceptor, AsyncTlsConnector, AsyncTlsFactory};
 use crate::config::TcpTargetConfig;
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::iptables_util::{configure_iptables, Protocol};
+use crate::tokio_util::resolve_host;
 
 struct TcpTargetData {
     pub server_tls_data: Option<ServerTlsData>,
@@ -117,7 +118,7 @@ pub async fn run_tcp_server(
     }
 
     let listener = TcpListener::bind(server_address).await.unwrap();
-    info!("Listening: {}", listener.local_addr().unwrap());
+    info!("Listening (TCP): {}", listener.local_addr().unwrap());
 
     loop {
         let (stream, addr) = match listener.accept().await {
@@ -322,8 +323,8 @@ async fn setup_target_stream(
     target_address: &TargetAddressData,
     tcp_nodelay: bool,
 ) -> std::io::Result<Box<dyn AsyncStream>> {
-    let target_stream =
-        TcpStream::connect((target_address.address.as_str(), target_address.port)).await?;
+    let target_addr = resolve_host((target_address.address.as_str(), target_address.port)).await?;
+    let target_stream = TcpStream::connect(target_addr).await?;
 
     if tcp_nodelay {
         if let Err(e) = target_stream.set_nodelay(true) {
