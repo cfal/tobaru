@@ -1,18 +1,12 @@
 #![feature(available_concurrency)]
 
-#[cfg(all(feature = "tls-native", feature = "tls-rustls"))]
-compile_error!("only one of tls-native or tls-rustls can be enabled.");
-
 mod async_stream;
 mod async_tls;
 mod config;
 mod copy_bidirectional;
 mod iptables_util;
-#[cfg(feature = "tls-native")]
-mod native_tls;
-mod rustls;
 mod tcp;
-#[cfg(feature = "tls-rustls")]
+mod tls_factory;
 mod tokio_util;
 mod udp;
 
@@ -25,16 +19,6 @@ use crate::async_tls::AsyncTlsFactory;
 use crate::config::{ServerConfig, TargetConfigs};
 use crate::tcp::run_tcp_server;
 use crate::udp::run_udp_server;
-
-#[cfg(feature = "tls-native")]
-fn create_tls_factory() -> native_tls::NativeTlsFactory {
-    native_tls::NativeTlsFactory::new()
-}
-
-#[cfg(feature = "tls-rustls")]
-fn create_tls_factory() -> rustls::RustlsFactory {
-    rustls::RustlsFactory::new()
-}
 
 async fn run(server_config: ServerConfig, tls_factory: Arc<dyn AsyncTlsFactory>) {
     let ServerConfig {
@@ -64,7 +48,7 @@ async fn run(server_config: ServerConfig, tls_factory: Arc<dyn AsyncTlsFactory>)
 fn main() {
     env_logger::init();
 
-    let tls_factory: Arc<dyn AsyncTlsFactory> = Arc::new(create_tls_factory());
+    let tls_factory: Arc<dyn AsyncTlsFactory> = Arc::new(tls_factory::create_tls_factory());
 
     let mut config_paths = vec![];
     let mut clear_iptables_only = false;
