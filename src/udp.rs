@@ -279,7 +279,8 @@ async fn run_forward_task(
     last_active: Arc<AtomicU32>,
     mut rx: Receiver<AssociationMessage>,
 ) -> std::io::Result<()> {
-    let mut buf = create_boxed_slice(MAX_UDP_PACKET_SIZE);
+    let mut buf: [u8; MAX_UDP_PACKET_SIZE] =
+        unsafe { std::mem::MaybeUninit::uninit().assume_init() };
     let forward_send_timeout = tokio::time::Duration::from_millis(10);
     let forward_addr = resolve_host((target_address.address.as_str(), target_address.port)).await?;
     // TODO: bind to local interface only if forwarding to one.
