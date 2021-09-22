@@ -53,9 +53,12 @@ fn main() {
     let mut config_paths = vec![];
     let mut config_urls = vec![];
     let mut clear_iptables_only = false;
+    let mut num_threads = 0usize;
     for arg in std::env::args().skip(1) {
         if arg == "--clear-iptables" {
             clear_iptables_only = true;
+        } else if arg.starts_with("-t") {
+            num_threads = arg[2..].parse::<usize>().expect("Invalid thread count");
         } else if arg.find("://").is_some() {
             config_urls.push(arg);
         } else {
@@ -85,12 +88,14 @@ fn main() {
 
     let last_config = server_configs.pop().unwrap();
 
-    let num_threads = std::cmp::max(
-        2,
-        std::thread::available_concurrency()
-            .map(|n| n.get())
-            .unwrap_or(1),
-    );
+    if num_threads == 0 {
+        num_threads = std::cmp::max(
+            2,
+            std::thread::available_concurrency()
+                .map(|n| n.get())
+                .unwrap_or(1),
+        );
+    }
 
     debug!("Runtime threads: {}", num_threads);
 
