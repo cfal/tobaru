@@ -51,16 +51,19 @@ fn main() {
     let tls_factory: Arc<dyn AsyncTlsFactory> = Arc::new(tls_factory::create_tls_factory());
 
     let mut config_paths = vec![];
+    let mut config_urls = vec![];
     let mut clear_iptables_only = false;
     for arg in std::env::args().skip(1) {
         if arg == "--clear-iptables" {
             clear_iptables_only = true;
+        } else if arg.find("://").is_some() {
+            config_urls.push(arg);
         } else {
             config_paths.push(arg);
         }
     }
 
-    let mut server_configs: Vec<ServerConfig> = config::load_configs(config_paths);
+    let mut server_configs: Vec<ServerConfig> = config::load_configs(config_paths, config_urls);
 
     if server_configs.is_empty() {
         error!("No server configs found.");

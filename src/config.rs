@@ -68,7 +68,7 @@ pub struct UdpTargetConfig {
     pub association_timeout_secs: Option<u32>,
 }
 
-pub fn load_configs(config_paths: Vec<String>) -> Vec<ServerConfig> {
+pub fn load_configs(config_paths: Vec<String>, config_urls: Vec<String>) -> Vec<ServerConfig> {
     let mut config_objects: Vec<JsonValue> = config_paths
         .iter()
         .map(|config_path| {
@@ -94,6 +94,10 @@ pub fn load_configs(config_paths: Vec<String>) -> Vec<ServerConfig> {
     for config_object in config_objects.into_iter() {
         let configs = load_config(config_object, &ip_groups);
         all_configs.extend(configs.into_iter())
+    }
+
+    for config_url in config_urls {
+        all_configs.push(load_config_from_url(config_url, &ip_groups));
     }
 
     all_configs
@@ -166,6 +170,83 @@ fn convert_ip_mask(mask_str: &str) -> IpMask {
             }
         },
     }
+}
+
+fn load_config_from_url(url: String, ip_groups: &HashMap<String, Vec<IpMask>>) -> ServerConfig {
+    fn split(mut input: String, separator: &str) -> (String, String) {
+        match input.find(separator) {
+            Some(index) => {
+                let suffix = input.split_off(index + separator.len());
+                input.truncate(input.len() - separator.len());
+                (input, suffix)
+            }
+            None => (input, String::new()),
+        }
+    }
+
+    fn trim(input: &mut String, c: u8) {
+        let b = input.as_bytes();
+        let mut i = b.len() - 1;
+        while b[i] == c {
+            i -= 1;
+        }
+        input.truncate(i + 1);
+    }
+
+    fn b(input: String) -> bool {
+        input != "false" && input != "0"
+    }
+
+    let mut obj = JsonValue::new_object();
+
+    let (protocol, remaining) = split(url, "://");
+
+    obj.insert("protocol", protocol).unwrap();
+
+    let (mut address, query) = split(remaining, "?");
+    trim(&mut address, b'/');
+
+    obj.insert("bindAddress", address).unwrap();
+
+    // only a single target is supported with urls.
+    let mut target = JsonValue::new_object();
+
+    for param in query.split("&") {
+        let (key, value) = split(param.to_string(), "=");
+        if key == "iptables" {
+            obj.insert("iptables", b(value)).unwrap();
+        } else if key == "targetAddress" || key == "target" || key == "to" {
+            target.insert("address", value).unwrap();
+        } else if key == "tcp_nodelay" || key == "nodelay" || key == "tcpNodelay" {
+            target.insert("tcp_nodelay", b(value)).unwrap();
+        } else if key == "early_connect" || key == "earlyConnect" {
+            target.insert("early_connect", b(value)).unwrap()
+        } else if key == "allowlist" || key == "allow" || key == "allowed" {
+            target
+                .insert(
+                    "allowlist",
+                    value
+                        .split(",")
+                        .map(|item| item.to_string())
+                        .collect::<Vec<String>>(),
+                )
+                .unwrap();
+        } else {
+            panic!("Unknown query parameter: {}", key);
+        }
+    }
+
+    if !target.has_key("address") {
+        panic!("Config URL is missing target address.");
+    }
+
+    if !target.has_key("allowlist") {
+        panic!("Config URL is missing allowlist.");
+    }
+
+    obj.insert("target", target).unwrap();
+
+    parse_server_object(obj, ip_groups)
 }
 
 fn load_config(mut obj: JsonValue, ip_groups: &HashMap<String, Vec<IpMask>>) -> Vec<ServerConfig> {
