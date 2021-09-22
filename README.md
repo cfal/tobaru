@@ -11,17 +11,42 @@ Port forwarding tool written in Rust with advanced features, such as:
 
 ## Usage
 
-`tobaru <JSON config file> [JSON config file..]`
+`tobaru <config URL or file> [config URL or file..]`
 
-## Configuration
+## Simple configuration
 
-Configuration is done using JSON files. One difference from JSON is that configuration files can contain comment lines that begin with `//`.
+Simple configuration can be done by passing in URLs on the command line. The format is as follows:
+
+```
+<protocol>://<bind ip>:<bind port>?to=<target ip>:<target port>&key=value&key2=value2&...
+```
+
+- **protocol**: one of `tcp` or `udp`.
+- **bind ip** and **bind port**: ip of the interface and port to listen on
+
+Supported query keys:
+
+- **to, targetAddress, target**: address to forward to.
+- **allowlist**: list of comma separated netmasks to allow. if this is omitted, all source addresses are allowed.
+- **tcp_nodelay, nodelay, tcpNodelay**: enables tcp_nodelay.
+- **early_connect, earlyConnect**: enables early connect.
+
+## Advanced Configuration
+
+Advanced configuration is done using JSON files. One difference from JSON is that configuration files can contain comment lines that begin with `//`.
 
 ## Examples
 
-See the [examples](examples) directory for more examples.
+### Simple forwarding (command line)
 
-### Simple forwarding
+```bash
+tobaru 'udp://0.0.0.0:5353?to=192.168.8.1:8053'
+```
+
+Listens for udp traffic on port 5353 of all interfaces, and forwards to 192.168.8.1 port 8053. All source addresses are allowed.
+
+
+### Simple forwarding (config file)
 
 ```js
 {
