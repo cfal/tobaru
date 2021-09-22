@@ -206,7 +206,7 @@ fn load_config_from_url(url: String, ip_groups: &HashMap<String, Vec<IpMask>>) -
     let (mut address, query) = split(remaining, "?");
     trim(&mut address, b'/');
 
-    obj.insert("bindAddress", address).unwrap();
+    obj.insert("bindAddress", address.clone()).unwrap();
 
     // only a single target is supported with urls.
     let mut target = JsonValue::new_object();
@@ -237,11 +237,15 @@ fn load_config_from_url(url: String, ip_groups: &HashMap<String, Vec<IpMask>>) -
     }
 
     if !target.has_key("address") {
-        panic!("Config URL is missing target address.");
+        panic!("Config URL for {} is missing target address.", address);
     }
 
     if !target.has_key("allowlist") {
-        panic!("Config URL is missing allowlist.");
+        warn!(
+            "Config URL for {} missing allowlist, allowing all connections.",
+            address
+        );
+        target.insert("allowlist", vec!["0.0.0.0/0"]).unwrap();
     }
 
     obj.insert("target", target).unwrap();
