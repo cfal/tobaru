@@ -50,15 +50,13 @@ Listens for udp traffic on port 5353 of all interfaces, and forwards to 192.168.
 
 ```js
 {
-  "server": {
-    // Listen on all interfaces, on port 8080.
-    "bindAddress": "0.0.0.0:8080",
-    "target": {
-      // Forward to 192.168.8.1 port 80.
-      "address": "192.168.8.1:80",
-      // Allow connections from all addresses. 'all' is a special alias for 0.0.0.0/0.
-      "allowlist": "all"
-    }
+  // Listen on all interfaces, on port 8080.
+  "bindAddress": "0.0.0.0:8080",
+  "target": {
+    // Forward to 192.168.8.1 port 80.
+    "address": "192.168.8.1:80",
+    // Allow connections from all addresses. 'all' is a special alias for 0.0.0.0/0.
+    "allowlist": "all"
   }
 }
 ```
@@ -101,19 +99,17 @@ Connections from addresses that are not specified in `allowlist` will either be 
 
 ```js
 {
-  "server": {
-    // Listen on all interfaces, port 8080.
-    "bindAddress": "0.0.0.0:8080",
-    "target": {
-      // Round-robin forward to different addresses.
-      "addresses": [
-        "192.168.8.1:80",
-        "192.168.8.2:80",
-        "192.168.8.3:80",
-        "192.168.8.4:80"
-      ],
-      "allowlist": "all"
-    }
+  // Listen on all interfaces, port 8080.
+  "bindAddress": "0.0.0.0:8080",
+  "target": {
+    // Round-robin forward to different addresses.
+    "addresses": [
+      "192.168.8.1:80",
+      "192.168.8.2:80",
+      "192.168.8.3:80",
+      "192.168.8.4:80"
+    ],
+    "allowlist": "all"
   }
 }
 ```
@@ -122,28 +118,26 @@ Connections from addresses that are not specified in `allowlist` will either be 
 
 ```js
 {
-  "server": {
-    // Listen on port 8080
-    "bindAddress": "0.0.0.0:8080",
-    "targets": [
-      // Forward some IP ranges to 192.168.8.1 port 80.
-      {
-        "address": "192.168.8.1:80",
-        "allowlist": [
-          "192.168.1.0/24",
-          "192.168.2.0/24"
-        ]
-      },
-      // Forward other IP ranges to 192.168.8.2 port 80.
-      {
-        "address": "192.168.8.2:80",
-        "allowlist": [
-          "192.168.3.0/24",
-          "192.168.4.0/24"
-        ]
-      }
-    ]
-  }
+  // Listen on port 8080
+  "bindAddress": "0.0.0.0:8080",
+  "targets": [
+    // Forward some IP ranges to 192.168.8.1 port 80.
+    {
+      "address": "192.168.8.1:80",
+      "allowlist": [
+        "192.168.1.0/24",
+        "192.168.2.0/24"
+      ]
+    },
+    // Forward other IP ranges to 192.168.8.2 port 80.
+    {
+      "address": "192.168.8.2:80",
+      "allowlist": [
+        "192.168.3.0/24",
+        "192.168.4.0/24"
+      ]
+    }
+  ]
 }
 ```
 
@@ -200,19 +194,17 @@ Note that tobaru will need root access in order to configure iptables. It might 
 
 ```js
 {
-  "server": {
-    "bindAddress": "0.0.0.0:8080",
-    // Enable iptables auto-configuration.
-    "iptables": true,
-    "target": {
-      "address": "192.168.8.1:80",
-      // Allow only the following IP ranges. Packets from other IPs will be dropped.
-      "allowlist": [
-        "192.168.2.2/24",
-        "192.168.2.3/24",
-        "192.168.100.50"
-      ]
-    }
+  "bindAddress": "0.0.0.0:8080",
+  // Enable iptables auto-configuration.
+  "iptables": true,
+  "target": {
+    "address": "192.168.8.1:80",
+    // Allow only the following IP ranges. Packets from other IPs will be dropped.
+    "allowlist": [
+      "192.168.2.2/24",
+      "192.168.2.3/24",
+      "192.168.100.50"
+    ]
   }
 }
 ```
