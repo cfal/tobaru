@@ -1,4 +1,4 @@
-#![feature(available_concurrency)]
+#![feature(available_parallelism)]
 
 mod async_stream;
 mod async_tls;
@@ -91,7 +91,7 @@ fn main() {
     if num_threads == 0 {
         num_threads = std::cmp::max(
             2,
-            std::thread::available_concurrency()
+            std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(1),
         );
