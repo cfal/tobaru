@@ -68,8 +68,8 @@ pub async fn run_tcp_server(
             .map(|target_address| TargetAddressData {
                 address: target_address.address,
                 port: target_address.port,
-                tls_connector: if target_address.tls {
-                    Some(tls_factory.create_connector())
+                tls_connector: if let Some(cfg) = target_address.client_tls_config {
+                    Some(tls_factory.create_connector(cfg.verify))
                 } else {
                     None
                 },

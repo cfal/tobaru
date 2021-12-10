@@ -6,7 +6,7 @@ use crate::async_stream::AsyncStream;
 pub trait AsyncTlsFactory: Unpin + Send + Sync {
     fn create_acceptor(&self, cert_bytes: &[u8], key_bytes: &[u8]) -> Box<dyn AsyncTlsAcceptor>;
     // TODO: support different configs/certs.
-    fn create_connector(&self) -> Box<dyn AsyncTlsConnector>;
+    fn create_connector(&self, verify: bool) -> Box<dyn AsyncTlsConnector>;
 }
 
 #[async_trait]

@@ -62,10 +62,10 @@ impl AsyncTlsFactory for NativeTlsFactory {
         Box::new(acceptor)
     }
 
-    fn create_connector(&self) -> Box<dyn AsyncTlsConnector> {
+    fn create_connector(&self, verify: bool) -> Box<dyn AsyncTlsConnector> {
         let connector: tokio_native_tls::TlsConnector = native_tls::TlsConnector::builder()
-            .danger_accept_invalid_certs(true)
-            .danger_accept_invalid_hostnames(true)
+            .danger_accept_invalid_certs(!verify)
+            .danger_accept_invalid_hostnames(!verify)
             .build()
             .unwrap()
             .into();

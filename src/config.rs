@@ -24,23 +24,28 @@ pub struct TcpTargetAddress {
     // the system's DNS settings.
     pub address: String,
     pub port: u16,
-    pub tls: bool,
+    pub client_tls_config: Option<ClientTlsConfig>,
 }
 
 pub type IpMask = (Ipv6Addr, u32);
 
 #[derive(Debug, Clone)]
-pub struct TlsConfig {
+pub struct ServerTlsConfig {
     pub cert_path: String,
     pub key_path: String,
     pub optional: bool,
 }
 
 #[derive(Debug, Clone)]
+pub struct ClientTlsConfig {
+    pub verify: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct TcpTargetConfig {
     pub target_addresses: Vec<TcpTargetAddress>,
     pub allowlist: Vec<IpMask>,
-    pub server_tls_config: Option<TlsConfig>,
+    pub server_tls_config: Option<ServerTlsConfig>,
     pub early_connect: bool,
     pub tcp_nodelay: bool,
 }
@@ -338,11 +343,7 @@ fn parse_tcp_target_object(
     mut obj: JsonValue,
     ip_groups: &HashMap<String, Vec<IpMask>>,
 ) -> TcpTargetConfig {
-    let server_tls_config = if obj.has_key("serverTls") {
-        Some(parse_tls_object(obj["serverTls"].take()))
-    } else {
-        None
-    };
+    let server_tls_config = parse_server_tls_object(obj["serverTls"].take());
 
     let target_addresses = if obj.has_key("address") {
         vec![parse_tcp_target_address(obj["address"].take())]
@@ -410,11 +411,37 @@ fn lookup_ip_mask(s: &str, ip_groups: &HashMap<String, Vec<IpMask>>) -> Vec<IpMa
     }
 }
 
-fn parse_tls_object(mut obj: JsonValue) -> TlsConfig {
-    TlsConfig {
-        cert_path: obj["cert"].take_string().expect("No cert path"),
-        key_path: obj["key"].take_string().expect("No key path"),
-        optional: obj["optional"].as_bool().unwrap_or(false),
+fn parse_server_tls_object(obj: JsonValue) -> Option<ServerTlsConfig> {
+    match obj {
+        JsonValue::Null => None,
+        JsonValue::Object(mut o) => Some(ServerTlsConfig {
+            cert_path: o["cert"].take_string().expect("No cert path"),
+            key_path: o["key"].take_string().expect("No key path"),
+            optional: o["optional"].as_bool().unwrap_or(false),
+        }),
+        _ => {
+            panic!("Unknown server TLS config");
+        }
+    }
+}
+
+fn parse_client_tls_object(obj: JsonValue) -> Option<ClientTlsConfig> {
+    match obj {
+        JsonValue::Null => None,
+        JsonValue::Object(mut o) => {
+            let verify = o
+                .remove("verify")
+                .map(|v| v.as_bool().unwrap_or(true))
+                .unwrap_or(true);
+            Some(ClientTlsConfig { verify })
+        }
+        _ => {
+            if obj.as_bool().unwrap_or(false) {
+                Some(ClientTlsConfig { verify: true })
+            } else {
+                None
+            }
+        }
     }
 }
 
@@ -427,14 +454,25 @@ fn parse_tcp_target_address(mut obj: JsonValue) -> TcpTargetAddress {
             port: obj["port"]
                 .as_u16()
                 .expect("Target port is not a valid number"),
-            tls: obj["tls"].as_bool().unwrap_or(false),
+            client_tls_config: parse_client_tls_object(obj["tls"].take()),
         }
     } else if obj.is_string() {
         let mut s = obj.take_string().unwrap();
         let i = s.rfind(':').expect("No port separator in address string");
-        let mut port_str = s.split_off(i + 1);
+        let mut suffix_str = s.split_off(i + 1);
         // Remove the colon.
         s.pop();
+
+        let (mut port_str, query_str) = match suffix_str.find("/?") {
+            Some(i) => {
+                let query_str = suffix_str.split_off(i + 2);
+                // Remove the question mark and the slash.
+                suffix_str.pop();
+                suffix_str.pop();
+                (suffix_str, query_str)
+            }
+            None => (suffix_str, String::new()),
+        };
 
         let (port_str, tls) = if port_str.starts_with("+") {
             (port_str.split_off(1), true)
@@ -445,7 +483,13 @@ fn parse_tcp_target_address(mut obj: JsonValue) -> TcpTargetAddress {
         TcpTargetAddress {
             address: s,
             port: port_str.parse().expect("Invalid target port"),
-            tls,
+            client_tls_config: if tls {
+                Some(ClientTlsConfig {
+                    verify: !query_str.find("verify=false").is_some(),
+                })
+            } else {
+                None
+            },
         }
     } else {
         panic!("Invalid target address: {}", obj);
