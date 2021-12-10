@@ -1,6 +1,7 @@
 use crate::async_stream::AsyncStream;
 use crate::async_tls::{AsyncTlsAcceptor, AsyncTlsConnector, AsyncTlsFactory};
 
+use std::lazy::SyncOnceCell;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -34,6 +35,13 @@ impl AsyncTlsAcceptor for tokio_rustls::TlsAcceptor {
     }
 }
 
+fn get_dummy_dns_ref() -> webpki::DNSNameRef<'static> {
+    static INSTANCE: SyncOnceCell<webpki::DNSNameRef> = SyncOnceCell::new();
+    INSTANCE
+        .get_or_init(|| webpki::DNSNameRef::try_from_ascii_str("example.com").unwrap())
+        .clone()
+}
+
 #[async_trait]
 impl AsyncTlsConnector for tokio_rustls::TlsConnector {
     async fn connect(
@@ -45,8 +53,7 @@ impl AsyncTlsConnector for tokio_rustls::TlsConnector {
             Ok(d) => d,
             Err(_) => {
                 // Must not be a valid domain name.
-                webpki::DNSNameRef::try_from_ascii_str("example.com")
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+                get_dummy_dns_ref()
             }
         };
 
@@ -80,24 +87,31 @@ impl AsyncTlsFactory for RustlsFactory {
     }
 }
 
+pub struct DisabledVerifier;
+impl rustls::ServerCertVerifier for DisabledVerifier {
+    fn verify_server_cert(
+        &self,
+        _roots: &rustls::RootCertStore,
+        _presented_certs: &[rustls::Certificate],
+        _dns_name: webpki::DNSNameRef<'_>,
+        _ocsp: &[u8],
+    ) -> std::result::Result<rustls::ServerCertVerified, rustls::TLSError> {
+        Ok(rustls::ServerCertVerified::assertion())
+    }
+}
+fn get_disabled_verifier() -> Arc<DisabledVerifier> {
+    static INSTANCE: SyncOnceCell<Arc<DisabledVerifier>> = SyncOnceCell::new();
+    INSTANCE
+        .get_or_init(|| Arc::new(DisabledVerifier {}))
+        .clone()
+}
+
 fn create_client_config(verify: bool) -> rustls::ClientConfig {
     let mut config = rustls::ClientConfig::new();
     if !verify {
-        pub struct NoCertificateVerification;
-        impl rustls::ServerCertVerifier for NoCertificateVerification {
-            fn verify_server_cert(
-                &self,
-                _roots: &rustls::RootCertStore,
-                _presented_certs: &[rustls::Certificate],
-                _dns_name: webpki::DNSNameRef<'_>,
-                _ocsp: &[u8],
-            ) -> std::result::Result<rustls::ServerCertVerified, rustls::TLSError> {
-                Ok(rustls::ServerCertVerified::assertion())
-            }
-        }
         config
             .dangerous()
-            .set_certificate_verifier(Arc::new(NoCertificateVerification {}));
+            .set_certificate_verifier(get_disabled_verifier());
     }
     config
 }

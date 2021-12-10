@@ -1,4 +1,5 @@
 #![feature(available_parallelism)]
+#![feature(once_cell)]
 
 mod async_stream;
 mod async_tls;
