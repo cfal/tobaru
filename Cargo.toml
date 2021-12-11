@@ -6,7 +6,7 @@ edition = "2021"
 [features]
 default = ["tls-rustls"]
 tls-native = ["openssl", "tokio-native-tls", "native-tls"]
-tls-rustls = ["rustls", "tokio-rustls", "webpki"]
+tls-rustls = ["rustls", "rustls-pemfile", "tokio-rustls", "webpki-roots"]
 
 [dependencies]
 async-trait = "*"
@@ -18,11 +18,12 @@ log = "*"
 native-tls = { version = "*", optional = true }
 openssl = { version = "*", optional = true }
 rustls = { version = "*", features = ["dangerous_configuration"], optional = true }
+rustls-pemfile = { version = "*", optional = true }
 tokio = { version = "*", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-native-tls = { version = "*", optional = true }
 tokio-rustls = { version = "*", features = ["dangerous_configuration"], optional = true }
 treebitmap = "*"
-webpki = { version = "0.21.4", optional = true }
+webpki-roots = { version = "*", optional = true }
 
 [profile.release]
 opt-level = 3

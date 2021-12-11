@@ -5,7 +5,6 @@ use std::lazy::SyncOnceCell;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use rustls::Session;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
@@ -29,16 +28,16 @@ impl AsyncTlsAcceptor for tokio_rustls::TlsAcceptor {
         tokio_rustls::TlsAcceptor::accept(&self, stream)
             .await
             .map(|mut s| {
-                s.get_mut().1.set_buffer_limit(8192);
+                s.get_mut().1.set_buffer_limit(Some(8192));
                 Box::new(s) as Box<dyn AsyncStream>
             })
     }
 }
 
-fn get_dummy_dns_ref() -> webpki::DNSNameRef<'static> {
-    static INSTANCE: SyncOnceCell<webpki::DNSNameRef> = SyncOnceCell::new();
+fn get_dummy_server_name() -> rustls::ServerName {
+    static INSTANCE: SyncOnceCell<rustls::ServerName> = SyncOnceCell::new();
     INSTANCE
-        .get_or_init(|| webpki::DNSNameRef::try_from_ascii_str("example.com").unwrap())
+        .get_or_init(|| rustls::ServerName::try_from("example.com").unwrap())
         .clone()
 }
 
@@ -49,18 +48,15 @@ impl AsyncTlsConnector for tokio_rustls::TlsConnector {
         domain: &str,
         stream: TcpStream,
     ) -> std::io::Result<Box<dyn AsyncStream>> {
-        let domain = match webpki::DNSNameRef::try_from_ascii_str(domain) {
-            Ok(d) => d,
-            Err(_) => {
-                // Must not be a valid domain name.
-                get_dummy_dns_ref()
-            }
+        let server_name = match rustls::ServerName::try_from(domain) {
+            Ok(s) => s,
+            Err(_) => get_dummy_server_name(),
         };
 
-        tokio_rustls::TlsConnector::connect(&self, domain, stream)
+        tokio_rustls::TlsConnector::connect(&self, server_name, stream)
             .await
             .map(|mut s| {
-                s.get_mut().1.set_buffer_limit(8192);
+                s.get_mut().1.set_buffer_limit(Some(8192));
                 Box::new(s) as Box<dyn AsyncStream>
             })
     }
@@ -74,6 +70,42 @@ impl RustlsFactory {
     }
 }
 
+fn create_client_config(verify: bool) -> rustls::ClientConfig {
+    let builder = rustls::ClientConfig::builder().with_safe_defaults();
+
+    if !verify {
+        builder
+            .with_custom_certificate_verifier(get_disabled_verifier())
+            .with_no_client_auth()
+    } else {
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.add_server_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.0.iter().map(|ta| {
+            rustls::OwnedTrustAnchor::from_subject_spki_name_constraints(
+                ta.subject,
+                ta.spki,
+                ta.name_constraints,
+            )
+        }));
+        builder
+            .with_root_certificates(root_store)
+            .with_no_client_auth()
+    }
+}
+
+fn get_client_config(verify: bool) -> Arc<rustls::ClientConfig> {
+    static VERIFIED_INSTANCE: SyncOnceCell<Arc<rustls::ClientConfig>> = SyncOnceCell::new();
+    static UNVERIFIED_INSTANCE: SyncOnceCell<Arc<rustls::ClientConfig>> = SyncOnceCell::new();
+    if verify {
+        VERIFIED_INSTANCE
+            .get_or_init(|| Arc::new(create_client_config(true)))
+            .clone()
+    } else {
+        UNVERIFIED_INSTANCE
+            .get_or_init(|| Arc::new(create_client_config(false)))
+            .clone()
+    }
+}
+
 impl AsyncTlsFactory for RustlsFactory {
     fn create_acceptor(&self, cert_bytes: &[u8], key_bytes: &[u8]) -> Box<dyn AsyncTlsAcceptor> {
         let acceptor: tokio_rustls::TlsAcceptor =
@@ -82,21 +114,23 @@ impl AsyncTlsFactory for RustlsFactory {
     }
 
     fn create_connector(&self, verify: bool) -> Box<dyn AsyncTlsConnector> {
-        let connector: tokio_rustls::TlsConnector = Arc::new(create_client_config(verify)).into();
+        let connector: tokio_rustls::TlsConnector = get_client_config(verify).into();
         Box::new(connector)
     }
 }
 
 pub struct DisabledVerifier;
-impl rustls::ServerCertVerifier for DisabledVerifier {
+impl rustls::client::ServerCertVerifier for DisabledVerifier {
     fn verify_server_cert(
         &self,
-        _roots: &rustls::RootCertStore,
-        _presented_certs: &[rustls::Certificate],
-        _dns_name: webpki::DNSNameRef<'_>,
-        _ocsp: &[u8],
-    ) -> std::result::Result<rustls::ServerCertVerified, rustls::TLSError> {
-        Ok(rustls::ServerCertVerified::assertion())
+        _end_entity: &rustls::Certificate,
+        _intermediates: &[rustls::Certificate],
+        _server_name: &rustls::client::ServerName,
+        _scts: &mut dyn Iterator<Item = &[u8]>,
+        _ocsp_response: &[u8],
+        _now: std::time::SystemTime,
+    ) -> std::result::Result<rustls::client::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::ServerCertVerified::assertion())
     }
 }
 fn get_disabled_verifier() -> Arc<DisabledVerifier> {
@@ -106,31 +140,39 @@ fn get_disabled_verifier() -> Arc<DisabledVerifier> {
         .clone()
 }
 
-fn create_client_config(verify: bool) -> rustls::ClientConfig {
-    let mut config = rustls::ClientConfig::new();
-    if !verify {
-        config
-            .dangerous()
-            .set_certificate_verifier(get_disabled_verifier());
-    }
-    config
-}
-
 fn load_certs(cert_bytes: &[u8]) -> Vec<rustls::Certificate> {
     let mut reader = std::io::Cursor::new(cert_bytes);
-    rustls::internal::pemfile::certs(&mut reader).unwrap()
+    let mut certs = vec![];
+    for item in std::iter::from_fn(|| rustls_pemfile::read_one(&mut reader).transpose()) {
+        match item.unwrap() {
+            rustls_pemfile::Item::X509Certificate(cert) => {
+                certs.push(rustls::Certificate(cert));
+            }
+            _ => (),
+        }
+    }
+    certs
 }
 
 fn load_private_key(key_bytes: &[u8]) -> rustls::PrivateKey {
     let mut reader = std::io::Cursor::new(key_bytes);
-    let pkcs8_keys = rustls::internal::pemfile::pkcs8_private_keys(&mut reader).unwrap();
-    pkcs8_keys[0].clone()
+    for item in std::iter::from_fn(|| rustls_pemfile::read_one(&mut reader).transpose()) {
+        match item.unwrap() {
+            rustls_pemfile::Item::PKCS8Key(key) => {
+                return rustls::PrivateKey(key);
+            }
+            _ => (),
+        }
+    }
+    panic!("No private key found");
 }
 
 fn create_server_config(cert_bytes: &[u8], key_bytes: &[u8]) -> rustls::ServerConfig {
-    let mut config = rustls::ServerConfig::new(rustls::NoClientAuth::new());
     let certs = load_certs(cert_bytes);
     let privkey = load_private_key(key_bytes);
-    config.set_single_cert(certs, privkey).unwrap();
-    config
+    rustls::ServerConfig::builder()
+        .with_safe_defaults()
+        .with_no_client_auth()
+        .with_single_cert(certs, privkey)
+        .expect("bad certificate/key")
 }
