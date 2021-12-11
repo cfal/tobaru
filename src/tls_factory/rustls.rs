@@ -28,7 +28,7 @@ impl AsyncTlsAcceptor for tokio_rustls::TlsAcceptor {
         tokio_rustls::TlsAcceptor::accept(&self, stream)
             .await
             .map(|mut s| {
-                s.get_mut().1.set_buffer_limit(Some(8192));
+                s.get_mut().1.set_buffer_limit(Some(32768));
                 Box::new(s) as Box<dyn AsyncStream>
             })
     }
@@ -56,7 +56,7 @@ impl AsyncTlsConnector for tokio_rustls::TlsConnector {
         tokio_rustls::TlsConnector::connect(&self, server_name, stream)
             .await
             .map(|mut s| {
-                s.get_mut().1.set_buffer_limit(Some(8192));
+                s.get_mut().1.set_buffer_limit(Some(32768));
                 Box::new(s) as Box<dyn AsyncStream>
             })
     }
