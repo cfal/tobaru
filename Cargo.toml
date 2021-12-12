@@ -2,6 +2,13 @@
 name = "tobaru"
 version = "0.4.0"
 edition = "2021"
+license = "MIT"
+description = "Port forwarding CLI utility written in Rust with allowlists, TLS, iptables support, round-robin forwarding (load balancing), and IP-to-destination mapping."
+homepage = "https://github.com/cfal/tobaru/"
+repository = "https://github.com/cfal/tobaru/"
+readme = "README.md"
+keywords = ["tunnel", "proxy", "tcp", "forward", "port"]
+categories = ["command-line-utilities", "network-programming"]
 
 [features]
 default = ["tls-rustls"]
