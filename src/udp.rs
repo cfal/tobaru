@@ -11,6 +11,7 @@ use tokio::select;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::task::JoinHandle;
+use tokio::time::timeout;
 use treebitmap::IpLookupTable;
 
 use crate::config::{UdpTargetAddress, UdpTargetConfig};
@@ -215,7 +216,7 @@ impl Association {
         let last_active = Arc::new(AtomicU32::new(get_timestamp_secs()));
         let cloned_last_active = last_active.clone();
 
-        let (tx, rx) = channel::<AssociationMessage>(400);
+        let (tx, rx) = channel::<AssociationMessage>(1024);
         let join_handle = tokio::spawn(async move {
             if let Err(e) = run_forward_task(
                 client_address,
@@ -281,7 +282,7 @@ async fn run_forward_task(
 ) -> std::io::Result<()> {
     let mut buf: [u8; MAX_UDP_PACKET_SIZE] =
         unsafe { std::mem::MaybeUninit::uninit().assume_init() };
-    let forward_send_timeout = tokio::time::Duration::from_millis(10);
+    let forward_send_timeout = tokio::time::Duration::from_millis(40);
     let forward_addr = resolve_host((target_address.address.as_str(), target_address.port)).await?;
     // TODO: bind to local interface only if forwarding to one.
     let forward_socket = UdpSocket::bind("0.0.0.0:0").await?;
@@ -293,14 +294,22 @@ async fn run_forward_task(
                     Some(AssociationMessage::Data(data)) => {
                         // This previously did a try_send, but it seemed to skip a lot of messages
                         // depending on udp buffer size (on linux, this defaults to 212992).
-                        select! {
-                            res = forward_socket.send(&data) => {
-                                res?;
-                            }
-                            _ = tokio::time::sleep(forward_send_timeout) => {
-                                error!("Failed to forward data, send was too slow.");
+
+                        let send_future = timeout(
+                            forward_send_timeout,
+                            forward_socket.send(&data)
+                        );
+
+                        match send_future.await {
+                            Ok(Ok(_)) => (),
+                            Ok(Err(e)) => {
+                                error!("Failed to forward data: {}", e);
+                            },
+                            Err(elapsed) => {
+                                error!("Data forwarding timed out: {}", elapsed);
                             }
                         }
+
                         if last_active.swap(get_timestamp_secs(), Ordering::Relaxed) == 0 {
                             break;
                         }
