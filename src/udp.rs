@@ -106,7 +106,7 @@ pub async fn run_udp_server(
     }
 
     let server_socket = Arc::new(UdpSocket::bind(&server_address).await?);
-    info!("Listening (UDP): {}", server_address);
+    println!("Listening (UDP): {}", server_address);
 
     let mut buf = [0u8; MAX_UDP_PACKET_SIZE];
 

@@ -118,7 +118,7 @@ pub async fn run_tcp_server(
     }
 
     let listener = TcpListener::bind(server_address).await.unwrap();
-    info!("Listening (TCP): {}", listener.local_addr().unwrap());
+    println!("Listening (TCP): {}", listener.local_addr().unwrap());
 
     loop {
         let (stream, addr) = match listener.accept().await {
