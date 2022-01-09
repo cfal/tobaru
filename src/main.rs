@@ -1,4 +1,3 @@
-#![feature(available_parallelism)]
 #![feature(once_cell)]
 
 mod async_stream;
