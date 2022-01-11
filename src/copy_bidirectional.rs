@@ -130,6 +130,7 @@ impl CopyBuffer {
             // If we've written all the data and we've seen EOF, flush out the
             // data and finish the transfer.
             if self.read_done && self.cache_length == 0 {
+                ready!(writer.as_mut().poll_flush(cx))?;
                 return Poll::Ready(Ok(()));
             }
 
