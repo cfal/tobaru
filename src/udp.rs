@@ -209,7 +209,7 @@ impl Association {
 
         let (tx, rx) = channel::<AssociationMessage>(1024);
         let join_handle = tokio::spawn(async move {
-            if let Err(e) = run_forward_task(
+            if let Err(e) = run_forward_tasks(
                 client_address,
                 server_socket,
                 target_address,
@@ -264,70 +264,84 @@ impl Association {
     }
 }
 
-async fn run_forward_task(
+fn run_forward_to_target_task(
+    mut rx: Receiver<AssociationMessage>,
+    forward_socket: Arc<UdpSocket>,
+    forward_send_timeout: tokio::time::Duration,
+    last_active: Arc<AtomicU32>,
+) {
+    tokio::spawn(async move {
+        while let Some(client_msg) = rx.recv().await {
+            match client_msg {
+                AssociationMessage::Data(data) => {
+                    // This previously did a try_send, but it seemed to skip a lot of messages
+                    // depending on udp buffer size (on linux, this defaults to 212992).
+
+                    let send_future = timeout(forward_send_timeout, forward_socket.send(&data));
+
+                    match send_future.await {
+                        Ok(Ok(_)) => (),
+                        Ok(Err(e)) => {
+                            error!("Failed to forward data: {}", e);
+                        }
+                        Err(elapsed) => {
+                            error!("Data forwarding timed out: {}", elapsed);
+                        }
+                    }
+
+                    if last_active.swap(get_timestamp_secs(), Ordering::Relaxed) == 0 {
+                        return;
+                    }
+                }
+                AssociationMessage::Finish => {
+                    return;
+                }
+            }
+        }
+
+        panic!("channel closed unexpectedly");
+    });
+}
+
+fn run_forward_from_target_task(
+    forward_socket: Arc<UdpSocket>,
+    server_socket: Arc<UdpSocket>,
+    client_address: SocketAddr,
+    last_active: Arc<AtomicU32>,
+) {
+    let mut buf: [u8; MAX_UDP_PACKET_SIZE] =
+        unsafe { std::mem::MaybeUninit::uninit().assume_init() };
+    tokio::spawn(async move {
+        while let Ok(len) = forward_socket.recv(&mut buf).await {
+            if let Err(e) = server_socket.try_send_to(&buf[0..len], client_address) {
+                error!("Failed to relay response: {}", e);
+            }
+            if last_active.swap(get_timestamp_secs(), Ordering::Relaxed) == 0 {
+                break;
+            }
+        }
+    });
+}
+
+async fn run_forward_tasks(
     client_address: SocketAddr,
     server_socket: Arc<UdpSocket>,
     target_address: UdpTargetAddress,
     last_active: Arc<AtomicU32>,
-    mut rx: Receiver<AssociationMessage>,
+    rx: Receiver<AssociationMessage>,
 ) -> std::io::Result<()> {
-    let mut buf: [u8; MAX_UDP_PACKET_SIZE] =
-        unsafe { std::mem::MaybeUninit::uninit().assume_init() };
     let forward_send_timeout = tokio::time::Duration::from_millis(40);
     let forward_addr = resolve_host((target_address.address.as_str(), target_address.port)).await?;
     // TODO: bind to local interface only if forwarding to one.
-    let forward_socket = UdpSocket::bind("0.0.0.0:0").await?;
+    let forward_socket = UdpSocket::bind("0.0.0.0:0").await.map(Arc::new)?;
     forward_socket.connect(forward_addr).await?;
-    loop {
-        select! {
-            client_msg = rx.recv() => {
-                match client_msg {
-                    Some(AssociationMessage::Data(data)) => {
-                        // This previously did a try_send, but it seemed to skip a lot of messages
-                        // depending on udp buffer size (on linux, this defaults to 212992).
 
-                        let send_future = timeout(
-                            forward_send_timeout,
-                            forward_socket.send(&data)
-                        );
-
-                        match send_future.await {
-                            Ok(Ok(_)) => (),
-                            Ok(Err(e)) => {
-                                error!("Failed to forward data: {}", e);
-                            },
-                            Err(elapsed) => {
-                                error!("Data forwarding timed out: {}", elapsed);
-                            }
-                        }
-
-                        if last_active.swap(get_timestamp_secs(), Ordering::Relaxed) == 0 {
-                            break;
-                        }
-                    }
-                    Some(AssociationMessage::Finish) => {
-                        break;
-                    }
-                    None => {
-                        return Err(std::io::Error::new(std::io::ErrorKind::Other, "socket closed"));
-                    }
-                }
-            }
-            res = forward_socket.recv(&mut buf) => {
-                let len = res?;
-                // This could happen if things are congested, which is fine since we expect lossy
-                // behavior with udp.
-                // TODO: Unlike above, this doesn't seem to fail often with a try_send, perhaps due
-                // to the Arc?
-                if let Err(e) = server_socket.try_send_to(&buf[0..len], client_address) {
-                    error!("Failed to relay response: {}", e);
-                }
-                if last_active.swap(get_timestamp_secs(), Ordering::Relaxed) == 0 {
-                    break;
-                }
-            }
-        }
-    }
-    debug!("Finishing forward task.");
+    run_forward_to_target_task(
+        rx,
+        forward_socket.clone(),
+        forward_send_timeout,
+        last_active.clone(),
+    );
+    run_forward_from_target_task(forward_socket, server_socket, client_address, last_active);
     Ok(())
 }
