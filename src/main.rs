@@ -12,6 +12,7 @@ mod udp;
 
 use std::sync::Arc;
 
+use futures::future::try_join_all;
 use log::{debug, error, info};
 use tokio::runtime::Builder;
 
@@ -66,7 +67,7 @@ fn main() {
         }
     }
 
-    let mut server_configs: Vec<ServerConfig> = config::load_configs(config_paths, config_urls);
+    let server_configs: Vec<ServerConfig> = config::load_configs(config_paths, config_urls);
 
     if server_configs.is_empty() {
         error!("No server configs found.");
@@ -86,8 +87,6 @@ fn main() {
         return;
     }
 
-    let last_config = server_configs.pop().unwrap();
-
     if num_threads == 0 {
         num_threads = std::cmp::max(
             2,
@@ -106,15 +105,17 @@ fn main() {
         .build()
         .expect("Could not build tokio runtime");
 
-    for server_config in server_configs {
-        let cloned_factory = tls_factory.clone();
-        runtime.spawn(async move {
-            run(server_config, cloned_factory).await;
-        });
-    }
-
-    let cloned_factory = tls_factory.clone();
     runtime.block_on(async move {
-        run(last_config, cloned_factory).await;
-    })
+        let mut join_handles = Vec::with_capacity(server_configs.len());
+
+        for server_config in server_configs {
+            let cloned_factory = tls_factory.clone();
+            join_handles.push(tokio::spawn(async move {
+                run(server_config, cloned_factory).await;
+            }));
+        }
+
+        // Die on any server error.
+        try_join_all(join_handles).await.unwrap();
+    });
 }

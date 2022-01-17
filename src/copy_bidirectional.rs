@@ -6,7 +6,7 @@
 // - Read and write whenever there's a space
 // - Circular buffer
 
-use futures_util::ready;
+use futures::ready;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use std::future::Future;

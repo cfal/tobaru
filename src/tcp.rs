@@ -2,7 +2,8 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use log::{debug, error, info, warn};
+use futures::join;
+use log::{debug, error, warn};
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
@@ -177,7 +178,7 @@ async fn process_stream(
     );
 
     let (mut source_stream, mut target_stream) = if target_data.early_connect {
-        let (source_result, target_result) = futures_util::join!(
+        let (source_result, target_result) = join!(
             setup_source_stream(stream, &target_data.server_tls_data),
             setup_target_stream(addr, &target_address, target_data.tcp_nodelay)
         );
@@ -227,7 +228,7 @@ async fn process_stream(
         &target_address.port
     );
 
-    let (_, _) = futures_util::join!(source_stream.try_shutdown(), target_stream.try_shutdown());
+    let (_, _) = join!(source_stream.try_shutdown(), target_stream.try_shutdown());
 
     debug!(
         "Done: {}:{} to {}:{}",
