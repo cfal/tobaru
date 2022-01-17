@@ -35,14 +35,6 @@ fn get_timestamp_secs() -> u32 {
     SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs() as u32
 }
 
-fn create_boxed_slice(len: usize) -> Box<[u8]> {
-    let mut buf = Vec::with_capacity(len);
-    unsafe {
-        buf.set_len(len);
-    }
-    buf.into_boxed_slice()
-}
-
 pub async fn run_udp_server(
     server_address: SocketAddr,
     use_iptables: bool,
@@ -134,8 +126,7 @@ pub async fn run_udp_server(
                             }
                         };
 
-                        let mut copied_msg = create_boxed_slice(len);
-                        copied_msg.copy_from_slice(&buf[0..len]);
+                        let copied_msg = buf[0..len].to_vec().into_boxed_slice();
 
                         let target_address = if target_data.addresses.len() > 1 {
                             // fetch_add wraps around on overflow.
