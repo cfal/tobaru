@@ -75,7 +75,7 @@ fn create_client_config(verify: bool) -> rustls::ClientConfig {
 
     if !verify {
         builder
-            .with_custom_certificate_verifier(get_disabled_verifier())
+            .with_custom_certificate_verifier(Arc::new(DisabledVerifier {}))
             .with_no_client_auth()
     } else {
         let mut root_store = rustls::RootCertStore::empty();
@@ -132,12 +132,6 @@ impl rustls::client::ServerCertVerifier for DisabledVerifier {
     ) -> std::result::Result<rustls::client::ServerCertVerified, rustls::Error> {
         Ok(rustls::client::ServerCertVerified::assertion())
     }
-}
-fn get_disabled_verifier() -> Arc<DisabledVerifier> {
-    static INSTANCE: SyncOnceCell<Arc<DisabledVerifier>> = SyncOnceCell::new();
-    INSTANCE
-        .get_or_init(|| Arc::new(DisabledVerifier {}))
-        .clone()
 }
 
 fn load_certs(cert_bytes: &[u8]) -> Vec<rustls::Certificate> {
