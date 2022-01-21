@@ -267,7 +267,6 @@ impl Association {
 fn run_forward_to_target_task(
     mut rx: Receiver<AssociationMessage>,
     forward_socket: Arc<UdpSocket>,
-    forward_send_timeout: tokio::time::Duration,
     last_active: Arc<AtomicU32>,
 ) {
     tokio::spawn(async move {
@@ -276,17 +275,8 @@ fn run_forward_to_target_task(
                 AssociationMessage::Data(data) => {
                     // This previously did a try_send, but it seemed to skip a lot of messages
                     // depending on udp buffer size (on linux, this defaults to 212992).
-
-                    let send_future = timeout(forward_send_timeout, forward_socket.send(&data));
-
-                    match send_future.await {
-                        Ok(Ok(_)) => (),
-                        Ok(Err(e)) => {
-                            error!("Failed to forward data: {}", e);
-                        }
-                        Err(elapsed) => {
-                            error!("Data forwarding timed out: {}", elapsed);
-                        }
+                    if let Err(e) = forward_socket.send(&data).await {
+                        error!("Failed to forward data: {}", e);
                     }
 
                     if last_active.swap(get_timestamp_secs(), Ordering::Relaxed) == 0 {
@@ -313,7 +303,7 @@ fn run_forward_from_target_task(
         unsafe { std::mem::MaybeUninit::uninit().assume_init() };
     tokio::spawn(async move {
         while let Ok(len) = forward_socket.recv(&mut buf).await {
-            if let Err(e) = server_socket.try_send_to(&buf[0..len], client_address) {
+            if let Err(e) = server_socket.send_to(&buf[0..len], client_address).await {
                 error!("Failed to relay response: {}", e);
             }
             if last_active.swap(get_timestamp_secs(), Ordering::Relaxed) == 0 {
@@ -330,18 +320,12 @@ async fn run_forward_tasks(
     last_active: Arc<AtomicU32>,
     rx: Receiver<AssociationMessage>,
 ) -> std::io::Result<()> {
-    let forward_send_timeout = tokio::time::Duration::from_millis(40);
     let forward_addr = resolve_host((target_address.address.as_str(), target_address.port)).await?;
     // TODO: bind to local interface only if forwarding to one.
     let forward_socket = UdpSocket::bind("0.0.0.0:0").await.map(Arc::new)?;
     forward_socket.connect(forward_addr).await?;
 
-    run_forward_to_target_task(
-        rx,
-        forward_socket.clone(),
-        forward_send_timeout,
-        last_active.clone(),
-    );
+    run_forward_to_target_task(rx, forward_socket.clone(), last_active.clone());
     run_forward_from_target_task(forward_socket, server_socket, client_address, last_active);
     Ok(())
 }
