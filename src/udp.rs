@@ -5,13 +5,12 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use log::{debug, error, info, warn};
+use futures::join;
+use log::{debug, error, warn};
 use tokio::net::UdpSocket;
 use tokio::select;
-use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::task::JoinHandle;
-use tokio::time::timeout;
 use treebitmap::IpLookupTable;
 
 use crate::config::{UdpTargetAddress, UdpTargetConfig};
@@ -31,6 +30,7 @@ struct UdpTargetData {
     association_timeout_secs: u32,
 }
 
+#[inline]
 fn get_timestamp_secs() -> u32 {
     SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs() as u32
 }
@@ -167,32 +167,24 @@ pub async fn run_udp_server(
                 }
             }
             _ = cleanup_interval.tick() => {
-                // TODO: use drain_filter when stabilized.
                 let current_timestamp = get_timestamp_secs();
-                let mut cleanup_keys = vec![];
-                for (key, val) in associations.iter() {
-                    if val.maybe_abort(current_timestamp) {
-                        cleanup_keys.push(key.clone());
+                associations.retain(|k, val| {
+                    let last_active = val.last_active.load(Ordering::SeqCst);
+                    if current_timestamp - last_active < val.timeout_secs {
+                        true
+                    } else {
+                        debug!("Removing association: {:?}", k);
+                        false
                     }
-                }
-                for key in cleanup_keys {
-                    debug!("Removing association: {} -> {}", &key.0, &key.1);
-                    associations.remove(&key).unwrap();
-                }
+                });
             }
         }
     }
 }
 
-#[derive(Debug)]
-enum AssociationMessage {
-    Data(Box<[u8]>),
-    Finish,
-}
-
 struct Association {
     last_active: Arc<AtomicU32>,
-    tx: Sender<AssociationMessage>,
+    tx: Sender<Box<[u8]>>,
     join_handle: JoinHandle<()>,
     timeout_secs: u32,
 }
@@ -207,7 +199,7 @@ impl Association {
         let last_active = Arc::new(AtomicU32::new(get_timestamp_secs()));
         let cloned_last_active = last_active.clone();
 
-        let (tx, rx) = channel::<AssociationMessage>(1024);
+        let (tx, rx) = channel::<Box<[u8]>>(1024);
         let join_handle = tokio::spawn(async move {
             if let Err(e) = run_forward_tasks(
                 client_address,
@@ -230,70 +222,36 @@ impl Association {
         }
     }
 
-    fn maybe_abort(&self, current_timestamp: u32) -> bool {
-        let last_active = self.last_active.load(Ordering::SeqCst);
-        if current_timestamp - last_active >= self.timeout_secs {
-            self.abort();
-            true
-        } else {
-            false
-        }
-    }
-
-    fn abort(&self) {
-        if let Err(e) = self.tx.try_send(AssociationMessage::Finish) {
-            // There must be a ton of messages on the backlog?
-            match e {
-                TrySendError::Full(_) => {
-                    // Set last active to 0, which is used as another indicator
-                    // to break.
-                    self.last_active.store(0, Ordering::Relaxed);
-                }
-                TrySendError::Closed(_) => {
-                    // If the channel is already closed, then the task must
-                    // already have ended and it got dropped.
-                }
-            }
-        }
-    }
-
     fn try_send(&self, data: Box<[u8]>) -> std::io::Result<()> {
         self.tx
-            .try_send(AssociationMessage::Data(data))
+            .try_send(data)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
     }
 }
 
-fn run_forward_to_target_task(
-    mut rx: Receiver<AssociationMessage>,
+impl Drop for Association {
+    fn drop(&mut self) {
+        self.join_handle.abort();
+    }
+}
+
+async fn run_forward_to_target_task(
+    mut rx: Receiver<Box<[u8]>>,
     forward_socket: Arc<UdpSocket>,
     last_active: Arc<AtomicU32>,
 ) {
-    tokio::spawn(async move {
-        while let Some(client_msg) = rx.recv().await {
-            match client_msg {
-                AssociationMessage::Data(data) => {
-                    // This previously did a try_send, but it seemed to skip a lot of messages
-                    // depending on udp buffer size (on linux, this defaults to 212992).
-                    if let Err(e) = forward_socket.send(&data).await {
-                        error!("Failed to forward data: {}", e);
-                    }
-
-                    if last_active.swap(get_timestamp_secs(), Ordering::Relaxed) == 0 {
-                        return;
-                    }
-                }
-                AssociationMessage::Finish => {
-                    return;
-                }
-            }
+    while let Some(data) = rx.recv().await {
+        // This previously did a try_send, but it seemed to skip a lot of messages
+        // depending on udp buffer size (on linux, this defaults to 212992).
+        if let Err(e) = forward_socket.send(&data).await {
+            error!("Failed to forward data: {}", e);
         }
 
-        panic!("channel closed unexpectedly");
-    });
+        last_active.store(get_timestamp_secs(), Ordering::Relaxed);
+    }
 }
 
-fn run_forward_from_target_task(
+async fn run_forward_from_target_task(
     forward_socket: Arc<UdpSocket>,
     server_socket: Arc<UdpSocket>,
     client_address: SocketAddr,
@@ -301,16 +259,12 @@ fn run_forward_from_target_task(
 ) {
     let mut buf: [u8; MAX_UDP_PACKET_SIZE] =
         unsafe { std::mem::MaybeUninit::uninit().assume_init() };
-    tokio::spawn(async move {
-        while let Ok(len) = forward_socket.recv(&mut buf).await {
-            if let Err(e) = server_socket.send_to(&buf[0..len], client_address).await {
-                error!("Failed to relay response: {}", e);
-            }
-            if last_active.swap(get_timestamp_secs(), Ordering::Relaxed) == 0 {
-                break;
-            }
+    while let Ok(len) = forward_socket.recv(&mut buf).await {
+        if let Err(e) = server_socket.send_to(&buf[0..len], client_address).await {
+            error!("Failed to relay response: {}", e);
         }
-    });
+        last_active.store(get_timestamp_secs(), Ordering::Relaxed);
+    }
 }
 
 async fn run_forward_tasks(
@@ -318,14 +272,16 @@ async fn run_forward_tasks(
     server_socket: Arc<UdpSocket>,
     target_address: UdpTargetAddress,
     last_active: Arc<AtomicU32>,
-    rx: Receiver<AssociationMessage>,
+    rx: Receiver<Box<[u8]>>,
 ) -> std::io::Result<()> {
     let forward_addr = resolve_host((target_address.address.as_str(), target_address.port)).await?;
     // TODO: bind to local interface only if forwarding to one.
     let forward_socket = UdpSocket::bind("0.0.0.0:0").await.map(Arc::new)?;
     forward_socket.connect(forward_addr).await?;
 
-    run_forward_to_target_task(rx, forward_socket.clone(), last_active.clone());
-    run_forward_from_target_task(forward_socket, server_socket, client_address, last_active);
+    join!(
+        run_forward_to_target_task(rx, forward_socket.clone(), last_active.clone()),
+        run_forward_from_target_task(forward_socket, server_socket, client_address, last_active)
+    );
     Ok(())
 }
