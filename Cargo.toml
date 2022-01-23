@@ -16,22 +16,22 @@ tls-native = ["openssl", "tokio-native-tls", "native-tls"]
 tls-rustls = ["rustls", "rustls-pemfile", "tokio-rustls", "webpki-roots"]
 
 [dependencies]
-async-trait = "*"
-env_logger = "*"
-futures = "*"
-ipnet = "*"
-json = "*"
-log = "*"
-native-tls = { version = "*", optional = true }
-openssl = { version = "*", optional = true }
-parking_lot = "*"
-rustls = { version = "*", features = ["dangerous_configuration"], optional = true }
-rustls-pemfile = { version = "*", optional = true }
-tokio = { version = "*", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
-tokio-native-tls = { version = "*", optional = true }
-tokio-rustls = { version = "*", features = ["dangerous_configuration"], optional = true }
-treebitmap = "*"
-webpki-roots = { version = "*", optional = true }
+async-trait = "0.1.52"
+env_logger = "0.9.0"
+futures = "0.3.19"
+ipnet = "2.3.1"
+json = "0.12.4"
+log = "0.4.14"
+native-tls = { version = "0.2.8", optional = true }
+openssl = { version = "0.10.38", optional = true }
+parking_lot = "0.11.2"
+rustls = { version = "0.20.2", features = ["dangerous_configuration"], optional = true }
+rustls-pemfile = { version = "0.2.1", optional = true }
+tokio = { version = "1.14.0", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-native-tls = { version = "0.3.0", optional = true }
+tokio-rustls = { version = "0.23.1", features = ["dangerous_configuration"], optional = true }
+treebitmap = "0.4.0"
+webpki-roots = { version = "0.22.1", optional = true }
 
 [profile.release]
 opt-level = 3
