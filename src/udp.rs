@@ -7,10 +7,11 @@ use std::time::SystemTime;
 
 use futures::join;
 use log::{debug, error, warn};
+use parking_lot::Mutex;
 use tokio::net::UdpSocket;
-use tokio::select;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::task::JoinHandle;
+use tokio::time::{sleep, Duration};
 use treebitmap::IpLookupTable;
 
 use crate::config::{UdpTargetAddress, UdpTargetConfig};
@@ -41,7 +42,8 @@ pub async fn run_udp_server(
     target_configs: Vec<UdpTargetConfig>,
 ) -> std::io::Result<()> {
     let mut lookup_table = IpLookupTable::new();
-    let mut associations: HashMap<(SocketAddr, UdpTargetAddress), Association> = HashMap::new();
+    let associations: Arc<Mutex<HashMap<(SocketAddr, UdpTargetAddress), Association>>> =
+        Arc::new(Mutex::new(HashMap::new()));
 
     let mut min_association_timeout_secs: u32 = 0;
 
@@ -103,83 +105,84 @@ pub async fn run_udp_server(
 
     let mut buf = [0u8; MAX_UDP_PACKET_SIZE];
 
-    let mut cleanup_interval = tokio::time::interval(tokio::time::Duration::from_secs(
-        min_association_timeout_secs as u64,
-    ));
+    start_cleanup_task(associations.clone(), min_association_timeout_secs);
 
     loop {
-        select! {
-            res = server_socket.recv_from(&mut buf) => {
-                match res {
-                    Ok((len, addr)) => {
-                        let ip = match addr.ip() {
-                            IpAddr::V4(a) => a.to_ipv6_mapped(),
-                            IpAddr::V6(a) => a,
-                        };
+        let (len, addr) = server_socket
+            .recv_from(&mut buf)
+            .await
+            .expect("Could not read from server socket");
 
-                        let target_data = match lookup_table.longest_match(ip) {
-                            Some((_, _, d)) => d.clone(),
-                            None => {
-                                // Not allowed.
-                                warn!("Unknown address, ignoring: {}", addr.ip());
-                                continue;
-                            }
-                        };
+        let ip = match addr.ip() {
+            IpAddr::V4(a) => a.to_ipv6_mapped(),
+            IpAddr::V6(a) => a,
+        };
 
-                        let copied_msg = buf[0..len].to_vec().into_boxed_slice();
-
-                        let target_address = if target_data.addresses.len() > 1 {
-                            // fetch_add wraps around on overflow.
-                            let index = target_data
-                                .next_address_index
-                                .fetch_add(1, Ordering::Relaxed);
-                            &target_data.addresses[index % target_data.addresses.len()]
-                        } else {
-                            &target_data.addresses[0]
-                        };
-
-                        // Use `addr` here for the key, we only need `ip` for the lookup.
-                        let key = (addr, target_address.clone());
-                        let send_result = match associations.entry(key) {
-                            Entry::Occupied(o) => {
-                                o.get().try_send(copied_msg)
-                            }
-                            Entry::Vacant(v) => {
-                                debug!("Creating new association: {} -> {}", &addr, &target_address);
-                                let new_assoc = Association::new(
-                                    addr,
-                                    server_socket.clone(),
-                                    target_address.clone(),
-                                    target_data.association_timeout_secs,
-                                );
-                                v.insert(new_assoc)
-                                    .try_send(copied_msg)
-                            }
-                        };
-                        // Sends can fail if the channel is full.
-                        if let Err(e) = send_result {
-                            error!("Failed to send: {}", e);
-                        }
-                    }
-                    Err(e) => {
-                        panic!("Failed to receive from server socket: {}", e);
-                    }
-                }
+        let target_data = match lookup_table.longest_match(ip) {
+            Some((_, _, d)) => d.clone(),
+            None => {
+                // Not allowed.
+                warn!("Unknown address, ignoring: {}", addr.ip());
+                continue;
             }
-            _ = cleanup_interval.tick() => {
-                let current_timestamp = get_timestamp_secs();
-                associations.retain(|k, val| {
-                    let last_active = val.last_active.load(Ordering::SeqCst);
-                    if current_timestamp - last_active < val.timeout_secs {
-                        true
-                    } else {
-                        debug!("Removing association: {:?}", k);
-                        false
-                    }
-                });
+        };
+
+        let copied_msg = buf[0..len].to_vec().into_boxed_slice();
+
+        let target_address = if target_data.addresses.len() > 1 {
+            // fetch_add wraps around on overflow.
+            let index = target_data
+                .next_address_index
+                .fetch_add(1, Ordering::Relaxed);
+            &target_data.addresses[index % target_data.addresses.len()]
+        } else {
+            &target_data.addresses[0]
+        };
+
+        // Use `addr` here for the key, we only need `ip` for the lookup.
+        let key = (addr, target_address.clone());
+        let send_result = match associations.lock().entry(key) {
+            Entry::Occupied(o) => o.get().try_send(copied_msg),
+            Entry::Vacant(v) => {
+                debug!("Creating new association: {} -> {}", &addr, &target_address);
+                let new_assoc = Association::new(
+                    addr,
+                    server_socket.clone(),
+                    target_address.clone(),
+                    target_data.association_timeout_secs,
+                );
+                v.insert(new_assoc).try_send(copied_msg)
             }
+        };
+
+        // Sends can fail if the channel is full.
+        if let Err(e) = send_result {
+            error!("Failed to send: {}", e);
         }
     }
+}
+
+fn start_cleanup_task(
+    associations: Arc<Mutex<HashMap<(SocketAddr, UdpTargetAddress), Association>>>,
+    min_association_timeout_secs: u32,
+) {
+    let cleanup_interval = Duration::from_secs(min_association_timeout_secs as u64);
+
+    tokio::spawn(async move {
+        loop {
+            sleep(cleanup_interval).await;
+            let current_timestamp = get_timestamp_secs();
+            associations.lock().retain(|k, val| {
+                let last_active = val.last_active.load(Ordering::SeqCst);
+                if current_timestamp - last_active < val.timeout_secs {
+                    true
+                } else {
+                    debug!("Removing association: {:?}", k);
+                    false
+                }
+            });
+        }
+    });
 }
 
 struct Association {

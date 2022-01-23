@@ -24,6 +24,7 @@ json = "*"
 log = "*"
 native-tls = { version = "*", optional = true }
 openssl = { version = "*", optional = true }
+parking_lot = "*"
 rustls = { version = "*", features = ["dangerous_configuration"], optional = true }
 rustls-pemfile = { version = "*", optional = true }
 tokio = { version = "*", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
