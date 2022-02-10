@@ -294,7 +294,7 @@ fn parse_server_object(
         .next()
         .expect("Unable to resolve bind address");
 
-    let use_iptables = obj["iptables"].as_bool().unwrap_or(false);
+    let use_iptables = is_true_value(&obj["iptables"], false);
 
     let target_configs = match obj["protocol"].as_str().unwrap_or("tcp") {
         "tcp" => {
@@ -417,7 +417,7 @@ fn parse_server_tls_object(obj: JsonValue) -> Option<ServerTlsConfig> {
         JsonValue::Object(mut o) => Some(ServerTlsConfig {
             cert_path: o["cert"].take_string().expect("No cert path"),
             key_path: o["key"].take_string().expect("No key path"),
-            optional: o["optional"].as_bool().unwrap_or(false),
+            optional: is_true_value(&o["optional"], false),
         }),
         _ => {
             panic!("Unknown server TLS config");
@@ -431,12 +431,12 @@ fn parse_client_tls_object(obj: JsonValue) -> Option<ClientTlsConfig> {
         JsonValue::Object(mut o) => {
             let verify = o
                 .remove("verify")
-                .map(|v| v.as_bool().unwrap_or(true))
+                .map(|v| is_true_value(&v, true))
                 .unwrap_or(true);
             Some(ClientTlsConfig { verify })
         }
         _ => {
-            if obj.as_bool().unwrap_or(false) {
+            if is_true_value(&obj, false) {
                 Some(ClientTlsConfig { verify: true })
             } else {
                 None
@@ -561,4 +561,15 @@ fn parse_udp_target_address(mut obj: JsonValue) -> UdpTargetAddress {
     } else {
         panic!("Invalid target address: {}", obj);
     }
+}
+
+fn is_true_value(value: &JsonValue, default_value: bool) -> bool {
+    if value.is_string() {
+        let value_str = value.as_str().unwrap();
+        return value_str == "true" || value_str == "1" || value_str == "yes";
+    } else if value.is_number() {
+        let value = value.as_i32().unwrap();
+        return value == 1;
+    }
+    value.as_bool().unwrap_or(default_value)
 }
