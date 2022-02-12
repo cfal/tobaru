@@ -155,6 +155,9 @@ fn load_private_key(key_bytes: &[u8]) -> rustls::PrivateKey {
             rustls_pemfile::Item::PKCS8Key(key) => {
                 return rustls::PrivateKey(key);
             }
+            rustls_pemfile::Item::RSAKey(key) => {
+                return rustls::PrivateKey(key);
+            }
             _ => (),
         }
     }
