@@ -167,9 +167,11 @@ fn load_private_key(key_bytes: &[u8]) -> rustls::PrivateKey {
 fn create_server_config(cert_bytes: &[u8], key_bytes: &[u8]) -> rustls::ServerConfig {
     let certs = load_certs(cert_bytes);
     let privkey = load_private_key(key_bytes);
-    rustls::ServerConfig::builder()
+    let mut config = rustls::ServerConfig::builder()
         .with_safe_defaults()
         .with_no_client_auth()
         .with_single_cert(certs, privkey)
-        .expect("bad certificate/key")
+        .expect("bad certificate/key");
+    config.max_early_data_size = u32::MAX;
+    config
 }
