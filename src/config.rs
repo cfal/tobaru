@@ -45,7 +45,7 @@ pub struct ClientTlsConfig {
 
 #[derive(Debug, Clone)]
 pub struct TcpTargetConfig {
-    pub allowlist: Vec<IpMask>,
+    pub allowed_ips: Vec<IpMask>,
     pub target_addresses: Vec<TcpTargetAddress>,
     pub server_tls_config: Option<ServerTlsConfig>,
     pub early_connect: bool,
@@ -71,7 +71,7 @@ impl std::fmt::Display for UdpTargetAddress {
 #[derive(Debug, Clone)]
 pub struct UdpTargetConfig {
     pub target_addresses: Vec<UdpTargetAddress>,
-    pub allowlist: Vec<IpMask>,
+    pub allowed_ips: Vec<IpMask>,
     pub association_timeout_secs: Option<u32>,
 }
 
@@ -285,15 +285,22 @@ fn parse_tcp_target_object(
         panic!("No target addresses specified.");
     }
 
-    let allowlist = match obj["allowlist"].take() {
+    // support allowlist key for backwards compatibility
+    let allowed_ips_obj = if obj.has_key("allowed_ips") {
+        obj["allowed_ips"].take()
+    } else {
+        obj["allowlist"].take()
+    };
+
+    let allowed_ips = match allowed_ips_obj {
         JsonValue::String(s) => lookup_ip_mask(&s, ip_groups),
         JsonValue::Short(s) => lookup_ip_mask(s.as_str(), ip_groups),
         JsonValue::Array(v) => v
             .into_iter()
-            .map(|v| lookup_ip_mask(v.as_str().expect("Invalid allowlist entry"), ip_groups))
+            .map(|v| lookup_ip_mask(v.as_str().expect("Invalid allowed_ips entry"), ip_groups))
             .collect::<Vec<Vec<IpMask>>>()
             .concat(),
-        invalid => panic!("Invalid allowlist value: {}", invalid),
+        invalid => panic!("Invalid allowed_ips value: {}", invalid),
     };
 
     let early_connect = match obj["early_connect"].take() {
@@ -315,7 +322,7 @@ fn parse_tcp_target_object(
     TcpTargetConfig {
         server_tls_config,
         target_addresses,
-        allowlist,
+        allowed_ips,
         early_connect,
         tcp_nodelay,
     }
@@ -440,22 +447,29 @@ fn parse_udp_target_object(
         panic!("No target addresses specified.");
     }
 
-    let allowlist = match obj["allowlist"].take() {
+    // support allowlist key for backwards compatibility
+    let allowed_ips_obj = if obj.has_key("allowed_ips") {
+        obj["allowed_ips"].take()
+    } else {
+        obj["allowlist"].take()
+    };
+
+    let allowed_ips = match allowed_ips_obj {
         JsonValue::String(s) => lookup_ip_mask(&s, ip_groups),
         JsonValue::Short(s) => lookup_ip_mask(s.as_str(), ip_groups),
         JsonValue::Array(v) => v
             .into_iter()
-            .map(|v| lookup_ip_mask(v.as_str().expect("Invalid allowlist entry"), ip_groups))
+            .map(|v| lookup_ip_mask(v.as_str().expect("Invalid allowed_ips entry"), ip_groups))
             .collect::<Vec<Vec<IpMask>>>()
             .concat(),
-        invalid => panic!("Invalid allowlist value: {}", invalid),
+        invalid => panic!("Invalid allowed_ips value: {}", invalid),
     };
 
     let association_timeout_secs = obj["association_timeout_secs"].as_u32();
 
     UdpTargetConfig {
         target_addresses,
-        allowlist,
+        allowed_ips,
         association_timeout_secs,
     }
 }

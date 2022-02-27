@@ -67,7 +67,7 @@ pub async fn run_udp_server(
             association_timeout_secs,
         });
 
-        for (addr, masklen) in target_config.allowlist.into_iter() {
+        for (addr, masklen) in target_config.allowed_ips.into_iter() {
             if lookup_table
                 .insert(addr, masklen, target_data.clone())
                 .is_some()

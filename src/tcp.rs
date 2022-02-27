@@ -85,7 +85,7 @@ pub async fn run_tcp_server(
             tcp_nodelay: target_config.tcp_nodelay,
         });
 
-        for (addr, masklen) in target_config.allowlist.into_iter() {
+        for (addr, masklen) in target_config.allowed_ips.into_iter() {
             if lookup_table
                 .insert(addr, masklen, target_data.clone())
                 .is_some()
