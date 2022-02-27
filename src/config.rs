@@ -1,7 +1,7 @@
 use json::JsonValue;
+use log::{debug, warn};
 use percent_encoding::percent_decode_str;
 use url::Url;
-use log::{debug, warn};
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
@@ -33,6 +33,7 @@ pub type IpMask = (Ipv6Addr, u32);
 
 #[derive(Debug, Clone)]
 pub struct ServerTlsConfig {
+    pub allowed_sni_hostnames: Option<Vec<String>>,
     pub cert_path: String,
     pub key_path: String,
     pub optional: bool,
@@ -320,9 +321,9 @@ fn parse_tcp_target_object(
     };
 
     TcpTargetConfig {
+        allowed_ips,
         server_tls_config,
         target_addresses,
-        allowed_ips,
         early_connect,
         tcp_nodelay,
     }
@@ -344,11 +345,39 @@ fn lookup_ip_mask(s: &str, ip_groups: &HashMap<String, Vec<IpMask>>) -> Vec<IpMa
 fn parse_server_tls_object(obj: JsonValue) -> Option<ServerTlsConfig> {
     match obj {
         JsonValue::Null => None,
-        JsonValue::Object(mut o) => Some(ServerTlsConfig {
-            cert_path: o["cert"].take_string().expect("No cert path"),
-            key_path: o["key"].take_string().expect("No key path"),
-            optional: is_true_value(&o["optional"], false),
-        }),
+        JsonValue::Object(mut o) => {
+            let allowed_sni_hostnames = match o["allowed_sni_hostnames"].take() {
+                JsonValue::String(s) => Some(vec![s]),
+                JsonValue::Short(s) => Some(vec![s.to_string()]),
+                JsonValue::Array(v) => {
+                    let hostnames = v
+                        .into_iter()
+                        .map(|v| {
+                            v.as_str()
+                                .expect("Invalid allowed_sni_hostnames entry")
+                                .to_string()
+                        })
+                        .collect::<Vec<_>>();
+                    if hostnames.is_empty() {
+                        panic!("allowed_sni_hostnames is empty");
+                    }
+                    Some(hostnames)
+                }
+                JsonValue::Null => None,
+                invalid => panic!("Invalid allowed_sni_hostnames value: {}", invalid),
+            };
+
+            let cert_path = o["cert"].take_string().expect("No cert path");
+            let key_path = o["key"].take_string().expect("No key path");
+            let optional = is_true_value(&o["optional"], false);
+
+            Some(ServerTlsConfig {
+                allowed_sni_hostnames,
+                cert_path,
+                key_path,
+                optional,
+            })
+        }
         _ => {
             panic!("Unknown server TLS config");
         }
