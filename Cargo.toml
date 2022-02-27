@@ -25,12 +25,14 @@ log = "*"
 native-tls = { version = "*", optional = true }
 openssl = { version = "*", optional = true }
 parking_lot = "*"
+percent-encoding = "*"
 rustls = { version = "*", features = ["dangerous_configuration"], optional = true }
 rustls-pemfile = { version = "*", optional = true }
 tokio = { version = "*", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-native-tls = { version = "*", optional = true }
 tokio-rustls = { version = "*", features = ["dangerous_configuration"], optional = true }
 treebitmap = "*"
+url = "*"
 webpki-roots = { version = "*", optional = true }
 
 [profile.release]

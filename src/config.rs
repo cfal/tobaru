@@ -1,4 +1,6 @@
 use json::JsonValue;
+use percent_encoding::percent_decode_str;
+use url::Url;
 use log::{debug, warn};
 
 use std::collections::HashMap;
@@ -43,8 +45,8 @@ pub struct ClientTlsConfig {
 
 #[derive(Debug, Clone)]
 pub struct TcpTargetConfig {
-    pub target_addresses: Vec<TcpTargetAddress>,
     pub allowlist: Vec<IpMask>,
+    pub target_addresses: Vec<TcpTargetAddress>,
     pub server_tls_config: Option<ServerTlsConfig>,
     pub early_connect: bool,
     pub tcp_nodelay: bool,
@@ -102,7 +104,9 @@ pub fn load_configs(config_paths: Vec<String>, config_urls: Vec<String>) -> Vec<
     }
 
     for config_url in config_urls {
-        all_configs.push(load_config_from_url(config_url, &ip_groups));
+        let config_object = convert_url_to_obj(&config_url).unwrap();
+        let configs = load_config(config_object, &ip_groups);
+        all_configs.extend(configs.into_iter())
     }
 
     all_configs
@@ -175,87 +179,6 @@ fn convert_ip_mask(mask_str: &str) -> IpMask {
             }
         },
     }
-}
-
-fn load_config_from_url(url: String, ip_groups: &HashMap<String, Vec<IpMask>>) -> ServerConfig {
-    fn split(mut input: String, separator: &str) -> (String, String) {
-        match input.find(separator) {
-            Some(index) => {
-                let suffix = input.split_off(index + separator.len());
-                input.truncate(input.len() - separator.len());
-                (input, suffix)
-            }
-            None => (input, String::new()),
-        }
-    }
-
-    fn trim(input: &mut String, c: u8) {
-        let b = input.as_bytes();
-        let mut i = b.len() - 1;
-        while b[i] == c {
-            i -= 1;
-        }
-        input.truncate(i + 1);
-    }
-
-    fn b(input: String) -> bool {
-        input != "false" && input != "0"
-    }
-
-    let mut obj = JsonValue::new_object();
-
-    let (protocol, remaining) = split(url, "://");
-
-    obj.insert("protocol", protocol).unwrap();
-
-    let (mut address, query) = split(remaining, "?");
-    trim(&mut address, b'/');
-
-    obj.insert("bindAddress", address.clone()).unwrap();
-
-    // only a single target is supported with urls.
-    let mut target = JsonValue::new_object();
-
-    for param in query.split("&") {
-        let (key, value) = split(param.to_string(), "=");
-        if key == "iptables" {
-            obj.insert("iptables", b(value)).unwrap();
-        } else if key == "targetAddress" || key == "target" || key == "to" {
-            target.insert("address", value).unwrap();
-        } else if key == "tcp_nodelay" || key == "nodelay" || key == "tcpNodelay" {
-            target.insert("tcp_nodelay", b(value)).unwrap();
-        } else if key == "early_connect" || key == "earlyConnect" {
-            target.insert("early_connect", b(value)).unwrap()
-        } else if key == "allowlist" || key == "allow" || key == "allowed" {
-            target
-                .insert(
-                    "allowlist",
-                    value
-                        .split(",")
-                        .map(|item| item.to_string())
-                        .collect::<Vec<String>>(),
-                )
-                .unwrap();
-        } else {
-            panic!("Unknown query parameter: {}", key);
-        }
-    }
-
-    if !target.has_key("address") {
-        panic!("Config URL for {} is missing target address.", address);
-    }
-
-    if !target.has_key("allowlist") {
-        warn!(
-            "Config URL for {} missing allowlist, allowing all connections.",
-            address
-        );
-        target.insert("allowlist", vec!["0.0.0.0/0"]).unwrap();
-    }
-
-    obj.insert("target", target).unwrap();
-
-    parse_server_object(obj, ip_groups)
 }
 
 fn load_config(mut obj: JsonValue, ip_groups: &HashMap<String, Vec<IpMask>>) -> Vec<ServerConfig> {
@@ -572,4 +495,64 @@ fn is_true_value(value: &JsonValue, default_value: bool) -> bool {
         return value == 1;
     }
     value.as_bool().unwrap_or(default_value)
+}
+
+fn convert_url_to_obj(url_str: &str) -> std::result::Result<JsonValue, String> {
+    let url = Url::parse(url_str).map_err(|e| format!("Failed to parse url: {}", e))?;
+
+    let mut json_obj = JsonValue::new_object();
+
+    let protocol = url.scheme();
+
+    json_obj.insert("protocol", protocol.to_string()).unwrap();
+
+    let host_str = match url.host_str() {
+        Some(s) => s.to_string(),
+        None => {
+            return Err(format!("URL missing host: {}", url_str));
+        }
+    };
+
+    let address = match url.port() {
+        Some(port) => format!("{}:{}", host_str, port),
+        None => host_str,
+    };
+
+    json_obj.insert("bindAddress", address).unwrap();
+
+    for (query_key, query_value) in url.query_pairs().into_owned() {
+        let new_value = JsonValue::String(
+            percent_decode_str(&query_value)
+                .decode_utf8()
+                .unwrap()
+                .into_owned(),
+        );
+
+        let mut key_parts = query_key.split('.').collect::<Vec<_>>();
+        let final_part = key_parts.pop().unwrap();
+
+        let mut current_obj = &mut json_obj;
+        for key_part in key_parts.into_iter() {
+            if !current_obj.has_key(&key_part) {
+                current_obj[key_part] = JsonValue::new_object();
+            }
+            current_obj = &mut current_obj[key_part];
+        }
+
+        if current_obj.has_key(final_part) {
+            let existing_value = &mut current_obj[final_part];
+            if existing_value.is_array() {
+                existing_value.push(new_value).unwrap();
+            } else {
+                let existing_value = current_obj.remove(final_part);
+                current_obj
+                    .insert(final_part, vec![existing_value, new_value])
+                    .unwrap();
+            }
+        } else {
+            current_obj.insert(final_part, new_value).unwrap();
+        }
+    }
+
+    Ok(json_obj)
 }
