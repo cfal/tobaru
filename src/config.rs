@@ -220,11 +220,7 @@ fn parse_server_object(
 
     let use_iptables = is_true_value(&obj["iptables"], false);
 
-    let target_value = if obj.has_key("target") {
-        obj["target"].take()
-    } else {
-        obj["targets"].take()
-    };
+    let target_value = take_existing(&mut obj, &["target", "targets", "to"]);
 
     let target_objs = match target_value {
         JsonValue::String(s) => {
@@ -317,11 +313,7 @@ fn parse_tcp_target_object(
 }
 
 fn parse_allowed_ips(obj: &mut JsonValue, ip_groups: &HashMap<String, Vec<IpMask>>) -> Vec<IpMask> {
-    let allowed_ips_obj = if obj.has_key("allowed_ips") {
-        obj["allowed_ips"].take()
-    } else {
-        obj["allowlist"].take()
-    };
+    let allowed_ips_obj = take_existing(obj, &["allowed_ips", "allowlist"]);
 
     let allowed_ip_strs = match allowed_ips_obj {
         JsonValue::String(s) => vec![s],
@@ -594,4 +586,13 @@ fn convert_url_to_obj(url_str: &str) -> std::result::Result<JsonValue, String> {
     }
 
     Ok(json_obj)
+}
+
+fn take_existing(obj: &mut JsonValue, keys: &[&str]) -> JsonValue {
+    for key in keys {
+        if obj.has_key(*key) {
+            return obj[*key].take();
+        }
+    }
+    JsonValue::Null
 }
