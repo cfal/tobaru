@@ -220,35 +220,37 @@ fn parse_server_object(
 
     let use_iptables = is_true_value(&obj["iptables"], false);
 
+    let target_value = if obj.has_key("target") {
+        obj["target"].take()
+    } else {
+        obj["targets"].take()
+    };
+
+    let target_objs = match target_value {
+        JsonValue::String(s) => {
+            let mut json_obj = JsonValue::new_object();
+            json_obj["address"] = s.into();
+            vec![json_obj]
+        }
+        JsonValue::Object(_) => vec![target_value],
+        JsonValue::Array(v) => v,
+        _ => panic!("Invalid targets"),
+    };
+
     let target_configs = match obj["protocol"].as_str().unwrap_or("tcp") {
         "tcp" => {
-            let target_configs = if obj.has_key("target") {
-                vec![parse_tcp_target_object(obj["target"].take(), ip_groups)]
-            } else {
-                let target_objs = match obj["targets"].take() {
-                    JsonValue::Array(v) => v,
-                    _ => panic!("Invalid targets"),
-                };
-                target_objs
-                    .into_iter()
-                    .map(|target_obj| parse_tcp_target_object(target_obj, ip_groups))
-                    .collect()
-            };
+            let target_configs = target_objs
+                .into_iter()
+                .map(|target_obj| parse_tcp_target_object(target_obj, ip_groups))
+                .collect();
+
             TargetConfigs::Tcp(target_configs)
         }
         "udp" => {
-            let target_configs = if obj.has_key("target") {
-                vec![parse_udp_target_object(obj["target"].take(), ip_groups)]
-            } else {
-                let target_objs = match obj["targets"].take() {
-                    JsonValue::Array(v) => v,
-                    _ => panic!("Invalid targets"),
-                };
-                target_objs
-                    .into_iter()
-                    .map(|target_obj| parse_udp_target_object(target_obj, ip_groups))
-                    .collect()
-            };
+            let target_configs = target_objs
+                .into_iter()
+                .map(|target_obj| parse_udp_target_object(target_obj, ip_groups))
+                .collect();
             TargetConfigs::Udp(target_configs)
         }
         unknown_protocol => {
@@ -287,22 +289,7 @@ fn parse_tcp_target_object(
     }
 
     // support allowlist key for backwards compatibility
-    let allowed_ips_obj = if obj.has_key("allowed_ips") {
-        obj["allowed_ips"].take()
-    } else {
-        obj["allowlist"].take()
-    };
-
-    let allowed_ips = match allowed_ips_obj {
-        JsonValue::String(s) => lookup_ip_mask(&s, ip_groups),
-        JsonValue::Short(s) => lookup_ip_mask(s.as_str(), ip_groups),
-        JsonValue::Array(v) => v
-            .into_iter()
-            .map(|v| lookup_ip_mask(v.as_str().expect("Invalid allowed_ips entry"), ip_groups))
-            .collect::<Vec<Vec<IpMask>>>()
-            .concat(),
-        invalid => panic!("Invalid allowed_ips value: {}", invalid),
-    };
+    let allowed_ips = parse_allowed_ips(&mut obj, ip_groups);
 
     let early_connect = match obj["early_connect"].take() {
         JsonValue::Boolean(b) => b,
@@ -327,6 +314,30 @@ fn parse_tcp_target_object(
         early_connect,
         tcp_nodelay,
     }
+}
+
+fn parse_allowed_ips(obj: &mut JsonValue, ip_groups: &HashMap<String, Vec<IpMask>>) -> Vec<IpMask> {
+    let allowed_ips_obj = if obj.has_key("allowed_ips") {
+        obj["allowed_ips"].take()
+    } else {
+        obj["allowlist"].take()
+    };
+
+    let allowed_ip_strs = match allowed_ips_obj {
+        JsonValue::String(s) => vec![s],
+        JsonValue::Short(s) => vec![s.as_str().to_string()],
+        JsonValue::Array(v) => v
+            .into_iter()
+            .map(|v| v.as_str().expect("Invalid allowed_ips entry").to_string())
+            .collect::<Vec<_>>(),
+        invalid => panic!("Invalid allowed_ips value: {}", invalid),
+    };
+
+    allowed_ip_strs
+        .into_iter()
+        .map(|s| lookup_ip_mask(&s, ip_groups))
+        .collect::<Vec<Vec<IpMask>>>()
+        .concat()
 }
 
 fn lookup_ip_mask(s: &str, ip_groups: &HashMap<String, Vec<IpMask>>) -> Vec<IpMask> {
@@ -476,23 +487,7 @@ fn parse_udp_target_object(
         panic!("No target addresses specified.");
     }
 
-    // support allowlist key for backwards compatibility
-    let allowed_ips_obj = if obj.has_key("allowed_ips") {
-        obj["allowed_ips"].take()
-    } else {
-        obj["allowlist"].take()
-    };
-
-    let allowed_ips = match allowed_ips_obj {
-        JsonValue::String(s) => lookup_ip_mask(&s, ip_groups),
-        JsonValue::Short(s) => lookup_ip_mask(s.as_str(), ip_groups),
-        JsonValue::Array(v) => v
-            .into_iter()
-            .map(|v| lookup_ip_mask(v.as_str().expect("Invalid allowed_ips entry"), ip_groups))
-            .collect::<Vec<Vec<IpMask>>>()
-            .concat(),
-        invalid => panic!("Invalid allowed_ips value: {}", invalid),
-    };
+    let allowed_ips = parse_allowed_ips(&mut obj, ip_groups);
 
     let association_timeout_secs = obj["association_timeout_secs"].as_u32();
 
