@@ -330,6 +330,7 @@ fn parse_allowed_ips(obj: &mut JsonValue, ip_groups: &HashMap<String, Vec<IpMask
             .into_iter()
             .map(|v| v.as_str().expect("Invalid allowed_ips entry").to_string())
             .collect::<Vec<_>>(),
+        JsonValue::Null => vec!["all".to_string()],
         invalid => panic!("Invalid allowed_ips value: {}", invalid),
     };
 
