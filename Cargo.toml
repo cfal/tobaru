@@ -10,11 +10,6 @@ readme = "README.md"
 keywords = ["tunnel", "proxy", "tcp", "forward", "port"]
 categories = ["command-line-utilities", "network-programming"]
 
-[features]
-default = ["tls-rustls"]
-tls-native = ["openssl", "tokio-native-tls", "native-tls"]
-tls-rustls = ["rustls", "rustls-pemfile", "tokio-rustls", "webpki-roots"]
-
 [dependencies]
 async-trait = "*"
 env_logger = "*"
@@ -22,18 +17,15 @@ futures = "*"
 ipnet = "*"
 json = "*"
 log = "*"
-native-tls = { version = "*", optional = true }
-openssl = { version = "*", optional = true }
 parking_lot = "*"
 percent-encoding = "*"
-rustls = { version = "*", features = ["dangerous_configuration"], optional = true }
-rustls-pemfile = { version = "*", optional = true }
+rustls = { version = "*", features = ["dangerous_configuration"] }
+rustls-pemfile = { version = "*" }
 tokio = { version = "*", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
-tokio-native-tls = { version = "*", optional = true }
-tokio-rustls = { version = "*", features = ["dangerous_configuration"], optional = true }
+tokio-rustls = { version = "*", features = ["dangerous_configuration"] }
 treebitmap = "*"
 url = "*"
-webpki-roots = { version = "*", optional = true }
+webpki-roots = { version = "*" }
 
 [profile.release]
 opt-level = 3

@@ -31,3 +31,17 @@ impl AsyncStream for TcpStream {
         std_stream.shutdown(std::net::Shutdown::Both)
     }
 }
+
+#[async_trait]
+impl AsyncStream for tokio_rustls::client::TlsStream<TcpStream> {
+    async fn try_shutdown(&mut self) -> std::io::Result<()> {
+        self.shutdown().await
+    }
+}
+
+#[async_trait]
+impl AsyncStream for tokio_rustls::server::TlsStream<TcpStream> {
+    async fn try_shutdown(&mut self) -> std::io::Result<()> {
+        self.shutdown().await
+    }
+}

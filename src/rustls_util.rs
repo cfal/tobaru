@@ -1,74 +1,5 @@
-use crate::async_stream::AsyncStream;
-use crate::async_tls::{AsyncTlsAcceptor, AsyncTlsConnector, AsyncTlsFactory};
-
 use std::lazy::SyncOnceCell;
 use std::sync::Arc;
-
-use async_trait::async_trait;
-use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
-
-#[async_trait]
-impl AsyncStream for tokio_rustls::client::TlsStream<TcpStream> {
-    async fn try_shutdown(&mut self) -> std::io::Result<()> {
-        self.shutdown().await
-    }
-}
-
-#[async_trait]
-impl AsyncStream for tokio_rustls::server::TlsStream<TcpStream> {
-    async fn try_shutdown(&mut self) -> std::io::Result<()> {
-        self.shutdown().await
-    }
-}
-
-#[async_trait]
-impl AsyncTlsAcceptor for tokio_rustls::TlsAcceptor {
-    async fn accept(&self, stream: TcpStream) -> std::io::Result<Box<dyn AsyncStream>> {
-        tokio_rustls::TlsAcceptor::accept(&self, stream)
-            .await
-            .map(|mut s| {
-                s.get_mut().1.set_buffer_limit(Some(32768));
-                Box::new(s) as Box<dyn AsyncStream>
-            })
-    }
-}
-
-fn get_dummy_server_name() -> rustls::ServerName {
-    static INSTANCE: SyncOnceCell<rustls::ServerName> = SyncOnceCell::new();
-    INSTANCE
-        .get_or_init(|| rustls::ServerName::try_from("example.com").unwrap())
-        .clone()
-}
-
-#[async_trait]
-impl AsyncTlsConnector for tokio_rustls::TlsConnector {
-    async fn connect(
-        &self,
-        domain: &str,
-        stream: TcpStream,
-    ) -> std::io::Result<Box<dyn AsyncStream>> {
-        let server_name = match rustls::ServerName::try_from(domain) {
-            Ok(s) => s,
-            Err(_) => get_dummy_server_name(),
-        };
-
-        tokio_rustls::TlsConnector::connect(&self, server_name, stream)
-            .await
-            .map(|mut s| {
-                s.get_mut().1.set_buffer_limit(Some(32768));
-                Box::new(s) as Box<dyn AsyncStream>
-            })
-    }
-}
-
-pub struct RustlsFactory;
-
-impl RustlsFactory {
-    pub fn new() -> Self {
-        Self
-    }
-}
 
 fn create_client_config(verify: bool) -> rustls::ClientConfig {
     let builder = rustls::ClientConfig::builder().with_safe_defaults();
@@ -103,19 +34,6 @@ fn get_client_config(verify: bool) -> Arc<rustls::ClientConfig> {
         UNVERIFIED_INSTANCE
             .get_or_init(|| Arc::new(create_client_config(false)))
             .clone()
-    }
-}
-
-impl AsyncTlsFactory for RustlsFactory {
-    fn create_acceptor(&self, cert_bytes: &[u8], key_bytes: &[u8]) -> Box<dyn AsyncTlsAcceptor> {
-        let acceptor: tokio_rustls::TlsAcceptor =
-            Arc::new(create_server_config(cert_bytes, key_bytes)).into();
-        Box::new(acceptor)
-    }
-
-    fn create_connector(&self, verify: bool) -> Box<dyn AsyncTlsConnector> {
-        let connector: tokio_rustls::TlsConnector = get_client_config(verify).into();
-        Box::new(connector)
     }
 }
 
@@ -174,4 +92,19 @@ fn create_server_config(cert_bytes: &[u8], key_bytes: &[u8]) -> rustls::ServerCo
         .expect("bad certificate/key");
     config.max_early_data_size = u32::MAX;
     config
+}
+
+pub fn get_dummy_server_name() -> rustls::ServerName {
+    static INSTANCE: SyncOnceCell<rustls::ServerName> = SyncOnceCell::new();
+    INSTANCE
+        .get_or_init(|| rustls::ServerName::try_from("example.com").unwrap())
+        .clone()
+}
+
+pub fn create_acceptor(cert_bytes: &[u8], key_bytes: &[u8]) -> tokio_rustls::TlsAcceptor {
+    Arc::new(create_server_config(cert_bytes, key_bytes)).into()
+}
+
+pub fn create_connector(verify: bool) -> tokio_rustls::TlsConnector {
+    get_client_config(verify).into()
 }

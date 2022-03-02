@@ -10,10 +10,10 @@ use tokio::net::{TcpListener, TcpStream};
 use treebitmap::IpLookupTable;
 
 use crate::async_stream::AsyncStream;
-use crate::async_tls::{AsyncTlsAcceptor, AsyncTlsConnector, AsyncTlsFactory};
 use crate::config::TcpTargetConfig;
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::iptables_util::{configure_iptables, Protocol};
+use crate::rustls_util::{create_acceptor, create_connector, get_dummy_server_name};
 use crate::tokio_util::resolve_host;
 
 struct TcpTargetData {
@@ -25,20 +25,19 @@ struct TcpTargetData {
 }
 
 struct ServerTlsData {
-    pub acceptor: Box<dyn AsyncTlsAcceptor>,
+    pub acceptor: tokio_rustls::TlsAcceptor,
     pub optional: bool,
 }
 
 struct TargetAddressData {
     pub address: String,
     pub port: u16,
-    pub tls_connector: Option<Box<dyn AsyncTlsConnector>>,
+    pub tls_connector: Option<tokio_rustls::TlsConnector>,
 }
 
 const BUFFER_SIZE: usize = 8192;
 
 pub async fn run_tcp_server(
-    tls_factory: Arc<dyn AsyncTlsFactory>,
     server_address: SocketAddr,
     use_iptables: bool,
     target_configs: Vec<TcpTargetConfig>,
@@ -56,7 +55,7 @@ pub async fn run_tcp_server(
             key_file.read_to_end(&mut key_bytes).await?;
 
             Some(ServerTlsData {
-                acceptor: tls_factory.create_acceptor(&cert_bytes, &key_bytes),
+                acceptor: create_acceptor(&cert_bytes, &key_bytes),
                 optional: cfg.optional,
             })
         } else {
@@ -70,7 +69,7 @@ pub async fn run_tcp_server(
                 address: target_address.address,
                 port: target_address.port,
                 tls_connector: if let Some(cfg) = target_address.client_tls_config {
-                    Some(tls_factory.create_connector(cfg.verify))
+                    Some(create_connector(cfg.verify))
                 } else {
                     None
                 },
@@ -312,8 +311,9 @@ async fn setup_source_stream(
                 return Ok(Box::new(stream));
             }
         }
-        let tls_stream = data.acceptor.accept(stream).await?;
-        Ok(tls_stream)
+        let mut tls_stream = data.acceptor.accept(stream).await?;
+        tls_stream.get_mut().1.set_buffer_limit(Some(32768));
+        Ok(Box::new(tls_stream))
     } else {
         Ok(Box::new(stream))
     }
@@ -340,10 +340,14 @@ async fn setup_target_stream(
     );
 
     if let Some(ref connector) = target_address.tls_connector {
-        let tls_stream = connector
-            .connect(&target_address.address, target_stream)
-            .await?;
-        Ok(tls_stream)
+        let server_name = match rustls::ServerName::try_from(target_address.address.as_str()) {
+            Ok(s) => s,
+            Err(_) => get_dummy_server_name(),
+        };
+
+        let mut tls_stream = connector.connect(server_name, target_stream).await?;
+        tls_stream.get_mut().1.set_buffer_limit(Some(32768));
+        Ok(Box::new(tls_stream))
     } else {
         Ok(Box::new(target_stream))
     }

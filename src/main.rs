@@ -1,27 +1,23 @@
 #![feature(once_cell)]
 
 mod async_stream;
-mod async_tls;
 mod config;
 mod copy_bidirectional;
 mod iptables_util;
+mod rustls_util;
 mod tcp;
-mod tls_factory;
 mod tokio_util;
 mod udp;
-
-use std::sync::Arc;
 
 use futures::future::try_join_all;
 use log::{debug, error, info};
 use tokio::runtime::Builder;
 
-use crate::async_tls::AsyncTlsFactory;
 use crate::config::{ServerConfig, TargetConfigs};
 use crate::tcp::run_tcp_server;
 use crate::udp::run_udp_server;
 
-async fn run(server_config: ServerConfig, tls_factory: Arc<dyn AsyncTlsFactory>) {
+async fn run(server_config: ServerConfig) {
     let ServerConfig {
         server_address,
         use_iptables,
@@ -31,9 +27,7 @@ async fn run(server_config: ServerConfig, tls_factory: Arc<dyn AsyncTlsFactory>)
     match target_configs {
         TargetConfigs::Tcp(target_configs) => {
             // TODO: restart or panic?
-            if let Err(e) =
-                run_tcp_server(tls_factory, server_address, use_iptables, target_configs).await
-            {
+            if let Err(e) = run_tcp_server(server_address, use_iptables, target_configs).await {
                 error!("TCP forwarder finished with error: {}", e);
             }
         }
@@ -48,8 +42,6 @@ async fn run(server_config: ServerConfig, tls_factory: Arc<dyn AsyncTlsFactory>)
 
 fn main() {
     env_logger::init();
-
-    let tls_factory: Arc<dyn AsyncTlsFactory> = Arc::new(tls_factory::create_tls_factory());
 
     let mut config_paths = vec![];
     let mut config_urls = vec![];
@@ -107,11 +99,9 @@ fn main() {
 
     runtime.block_on(async move {
         let mut join_handles = Vec::with_capacity(server_configs.len());
-
         for server_config in server_configs {
-            let cloned_factory = tls_factory.clone();
             join_handles.push(tokio::spawn(async move {
-                run(server_config, cloned_factory).await;
+                run(server_config).await;
             }));
         }
 
