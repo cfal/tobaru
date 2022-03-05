@@ -59,7 +59,6 @@ pub async fn run_tcp_server(
             allowed_ips,
             target_addresses,
             server_tls_config,
-            early_connect,
             tcp_nodelay,
         } = target_config;
 

@@ -1,5 +1,5 @@
 use json::JsonValue;
-use log::{debug, warn};
+use log::debug;
 use percent_encoding::percent_decode_str;
 use url::Url;
 
@@ -82,7 +82,6 @@ pub struct TcpTargetConfig {
     pub allowed_ips: Vec<IpMask>,
     pub target_addresses: Vec<TcpTargetAddress>,
     pub server_tls_config: Option<ServerTlsConfig>,
-    pub early_connect: bool,
     pub tcp_nodelay: bool,
 }
 
@@ -320,16 +319,6 @@ fn parse_tcp_target_object(
     // support allowlist key for backwards compatibility
     let allowed_ips = parse_allowed_ips(&mut obj, ip_groups);
 
-    let early_connect = match obj["early_connect"].take() {
-        JsonValue::Boolean(b) => b,
-        JsonValue::Null => false,
-        invalid => panic!("Invalid early_connect value: {}", invalid),
-    };
-
-    if early_connect {
-        warn!("Enabling early connect, this can cause excessive target connections on unauthorized connections.");
-    }
-
     let tcp_nodelay = match obj["tcp_nodelay"].take() {
         JsonValue::Boolean(b) => b,
         JsonValue::Null => false,
@@ -340,7 +329,6 @@ fn parse_tcp_target_object(
         allowed_ips,
         server_tls_config,
         target_addresses,
-        early_connect,
         tcp_nodelay,
     }
 }

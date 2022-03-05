@@ -29,7 +29,6 @@ Supported query keys:
 - **to, targetAddress, target**: address to forward to.
 - **allowlist**: list of comma separated netmasks to allow. if this is omitted, all source addresses are allowed.
 - **tcp_nodelay, nodelay, tcpNodelay**: enables tcp_nodelay.
-- **early_connect, earlyConnect**: enables early connect.
 
 ## Advanced Configuration
 
