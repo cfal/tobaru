@@ -34,6 +34,7 @@ struct TargetData {
 }
 
 struct TlsTargetData {
+    pub allow_no_alpn: bool,
     pub alpn_protocols: HashSet<Vec<u8>>,
     pub ip_lookup_table: IpLookupTable<Ipv6Addr, bool>,
     pub tls_config: Arc<rustls::ServerConfig>,
@@ -84,6 +85,7 @@ pub async fn run_tcp_server(
         let is_non_tls_target = match server_tls_config {
             Some(ServerTlsConfig {
                 sni_hostnames,
+                allow_no_alpn,
                 alpn_protocols,
                 cert_path,
                 key_path,
@@ -127,6 +129,7 @@ pub async fn run_tcp_server(
                 }
 
                 let tls_target_data = Arc::new(TlsTargetData {
+                    allow_no_alpn,
                     alpn_protocols,
                     ip_lookup_table: config_lookup_table,
                     tls_config,
@@ -287,15 +290,17 @@ async fn process_tls_stream(
                         }
                     }
                     if matches {
+                        debug!("Found matching ALPN.");
                         sni_data.tls_config.clone()
                     } else {
                         continue;
                     }
                 }
                 None => {
-                    if !sni_data.alpn_protocols.is_empty() {
+                    if !sni_data.allow_no_alpn {
                         continue;
                     }
+                    debug!("No ALPN specified.");
                     sni_data.tls_config.clone()
                 }
             };

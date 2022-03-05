@@ -34,6 +34,7 @@ pub type IpMask = (Ipv6Addr, u32);
 #[derive(Debug, Clone)]
 pub struct ServerTlsConfig {
     pub sni_hostnames: HashSet<SniOption>,
+    pub allow_no_alpn: bool,
     pub alpn_protocols: HashSet<String>,
     pub cert_path: String,
     pub key_path: String,
@@ -407,8 +408,12 @@ fn parse_server_tls_object(obj: JsonValue) -> Option<ServerTlsConfig> {
                 invalid => panic!("Invalid alpn_protocols value: {}", invalid),
             };
 
+            // default to allowing no ALPN when no protocols are specified.
+            let allow_no_alpn = is_true_value(&o["allow_no_alpn"], alpn_protocols.is_empty());
+
             Some(ServerTlsConfig {
                 sni_hostnames,
+                allow_no_alpn,
                 alpn_protocols,
                 cert_path,
                 key_path,
