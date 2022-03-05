@@ -1,17 +1,25 @@
+use std::collections::HashSet;
 use std::lazy::SyncOnceCell;
 use std::sync::Arc;
 
-fn create_client_config(verify: bool) -> rustls::ClientConfig {
-    let builder = rustls::ClientConfig::builder().with_safe_defaults();
+use rustls::client::{ServerCertVerified, ServerName};
+use rustls::server::{ClientHello, ResolvesServerCert};
+use rustls::sign::{any_supported_type, CertifiedKey};
+use rustls::{
+    Certificate, ClientConfig, OwnedTrustAnchor, PrivateKey, RootCertStore, ServerConfig,
+};
+
+fn create_client_config(verify: bool) -> ClientConfig {
+    let builder = ClientConfig::builder().with_safe_defaults();
 
     if !verify {
         builder
             .with_custom_certificate_verifier(Arc::new(DisabledVerifier {}))
             .with_no_client_auth()
     } else {
-        let mut root_store = rustls::RootCertStore::empty();
+        let mut root_store = RootCertStore::empty();
         root_store.add_server_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.0.iter().map(|ta| {
-            rustls::OwnedTrustAnchor::from_subject_spki_name_constraints(
+            OwnedTrustAnchor::from_subject_spki_name_constraints(
                 ta.subject,
                 ta.spki,
                 ta.name_constraints,
@@ -23,9 +31,9 @@ fn create_client_config(verify: bool) -> rustls::ClientConfig {
     }
 }
 
-fn get_client_config(verify: bool) -> Arc<rustls::ClientConfig> {
-    static VERIFIED_INSTANCE: SyncOnceCell<Arc<rustls::ClientConfig>> = SyncOnceCell::new();
-    static UNVERIFIED_INSTANCE: SyncOnceCell<Arc<rustls::ClientConfig>> = SyncOnceCell::new();
+fn get_client_config(verify: bool) -> Arc<ClientConfig> {
+    static VERIFIED_INSTANCE: SyncOnceCell<Arc<ClientConfig>> = SyncOnceCell::new();
+    static UNVERIFIED_INSTANCE: SyncOnceCell<Arc<ClientConfig>> = SyncOnceCell::new();
     if verify {
         VERIFIED_INSTANCE
             .get_or_init(|| Arc::new(create_client_config(true)))
@@ -41,40 +49,43 @@ pub struct DisabledVerifier;
 impl rustls::client::ServerCertVerifier for DisabledVerifier {
     fn verify_server_cert(
         &self,
-        _end_entity: &rustls::Certificate,
-        _intermediates: &[rustls::Certificate],
-        _server_name: &rustls::client::ServerName,
+        _end_entity: &Certificate,
+        _intermediates: &[Certificate],
+        _server_name: &ServerName,
         _scts: &mut dyn Iterator<Item = &[u8]>,
         _ocsp_response: &[u8],
         _now: std::time::SystemTime,
-    ) -> std::result::Result<rustls::client::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::ServerCertVerified::assertion())
+    ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
     }
 }
 
-fn load_certs(cert_bytes: &[u8]) -> Vec<rustls::Certificate> {
+pub fn load_certs(cert_bytes: &[u8]) -> Vec<Certificate> {
     let mut reader = std::io::Cursor::new(cert_bytes);
     let mut certs = vec![];
     for item in std::iter::from_fn(|| rustls_pemfile::read_one(&mut reader).transpose()) {
         match item.unwrap() {
             rustls_pemfile::Item::X509Certificate(cert) => {
-                certs.push(rustls::Certificate(cert));
+                certs.push(Certificate(cert));
             }
             _ => (),
         }
     }
+    if certs.is_empty() {
+        panic!("No certs found");
+    }
     certs
 }
 
-fn load_private_key(key_bytes: &[u8]) -> rustls::PrivateKey {
+pub fn load_private_key(key_bytes: &[u8]) -> PrivateKey {
     let mut reader = std::io::Cursor::new(key_bytes);
     for item in std::iter::from_fn(|| rustls_pemfile::read_one(&mut reader).transpose()) {
         match item.unwrap() {
             rustls_pemfile::Item::PKCS8Key(key) => {
-                return rustls::PrivateKey(key);
+                return PrivateKey(key);
             }
             rustls_pemfile::Item::RSAKey(key) => {
-                return rustls::PrivateKey(key);
+                return PrivateKey(key);
             }
             _ => (),
         }
@@ -82,27 +93,38 @@ fn load_private_key(key_bytes: &[u8]) -> rustls::PrivateKey {
     panic!("No private key found");
 }
 
-fn create_server_config(cert_bytes: &[u8], key_bytes: &[u8]) -> rustls::ServerConfig {
-    let certs = load_certs(cert_bytes);
-    let privkey = load_private_key(key_bytes);
-    let mut config = rustls::ServerConfig::builder()
+struct AlwaysResolvesServerCert(Arc<CertifiedKey>);
+
+impl ResolvesServerCert for AlwaysResolvesServerCert {
+    fn resolve(&self, _client_hello: ClientHello) -> Option<Arc<CertifiedKey>> {
+        Some(self.0.clone())
+    }
+}
+
+pub fn create_server_config(
+    certs: Vec<Certificate>,
+    private_key: &PrivateKey,
+    alpn_protocols: &HashSet<Vec<u8>>,
+) -> ServerConfig {
+    let signing_key = any_supported_type(private_key).unwrap();
+    let certified_key = Arc::new(CertifiedKey::new(certs, signing_key));
+    let mut config = ServerConfig::builder()
         .with_safe_defaults()
         .with_no_client_auth()
-        .with_single_cert(certs, privkey)
-        .expect("bad certificate/key");
+        .with_cert_resolver(Arc::new(AlwaysResolvesServerCert(certified_key)));
+    config.alpn_protocols = alpn_protocols
+        .iter()
+        .map(|alpn_bytes| alpn_bytes.clone())
+        .collect();
     config.max_early_data_size = u32::MAX;
     config
 }
 
-pub fn get_dummy_server_name() -> rustls::ServerName {
-    static INSTANCE: SyncOnceCell<rustls::ServerName> = SyncOnceCell::new();
+pub fn get_dummy_server_name() -> ServerName {
+    static INSTANCE: SyncOnceCell<ServerName> = SyncOnceCell::new();
     INSTANCE
-        .get_or_init(|| rustls::ServerName::try_from("example.com").unwrap())
+        .get_or_init(|| ServerName::try_from("example.com").unwrap())
         .clone()
-}
-
-pub fn create_acceptor(cert_bytes: &[u8], key_bytes: &[u8]) -> tokio_rustls::TlsAcceptor {
-    Arc::new(create_server_config(cert_bytes, key_bytes)).into()
 }
 
 pub fn create_connector(verify: bool) -> tokio_rustls::TlsConnector {

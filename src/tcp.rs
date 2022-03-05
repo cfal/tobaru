@@ -1,4 +1,6 @@
-use std::net::{IpAddr, SocketAddr};
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -7,32 +9,35 @@ use log::{debug, error, warn};
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::LazyConfigAcceptor;
 use treebitmap::IpLookupTable;
 
 use crate::async_stream::AsyncStream;
-use crate::config::TcpTargetConfig;
+use crate::config::{ServerTlsConfig, SniOption, TcpTargetConfig};
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::iptables_util::{configure_iptables, Protocol};
-use crate::rustls_util::{create_acceptor, create_connector, get_dummy_server_name};
+use crate::rustls_util::{
+    create_connector, create_server_config, get_dummy_server_name, load_certs, load_private_key,
+};
 use crate::tokio_util::resolve_host;
-
-struct TcpTargetData {
-    pub server_tls_data: Option<ServerTlsData>,
-    pub address_data: Vec<TargetAddressData>,
-    pub next_address_index: AtomicUsize,
-    pub early_connect: bool,
-    pub tcp_nodelay: bool,
-}
-
-struct ServerTlsData {
-    pub acceptor: tokio_rustls::TlsAcceptor,
-    pub optional: bool,
-}
 
 struct TargetAddressData {
     pub address: String,
     pub port: u16,
     pub tls_connector: Option<tokio_rustls::TlsConnector>,
+}
+
+struct TargetData {
+    pub address_data: Vec<TargetAddressData>,
+    pub next_address_index: AtomicUsize,
+    pub tcp_nodelay: bool,
+}
+
+struct TlsTargetData {
+    pub alpn_protocols: HashSet<Vec<u8>>,
+    pub ip_lookup_table: IpLookupTable<Ipv6Addr, bool>,
+    pub tls_config: Arc<rustls::ServerConfig>,
+    pub target_data: Arc<TargetData>,
 }
 
 const BUFFER_SIZE: usize = 8192;
@@ -42,28 +47,23 @@ pub async fn run_tcp_server(
     use_iptables: bool,
     target_configs: Vec<TcpTargetConfig>,
 ) -> std::io::Result<()> {
-    let mut lookup_table = IpLookupTable::new();
+    let mut non_tls_lookup_table: IpLookupTable<Ipv6Addr, Arc<TargetData>> = IpLookupTable::new();
+
+    let mut tls_lookup_table: IpLookupTable<Ipv6Addr, bool> = IpLookupTable::new();
+    let mut sni_lookup_map: HashMap<SniOption, Vec<Arc<TlsTargetData>>> = HashMap::new();
+
+    let mut iptable_masks = vec![];
 
     for target_config in target_configs {
-        let server_tls_data = if let Some(cfg) = target_config.server_tls_config {
-            let mut cert_file = File::open(&cfg.cert_path).await?;
-            let mut cert_bytes = vec![];
-            cert_file.read_to_end(&mut cert_bytes).await?;
+        let TcpTargetConfig {
+            allowed_ips,
+            target_addresses,
+            server_tls_config,
+            early_connect,
+            tcp_nodelay,
+        } = target_config;
 
-            let mut key_file = File::open(&cfg.key_path).await?;
-            let mut key_bytes = vec![];
-            key_file.read_to_end(&mut key_bytes).await?;
-
-            Some(ServerTlsData {
-                acceptor: create_acceptor(&cert_bytes, &key_bytes),
-                optional: cfg.optional,
-            })
-        } else {
-            None
-        };
-
-        let address_data = target_config
-            .target_addresses
+        let address_data = target_addresses
             .into_iter()
             .map(|target_address| TargetAddressData {
                 address: target_address.address,
@@ -76,46 +76,102 @@ pub async fn run_tcp_server(
             })
             .collect();
 
-        let target_data = Arc::new(TcpTargetData {
-            server_tls_data,
+        let target_data = Arc::new(TargetData {
             address_data,
             next_address_index: AtomicUsize::new(0),
-            early_connect: target_config.early_connect,
-            tcp_nodelay: target_config.tcp_nodelay,
+            tcp_nodelay,
         });
 
-        for (addr, masklen) in target_config.allowed_ips.into_iter() {
-            if lookup_table
-                .insert(addr, masklen, target_data.clone())
-                .is_some()
-            {
-                panic!(
-                    "Address {}/{} is duplicated in another target.",
-                    addr, masklen
-                );
+        let is_non_tls_target = match server_tls_config {
+            Some(ServerTlsConfig {
+                sni_hostnames,
+                alpn_protocols,
+                cert_path,
+                key_path,
+                optional,
+            }) => {
+                let mut cert_file = File::open(&cert_path).await?;
+                let mut cert_bytes = vec![];
+                cert_file.read_to_end(&mut cert_bytes).await?;
+                let certs = load_certs(&cert_bytes);
+
+                let mut key_file = File::open(&key_path).await?;
+                let mut key_bytes = vec![];
+                key_file.read_to_end(&mut key_bytes).await?;
+                let private_key = load_private_key(&key_bytes);
+
+                let alpn_protocols = alpn_protocols.into_iter().map(String::into_bytes).collect();
+
+                let tls_config =
+                    Arc::new(create_server_config(certs, &private_key, &alpn_protocols));
+
+                let mut config_lookup_table = IpLookupTable::new();
+                for (addr, masklen) in allowed_ips.iter() {
+                    if tls_lookup_table
+                        .insert(addr.clone(), *masklen, true)
+                        .is_some()
+                    {
+                        panic!(
+                            "Address {}/{} is duplicated in the TLS config.",
+                            addr, masklen
+                        );
+                    }
+                    if config_lookup_table
+                        .insert(addr.clone(), *masklen, true)
+                        .is_some()
+                    {
+                        panic!(
+                            "Address {}/{} is duplicated in the TLS config.",
+                            addr, masklen
+                        );
+                    }
+                }
+
+                let tls_target_data = Arc::new(TlsTargetData {
+                    alpn_protocols,
+                    ip_lookup_table: config_lookup_table,
+                    tls_config,
+                    target_data: target_data.clone(),
+                });
+
+                for sni_hostname in sni_hostnames {
+                    match sni_lookup_map.entry(sni_hostname) {
+                        Entry::Occupied(mut o) => {
+                            o.get_mut().push(tls_target_data.clone());
+                        }
+                        Entry::Vacant(v) => {
+                            v.insert(vec![tls_target_data.clone()]);
+                        }
+                    }
+                }
+
+                optional
+            }
+            None => true,
+        };
+
+        if is_non_tls_target {
+            for (addr, masklen) in allowed_ips.iter() {
+                if non_tls_lookup_table
+                    .insert(addr.clone(), *masklen, target_data.clone())
+                    .is_some()
+                {
+                    panic!(
+                        "Address {}/{} is duplicated in another non-tls target.",
+                        addr, masklen
+                    );
+                }
             }
         }
-    }
 
-    if lookup_table.is_empty() {
-        warn!(
-            "Server does not accept any addresses, skipping: {}",
-            server_address
-        );
-        return Ok(());
+        iptable_masks.extend(allowed_ips);
     }
 
     if use_iptables {
-        let ip_masks: Vec<(std::net::Ipv6Addr, u32)> = lookup_table
-            .iter()
-            .map(|(addr, masklen, _)| (addr, masklen))
-            .collect();
-        configure_iptables(Protocol::Tcp, server_address, &ip_masks);
+        configure_iptables(Protocol::Tcp, server_address.clone(), &iptable_masks);
     }
 
-    for entry in lookup_table.iter() {
-        debug!("Lookup table entry: {:?} (masklen {})", &entry.0, &entry.1);
-    }
+    let sni_lookup_map = Arc::new(sni_lookup_map);
 
     let listener = TcpListener::bind(server_address).await.unwrap();
     println!("Listening (TCP): {}", listener.local_addr().unwrap());
@@ -134,29 +190,139 @@ pub async fn run_tcp_server(
             IpAddr::V6(a) => a,
         };
 
-        let target_data = match lookup_table.longest_match(ip) {
-            Some((_, _, d)) => d.clone(),
-            None => {
-                // Not allowed.
-                warn!("Unknown address, not allowing: {}", addr.ip());
-                continue;
-            }
-        };
+        let non_tls_data = non_tls_lookup_table
+            .longest_match(ip.clone())
+            .map(|(_, _, m)| m.clone());
+        let has_tls_data = tls_lookup_table.longest_match(ip).is_some();
 
-        tokio::spawn(async move {
-            if let Err(e) = process_stream(stream, &addr, target_data).await {
-                error!("{}:{} finished with error: {:?}", addr.ip(), addr.port(), e);
-            } else {
-                debug!("{}:{} finished successfully", addr.ip(), addr.port());
-            }
-        });
+        if non_tls_data.is_none() && !has_tls_data {
+            warn!("Unknown address, not allowing: {}", addr.ip());
+            continue;
+        }
+
+        if has_tls_data {
+            let cloned_sni_map = sni_lookup_map.clone();
+            // TODO: determine if it's a TLS connection, and act accordingly.
+            // if non_tls_data is None, then it's definitely a TLS connection.
+            tokio::spawn(async move {
+                if let Err(e) =
+                    process_tls_stream(stream, &addr, ip, non_tls_data, cloned_sni_map).await
+                {
+                    error!("{}:{} finished with error: {:?}", addr.ip(), addr.port(), e);
+                } else {
+                    debug!("{}:{} finished successfully", addr.ip(), addr.port());
+                }
+            });
+        } else {
+            tokio::spawn(async move {
+                if let Err(e) =
+                    process_generic_stream(Box::new(stream), &addr, non_tls_data.unwrap()).await
+                {
+                    error!("{}:{} finished with error: {:?}", addr.ip(), addr.port(), e);
+                } else {
+                    debug!("{}:{} finished successfully", addr.ip(), addr.port());
+                }
+            });
+        }
     }
 }
 
-async fn process_stream(
+async fn process_tls_stream(
     stream: TcpStream,
     addr: &std::net::SocketAddr,
-    target_data: Arc<TcpTargetData>,
+    ip: Ipv6Addr,
+    non_tls_data: Option<Arc<TargetData>>,
+    sni_lookup_map: Arc<HashMap<SniOption, Vec<Arc<TlsTargetData>>>>,
+) -> std::io::Result<()> {
+    if non_tls_data.is_some() {
+        let is_tls_client_hello = peek_tls_client_hello(&stream).await?;
+        if !is_tls_client_hello {
+            return process_generic_stream(Box::new(stream), addr, non_tls_data.unwrap()).await;
+        }
+    }
+
+    let acceptor = LazyConfigAcceptor::new(rustls::server::Acceptor::new().unwrap(), stream);
+    let start_handshake = acceptor.await?;
+    let client_hello = start_handshake.client_hello();
+    let sni_hostname = client_hello
+        .server_name()
+        .map(|s| SniOption::Hostname(s.to_string()))
+        .unwrap_or(SniOption::None);
+
+    let sni_data_vec = match sni_lookup_map.get(&sni_hostname) {
+        Some(v) => {
+            debug!("Matched SNI option: {:?}", sni_hostname);
+            v
+        }
+        None => {
+            if !sni_hostname.is_hostname() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "no matching SNI hostname",
+                ));
+            }
+            match sni_lookup_map.get(&SniOption::Any) {
+                Some(v) => v,
+                None => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!(
+                            "no matching SNI hostname: {}",
+                            sni_hostname.unwrap_hostname()
+                        ),
+                    ));
+                }
+            }
+        }
+    };
+
+    for sni_data in sni_data_vec {
+        if sni_data.ip_lookup_table.longest_match(ip.clone()).is_some() {
+            let tls_config = match client_hello.alpn() {
+                Some(alpn_iter) => {
+                    let mut matches = false;
+                    for alpn_bytes in alpn_iter {
+                        if sni_data.alpn_protocols.contains(alpn_bytes) {
+                            matches = true;
+                            break;
+                        }
+                    }
+                    if matches {
+                        sni_data.tls_config.clone()
+                    } else {
+                        continue;
+                    }
+                }
+                None => {
+                    if !sni_data.alpn_protocols.is_empty() {
+                        continue;
+                    }
+                    sni_data.tls_config.clone()
+                }
+            };
+
+            let mut tls_stream = start_handshake.into_stream(tls_config).await?;
+            tls_stream.get_mut().1.set_buffer_limit(Some(32768));
+
+            return process_generic_stream(
+                Box::new(tls_stream),
+                addr,
+                sni_data.target_data.clone(),
+            )
+            .await;
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Other,
+        "no matching target",
+    ))
+}
+
+async fn process_generic_stream(
+    mut source_stream: Box<dyn AsyncStream>,
+    addr: &std::net::SocketAddr,
+    target_data: Arc<TargetData>,
 ) -> std::io::Result<()> {
     let target_address = if target_data.address_data.len() > 1 {
         // fetch_add wraps around on overflow.
@@ -168,46 +334,14 @@ async fn process_stream(
         &target_data.address_data[0]
     };
 
-    debug!(
-        "Starting: {}:{} to {}:{}",
-        addr.ip(),
-        addr.port(),
-        &target_address.address,
-        &target_address.port
-    );
-
-    let (mut source_stream, mut target_stream) = if target_data.early_connect {
-        let (source_result, target_result) = join!(
-            setup_source_stream(stream, &target_data.server_tls_data),
-            setup_target_stream(addr, &target_address, target_data.tcp_nodelay)
-        );
-
-        if source_result.is_err() || target_result.is_err() {
-            if let Ok(mut source_stream) = source_result {
-                let _ = source_stream.try_shutdown().await;
-                return target_result.map(|_| ());
+    let mut target_stream =
+        match setup_target_stream(addr, &target_address, target_data.tcp_nodelay).await {
+            Ok(s) => s,
+            Err(e) => {
+                source_stream.try_shutdown().await?;
+                return Err(e);
             }
-            if let Ok(mut target_stream) = target_result {
-                let _ = target_stream.try_shutdown().await;
-                return source_result.map(|_| ());
-            }
-            // Both were errors, just return one.
-            return source_result.map(|_| ());
-        }
-
-        (source_result.unwrap(), target_result.unwrap())
-    } else {
-        let mut source_stream = setup_source_stream(stream, &target_data.server_tls_data).await?;
-        let target_stream =
-            match setup_target_stream(addr, &target_address, target_data.tcp_nodelay).await {
-                Ok(s) => s,
-                Err(e) => {
-                    source_stream.try_shutdown().await?;
-                    return Err(e);
-                }
-            };
-        (source_stream, target_stream)
-    };
+        };
 
     debug!(
         "Copying: {}:{} to {}:{}",
@@ -297,26 +431,6 @@ async fn peek_tls_client_hello(stream: &TcpStream) -> std::io::Result<bool> {
     // of the for loop. It could be possible that the client expects a server response
     // first before sending more bytes, so just assume it's not a TLS connection.
     Ok(false)
-}
-
-async fn setup_source_stream(
-    stream: TcpStream,
-    server_tls_data: &Option<ServerTlsData>,
-) -> std::io::Result<Box<dyn AsyncStream>> {
-    if let Some(data) = server_tls_data {
-        if data.optional {
-            let is_tls_client_hello = peek_tls_client_hello(&stream).await?;
-            debug!("Finished tls client hello check: {}", is_tls_client_hello);
-            if !is_tls_client_hello {
-                return Ok(Box::new(stream));
-            }
-        }
-        let mut tls_stream = data.acceptor.accept(stream).await?;
-        tls_stream.get_mut().1.set_buffer_limit(Some(32768));
-        Ok(Box::new(tls_stream))
-    } else {
-        Ok(Box::new(stream))
-    }
 }
 
 async fn setup_target_stream(

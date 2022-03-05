@@ -3,7 +3,7 @@ use log::{debug, warn};
 use percent_encoding::percent_decode_str;
 use url::Url;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 
 #[derive(Debug, Clone)]
@@ -33,10 +33,43 @@ pub type IpMask = (Ipv6Addr, u32);
 
 #[derive(Debug, Clone)]
 pub struct ServerTlsConfig {
-    pub allowed_sni_hostnames: Option<Vec<String>>,
+    pub sni_hostnames: HashSet<SniOption>,
+    pub alpn_protocols: HashSet<String>,
     pub cert_path: String,
     pub key_path: String,
     pub optional: bool,
+}
+
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+pub enum SniOption {
+    None,
+    Any,
+    Hostname(String),
+}
+
+impl From<&str> for SniOption {
+    fn from(s: &str) -> Self {
+        match s {
+            "any" => SniOption::Any,
+            "none" => SniOption::None,
+            hostname => SniOption::Hostname(hostname.to_string()),
+        }
+    }
+}
+
+impl SniOption {
+    pub fn is_hostname(&self) -> bool {
+        match self {
+            SniOption::Hostname(_) => true,
+            _ => false,
+        }
+    }
+    pub fn unwrap_hostname(&self) -> &str {
+        match self {
+            SniOption::Hostname(s) => s.as_str(),
+            _ => panic!("Not a hostname"),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -350,33 +383,45 @@ fn parse_server_tls_object(obj: JsonValue) -> Option<ServerTlsConfig> {
     match obj {
         JsonValue::Null => None,
         JsonValue::Object(mut o) => {
-            let allowed_sni_hostnames = match o["allowed_sni_hostnames"].take() {
-                JsonValue::String(s) => Some(vec![s]),
-                JsonValue::Short(s) => Some(vec![s.to_string()]),
+            let sni_hostnames = match o["sni_hostnames"].take() {
+                JsonValue::String(s) => HashSet::from([s.as_str().into()]),
+                JsonValue::Short(s) => HashSet::from([s.as_str().into()]),
                 JsonValue::Array(v) => {
-                    let hostnames = v
+                    let mut hostnames = v
                         .into_iter()
-                        .map(|v| {
-                            v.as_str()
-                                .expect("Invalid allowed_sni_hostnames entry")
-                                .to_string()
-                        })
-                        .collect::<Vec<_>>();
+                        .map(|v| v.as_str().expect("Invalid sni_hostnames entry").into())
+                        .collect::<HashSet<_>>();
                     if hostnames.is_empty() {
-                        panic!("allowed_sni_hostnames is empty");
+                        hostnames.extend([SniOption::None, SniOption::Any]);
                     }
-                    Some(hostnames)
+                    hostnames
                 }
-                JsonValue::Null => None,
-                invalid => panic!("Invalid allowed_sni_hostnames value: {}", invalid),
+                JsonValue::Null => HashSet::from([SniOption::None, SniOption::Any]),
+                invalid => panic!("Invalid sni_hostnames value: {}", invalid),
             };
 
             let cert_path = o["cert"].take_string().expect("No cert path");
             let key_path = o["key"].take_string().expect("No key path");
             let optional = is_true_value(&o["optional"], false);
 
+            let alpn_protocols = match o["alpn_protocols"].take() {
+                JsonValue::String(s) => HashSet::from([s]),
+                JsonValue::Short(s) => HashSet::from([s.to_string()]),
+                JsonValue::Array(v) => v
+                    .into_iter()
+                    .map(|v| {
+                        v.as_str()
+                            .expect("Invalid allowed_alpn_protocol entry")
+                            .to_string()
+                    })
+                    .collect::<HashSet<_>>(),
+                JsonValue::Null => HashSet::new(),
+                invalid => panic!("Invalid alpn_protocols value: {}", invalid),
+            };
+
             Some(ServerTlsConfig {
-                allowed_sni_hostnames,
+                sni_hostnames,
+                alpn_protocols,
                 cert_path,
                 key_path,
                 optional,
