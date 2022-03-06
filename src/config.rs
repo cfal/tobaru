@@ -33,9 +33,9 @@ pub type IpMask = (Ipv6Addr, u32);
 
 #[derive(Debug, Clone)]
 pub struct ServerTlsConfig {
-    pub sni_hostnames: HashSet<SniOption>,
+    pub sni_hostnames: HashSet<TlsOption>,
     // the alpn protocols to show in the serverhello response
-    pub alpn_protocols: HashSet<AlpnOption>,
+    pub alpn_protocols: HashSet<TlsOption>,
 
     pub cert_path: String,
     pub key_path: String,
@@ -43,50 +43,33 @@ pub struct ServerTlsConfig {
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
-pub enum SniOption {
+pub enum TlsOption {
     None,
     Any,
-    Hostname(String),
+    Specified(String),
 }
 
-impl From<&str> for SniOption {
+impl From<&str> for TlsOption {
     fn from(s: &str) -> Self {
         match s {
-            "any" => SniOption::Any,
-            "none" => SniOption::None,
-            hostname => SniOption::Hostname(hostname.to_string()),
+            "any" => TlsOption::Any,
+            "none" => TlsOption::None,
+            hostname => TlsOption::Specified(hostname.to_string()),
         }
     }
 }
 
-impl SniOption {
-    pub fn is_hostname(&self) -> bool {
+impl TlsOption {
+    pub fn is_specified(&self) -> bool {
         match self {
-            SniOption::Hostname(_) => true,
+            TlsOption::Specified(_) => true,
             _ => false,
         }
     }
-    pub fn unwrap_hostname(&self) -> &str {
+    pub fn unwrap_specified(&self) -> &str {
         match self {
-            SniOption::Hostname(s) => s.as_str(),
+            TlsOption::Specified(s) => s.as_str(),
             _ => panic!("Not a hostname"),
-        }
-    }
-}
-
-#[derive(Debug, PartialEq, Eq, Hash, Clone)]
-pub enum AlpnOption {
-    None,
-    Any,
-    Protocol(String),
-}
-
-impl From<&str> for AlpnOption {
-    fn from(s: &str) -> Self {
-        match s {
-            "any" => AlpnOption::Any,
-            "none" => AlpnOption::None,
-            protocol => AlpnOption::Protocol(protocol.to_string()),
         }
     }
 }
@@ -399,11 +382,11 @@ fn parse_server_tls_object(obj: JsonValue) -> Option<ServerTlsConfig> {
                         .map(|v| v.as_str().expect("Invalid sni_hostnames entry").into())
                         .collect::<HashSet<_>>();
                     if hostnames.is_empty() {
-                        hostnames.extend([SniOption::None, SniOption::Any]);
+                        hostnames.extend([TlsOption::None, TlsOption::Any]);
                     }
                     hostnames
                 }
-                JsonValue::Null => HashSet::from([SniOption::None, SniOption::Any]),
+                JsonValue::Null => HashSet::from([TlsOption::None, TlsOption::Any]),
                 invalid => panic!("Invalid sni_hostnames value: {}", invalid),
             };
 
@@ -420,11 +403,11 @@ fn parse_server_tls_object(obj: JsonValue) -> Option<ServerTlsConfig> {
                         .map(|v| v.as_str().expect("Invalid alpn_protocols entry").into())
                         .collect::<HashSet<_>>();
                     if hostnames.is_empty() {
-                        hostnames.extend([AlpnOption::None, AlpnOption::Any]);
+                        hostnames.extend([TlsOption::None, TlsOption::Any]);
                     }
                     hostnames
                 }
-                JsonValue::Null => HashSet::from([AlpnOption::None, AlpnOption::Any]),
+                JsonValue::Null => HashSet::from([TlsOption::None, TlsOption::Any]),
                 invalid => panic!("Invalid alpn_protocols value: {}", invalid),
             };
 

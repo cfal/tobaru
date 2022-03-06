@@ -13,7 +13,7 @@ use tokio_rustls::LazyConfigAcceptor;
 use treebitmap::IpLookupTable;
 
 use crate::async_stream::AsyncStream;
-use crate::config::{AlpnOption, ServerTlsConfig, SniOption, TcpTargetConfig};
+use crate::config::{ServerTlsConfig, TcpTargetConfig, TlsOption};
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::iptables_util::{configure_iptables, Protocol};
 use crate::rustls_util::{
@@ -53,7 +53,7 @@ pub async fn run_tcp_server(
     let mut non_tls_lookup_table: IpLookupTable<Ipv6Addr, Arc<TargetData>> = IpLookupTable::new();
 
     let mut tls_lookup_table: IpLookupTable<Ipv6Addr, bool> = IpLookupTable::new();
-    let mut sni_lookup_map: HashMap<SniOption, Vec<Arc<TlsTargetData>>> = HashMap::new();
+    let mut sni_lookup_map: HashMap<TlsOption, Vec<Arc<TlsTargetData>>> = HashMap::new();
 
     let mut iptable_masks = vec![];
 
@@ -107,13 +107,13 @@ pub async fn run_tcp_server(
                 let mut alpn_protocols = HashSet::new();
                 for alpn_protocol in alpn_protocol_strs {
                     match alpn_protocol {
-                        AlpnOption::None => {
+                        TlsOption::None => {
                             allow_no_alpn = true;
                         }
-                        AlpnOption::Any => {
+                        TlsOption::Any => {
                             allow_any_alpn = true;
                         }
-                        AlpnOption::Protocol(s) => {
+                        TlsOption::Specified(s) => {
                             alpn_protocols.insert(s.into_bytes());
                         }
                     }
@@ -261,7 +261,7 @@ async fn process_tls_stream(
     addr: &std::net::SocketAddr,
     ip: Ipv6Addr,
     non_tls_data: Option<Arc<TargetData>>,
-    sni_lookup_map: Arc<HashMap<SniOption, Vec<Arc<TlsTargetData>>>>,
+    sni_lookup_map: Arc<HashMap<TlsOption, Vec<Arc<TlsTargetData>>>>,
 ) -> std::io::Result<()> {
     if non_tls_data.is_some() {
         let is_tls_client_hello = peek_tls_client_hello(&stream).await?;
@@ -275,8 +275,8 @@ async fn process_tls_stream(
     let client_hello = start_handshake.client_hello();
     let sni_hostname = client_hello
         .server_name()
-        .map(|s| SniOption::Hostname(s.to_string()))
-        .unwrap_or(SniOption::None);
+        .map(|s| TlsOption::Specified(s.to_string()))
+        .unwrap_or(TlsOption::None);
 
     let sni_data_vec = match sni_lookup_map.get(&sni_hostname) {
         Some(v) => {
@@ -284,20 +284,20 @@ async fn process_tls_stream(
             v
         }
         None => {
-            if !sni_hostname.is_hostname() {
+            if !sni_hostname.is_specified() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     "no matching SNI hostname",
                 ));
             }
-            match sni_lookup_map.get(&SniOption::Any) {
+            match sni_lookup_map.get(&TlsOption::Any) {
                 Some(v) => v,
                 None => {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::Other,
                         format!(
                             "no matching SNI hostname: {}",
-                            sni_hostname.unwrap_hostname()
+                            sni_hostname.unwrap_specified()
                         ),
                     ));
                 }
