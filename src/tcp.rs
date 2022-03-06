@@ -319,7 +319,24 @@ async fn process_tls_stream(
 
     Err(std::io::Error::new(
         std::io::ErrorKind::Other,
-        "no matching target",
+        format!(
+            "no matching alpn ({})",
+            client_hello
+                .alpn()
+                .map(|alpn_iter| {
+                    alpn_iter
+                        .map(|alpn_bytes| {
+                            std::str::from_utf8(alpn_bytes)
+                                .map(String::from)
+                                .unwrap_or(format!("{:?}", alpn_bytes))
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .as_ref()
+                .map(String::as_str)
+                .unwrap_or("not negotiated")
+        ),
     ))
 }
 
