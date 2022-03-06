@@ -1,5 +1,7 @@
-use std::collections::hash_map::Entry;
+use std::collections::hash_map::{Entry, RandomState};
 use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasher, Hash};
+use std::lazy::SyncOnceCell;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -36,7 +38,7 @@ struct TargetData {
 struct TlsTargetData {
     pub allow_no_alpn: bool,
     pub allow_any_alpn: bool,
-    pub alpn_protocols: HashSet<Vec<u8>>,
+    pub alpn_protocol_hashes: HashSet<u64>,
     pub ip_lookup_table: IpLookupTable<Ipv6Addr, bool>,
     pub alpn_tls_config: Arc<rustls::ServerConfig>,
     pub no_alpn_tls_config: Arc<rustls::ServerConfig>,
@@ -44,6 +46,11 @@ struct TlsTargetData {
 }
 
 const BUFFER_SIZE: usize = 8192;
+
+fn hash_alpn<T: Hash>(x: T) -> u64 {
+    static ALPN_HASHER: SyncOnceCell<RandomState> = SyncOnceCell::new();
+    ALPN_HASHER.get_or_init(RandomState::new).hash_one(x)
+}
 
 pub async fn run_tcp_server(
     server_address: SocketAddr,
@@ -87,7 +94,7 @@ pub async fn run_tcp_server(
         let is_non_tls_target = match server_tls_config {
             Some(ServerTlsConfig {
                 sni_hostnames,
-                alpn_protocols: alpn_protocol_strs,
+                alpn_protocols,
                 cert_path,
                 key_path,
                 optional,
@@ -104,8 +111,9 @@ pub async fn run_tcp_server(
 
                 let mut allow_no_alpn = false;
                 let mut allow_any_alpn = false;
-                let mut alpn_protocols = HashSet::new();
-                for alpn_protocol in alpn_protocol_strs {
+                let mut alpn_protocol_hashes = HashSet::new();
+                let mut alpn_protocol_bytes = vec![];
+                for alpn_protocol in alpn_protocols {
                     match alpn_protocol {
                         TlsOption::None => {
                             allow_no_alpn = true;
@@ -114,18 +122,23 @@ pub async fn run_tcp_server(
                             allow_any_alpn = true;
                         }
                         TlsOption::Specified(s) => {
-                            alpn_protocols.insert(s.into_bytes());
+                            let alpn_bytes = s.into_bytes();
+                            alpn_protocol_hashes.insert(hash_alpn(&alpn_bytes));
+                            alpn_protocol_bytes.push(alpn_bytes);
                         }
                     }
                 }
 
-                let (alpn_tls_config, no_alpn_tls_config) = if alpn_protocols.is_empty() {
-                    let tls_config =
-                        Arc::new(create_server_config(certs, &private_key, &alpn_protocols));
+                let (alpn_tls_config, no_alpn_tls_config) = if alpn_protocol_hashes.is_empty() {
+                    let tls_config = Arc::new(create_server_config(
+                        certs,
+                        &private_key,
+                        alpn_protocol_bytes,
+                    ));
                     (tls_config.clone(), tls_config)
                 } else {
                     let alpn_tls_config =
-                        create_server_config(certs, &private_key, &alpn_protocols);
+                        create_server_config(certs, &private_key, alpn_protocol_bytes);
                     let mut no_alpn_tls_config = alpn_tls_config.clone();
                     no_alpn_tls_config.alpn_protocols = vec![];
                     (Arc::new(alpn_tls_config), Arc::new(no_alpn_tls_config))
@@ -156,7 +169,7 @@ pub async fn run_tcp_server(
                 let tls_target_data = Arc::new(TlsTargetData {
                     allow_no_alpn,
                     allow_any_alpn,
-                    alpn_protocols,
+                    alpn_protocol_hashes,
                     ip_lookup_table: config_lookup_table,
                     alpn_tls_config,
                     no_alpn_tls_config,
@@ -305,33 +318,27 @@ async fn process_tls_stream(
         }
     };
 
+    let alpn_protocol_hashes: HashSet<u64> = client_hello
+        .alpn()
+        .map(|alpn_iter| alpn_iter.map(hash_alpn).collect())
+        .unwrap_or_else(HashSet::new);
+
     for sni_data in sni_data_vec {
         if sni_data.ip_lookup_table.longest_match(ip.clone()).is_some() {
-            let tls_config = match client_hello.alpn() {
-                Some(alpn_iter) => {
-                    let mut matches = false;
-                    for alpn_bytes in alpn_iter {
-                        if sni_data.alpn_protocols.contains(alpn_bytes) {
-                            matches = true;
-                            break;
-                        }
-                    }
-                    if matches {
-                        debug!("Found matching ALPN.");
-                        sni_data.alpn_tls_config.clone()
-                    } else if sni_data.allow_any_alpn {
-                        debug!("No matching ALPN, but all ALPNs are allowed.");
-                        sni_data.no_alpn_tls_config.clone()
-                    } else {
-                        continue;
-                    }
+            let tls_config = if alpn_protocol_hashes.is_empty() {
+                if !sni_data.allow_no_alpn {
+                    continue;
                 }
-                None => {
-                    if !sni_data.allow_no_alpn {
-                        continue;
-                    }
-                    debug!("No ALPN specified.");
+                sni_data.no_alpn_tls_config.clone()
+            } else {
+                if !alpn_protocol_hashes.is_disjoint(&sni_data.alpn_protocol_hashes) {
+                    sni_data.alpn_tls_config.clone()
+                } else if sni_data.allow_any_alpn {
+                    // allow any ALPN - don't do ALPN negotiation since the requested ALPNs don't
+                    // match any of the specified ones.
                     sni_data.no_alpn_tls_config.clone()
+                } else {
+                    continue;
                 }
             };
 

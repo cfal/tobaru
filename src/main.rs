@@ -1,3 +1,4 @@
+#![feature(build_hasher_simple_hash_one)]
 #![feature(once_cell)]
 
 mod async_stream;

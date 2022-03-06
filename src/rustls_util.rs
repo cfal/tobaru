@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::lazy::SyncOnceCell;
 use std::sync::Arc;
 
@@ -104,7 +103,7 @@ impl ResolvesServerCert for AlwaysResolvesServerCert {
 pub fn create_server_config(
     certs: Vec<Certificate>,
     private_key: &PrivateKey,
-    alpn_protocols: &HashSet<Vec<u8>>,
+    alpn_protocols: Vec<Vec<u8>>,
 ) -> ServerConfig {
     let signing_key = any_supported_type(private_key).unwrap();
     let certified_key = Arc::new(CertifiedKey::new(certs, signing_key));
@@ -112,10 +111,7 @@ pub fn create_server_config(
         .with_safe_defaults()
         .with_no_client_auth()
         .with_cert_resolver(Arc::new(AlwaysResolvesServerCert(certified_key)));
-    config.alpn_protocols = alpn_protocols
-        .iter()
-        .map(|alpn_bytes| alpn_bytes.clone())
-        .collect();
+    config.alpn_protocols = alpn_protocols;
     config.max_early_data_size = u32::MAX;
     config
 }
