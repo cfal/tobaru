@@ -342,8 +342,11 @@ async fn process_tls_stream(
                 }
             };
 
-            let mut tls_stream = start_handshake.into_stream(tls_config).await?;
-            tls_stream.get_mut().1.set_buffer_limit(Some(32768));
+            let tls_stream = start_handshake
+                .into_stream_with(tls_config, |server_conn| {
+                    server_conn.set_buffer_limit(Some(32768));
+                })
+                .await?;
 
             return process_generic_stream(
                 Box::new(tls_stream),
@@ -517,8 +520,11 @@ async fn setup_target_stream(
             Err(_) => get_dummy_server_name(),
         };
 
-        let mut tls_stream = connector.connect(server_name, target_stream).await?;
-        tls_stream.get_mut().1.set_buffer_limit(Some(32768));
+        let tls_stream = connector
+            .connect_with(server_name, target_stream, |server_conn| {
+                server_conn.set_buffer_limit(Some(32768));
+            })
+            .await?;
         Ok(Box::new(tls_stream))
     } else {
         Ok(Box::new(target_stream))
