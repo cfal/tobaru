@@ -13,7 +13,7 @@ use tokio_rustls::LazyConfigAcceptor;
 use treebitmap::IpLookupTable;
 
 use crate::async_stream::AsyncStream;
-use crate::config::{ServerTlsConfig, SniOption, TcpTargetConfig};
+use crate::config::{AlpnOption, ServerTlsConfig, SniOption, TcpTargetConfig};
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::iptables_util::{configure_iptables, Protocol};
 use crate::rustls_util::{
@@ -35,9 +35,11 @@ struct TargetData {
 
 struct TlsTargetData {
     pub allow_no_alpn: bool,
+    pub allow_any_alpn: bool,
     pub alpn_protocols: HashSet<Vec<u8>>,
     pub ip_lookup_table: IpLookupTable<Ipv6Addr, bool>,
-    pub tls_config: Arc<rustls::ServerConfig>,
+    pub alpn_tls_config: Arc<rustls::ServerConfig>,
+    pub no_alpn_tls_config: Arc<rustls::ServerConfig>,
     pub target_data: Arc<TargetData>,
 }
 
@@ -85,8 +87,7 @@ pub async fn run_tcp_server(
         let is_non_tls_target = match server_tls_config {
             Some(ServerTlsConfig {
                 sni_hostnames,
-                allow_no_alpn,
-                alpn_protocols,
+                alpn_protocols: alpn_protocol_strs,
                 cert_path,
                 key_path,
                 optional,
@@ -101,10 +102,34 @@ pub async fn run_tcp_server(
                 key_file.read_to_end(&mut key_bytes).await?;
                 let private_key = load_private_key(&key_bytes);
 
-                let alpn_protocols = alpn_protocols.into_iter().map(String::into_bytes).collect();
+                let mut allow_no_alpn = false;
+                let mut allow_any_alpn = false;
+                let mut alpn_protocols = HashSet::new();
+                for alpn_protocol in alpn_protocol_strs {
+                    match alpn_protocol {
+                        AlpnOption::None => {
+                            allow_no_alpn = true;
+                        }
+                        AlpnOption::Any => {
+                            allow_any_alpn = true;
+                        }
+                        AlpnOption::Protocol(s) => {
+                            alpn_protocols.insert(s.into_bytes());
+                        }
+                    }
+                }
 
-                let tls_config =
-                    Arc::new(create_server_config(certs, &private_key, &alpn_protocols));
+                let (alpn_tls_config, no_alpn_tls_config) = if alpn_protocols.is_empty() {
+                    let tls_config =
+                        Arc::new(create_server_config(certs, &private_key, &alpn_protocols));
+                    (tls_config.clone(), tls_config)
+                } else {
+                    let alpn_tls_config =
+                        create_server_config(certs, &private_key, &alpn_protocols);
+                    let mut no_alpn_tls_config = alpn_tls_config.clone();
+                    no_alpn_tls_config.alpn_protocols = vec![];
+                    (Arc::new(alpn_tls_config), Arc::new(no_alpn_tls_config))
+                };
 
                 let mut config_lookup_table = IpLookupTable::new();
                 for (addr, masklen) in allowed_ips.iter() {
@@ -130,9 +155,11 @@ pub async fn run_tcp_server(
 
                 let tls_target_data = Arc::new(TlsTargetData {
                     allow_no_alpn,
+                    allow_any_alpn,
                     alpn_protocols,
                     ip_lookup_table: config_lookup_table,
-                    tls_config,
+                    alpn_tls_config,
+                    no_alpn_tls_config,
                     target_data: target_data.clone(),
                 });
 
@@ -291,7 +318,10 @@ async fn process_tls_stream(
                     }
                     if matches {
                         debug!("Found matching ALPN.");
-                        sni_data.tls_config.clone()
+                        sni_data.alpn_tls_config.clone()
+                    } else if sni_data.allow_any_alpn {
+                        debug!("No matching ALPN, but all ALPNs are allowed.");
+                        sni_data.no_alpn_tls_config.clone()
                     } else {
                         continue;
                     }
@@ -301,7 +331,7 @@ async fn process_tls_stream(
                         continue;
                     }
                     debug!("No ALPN specified.");
-                    sni_data.tls_config.clone()
+                    sni_data.no_alpn_tls_config.clone()
                 }
             };
 
