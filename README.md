@@ -26,9 +26,9 @@ Simple configuration can be done by passing in URLs on the command line. The for
 
 Supported query keys:
 
-- **to, targetAddress, target**: address to forward to.
+- **to, target**: address to forward to.
 - **allowlist**: list of comma separated netmasks to allow. if this is omitted, all source addresses are allowed.
-- **tcp_nodelay, nodelay, tcpNodelay**: enables tcp_nodelay.
+- **tcp_nodelay**: enables tcp_nodelay.
 
 ## Advanced Configuration
 

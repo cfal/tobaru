@@ -10,13 +10,41 @@ mod tcp;
 mod tokio_util;
 mod udp;
 
-use futures::future::try_join_all;
+use std::path::Path;
+
 use log::{debug, error, info};
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::runtime::Builder;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 
 use crate::config::{ServerConfig, TargetConfigs};
 use crate::tcp::run_tcp_server;
 use crate::udp::run_udp_server;
+
+#[derive(Debug)]
+struct ConfigChanged;
+
+fn start_notify_thread(
+    config_paths: Vec<String>,
+) -> (RecommendedWatcher, UnboundedReceiver<ConfigChanged>) {
+    let (tx, rx) = unbounded_channel();
+
+    let mut watcher = notify::recommended_watcher(move |res| match res {
+        Ok(_) => {
+            tx.send(ConfigChanged {}).unwrap();
+        }
+        Err(e) => println!("watch error: {:?}", e),
+    })
+    .unwrap();
+
+    for config_path in config_paths {
+        watcher
+            .watch(Path::new(&config_path), RecursiveMode::NonRecursive)
+            .unwrap();
+    }
+
+    (watcher, rx)
+}
 
 async fn run(server_config: ServerConfig) {
     let ServerConfig {
@@ -60,26 +88,6 @@ fn main() {
         }
     }
 
-    let server_configs: Vec<ServerConfig> = config::load_configs(config_paths, config_urls);
-
-    if server_configs.is_empty() {
-        error!("No server configs found.");
-        return;
-    }
-
-    debug!("Loaded server configs: {:#?}", &server_configs);
-
-    for server_config in server_configs.iter() {
-        if server_config.use_iptables {
-            iptables_util::clear_iptables(server_config.server_address);
-        }
-    }
-
-    if clear_iptables_only {
-        info!("iptables cleared, exiting.");
-        return;
-    }
-
     if num_threads == 0 {
         num_threads = std::cmp::max(
             2,
@@ -99,14 +107,51 @@ fn main() {
         .expect("Could not build tokio runtime");
 
     runtime.block_on(async move {
-        let mut join_handles = Vec::with_capacity(server_configs.len());
-        for server_config in server_configs {
-            join_handles.push(tokio::spawn(async move {
-                run(server_config).await;
-            }));
-        }
+        let (_watcher, mut config_rx) = start_notify_thread(config_paths.clone());
+        let mut is_initial = true;
 
-        // Die on any server error.
-        try_join_all(join_handles).await.unwrap();
+        loop {
+            let server_configs: Vec<ServerConfig> =
+                config::load_configs(config_paths.clone(), config_urls.clone(), is_initial).await;
+            is_initial = false;
+
+            if server_configs.is_empty() {
+                error!("No server configs found.");
+                return;
+            }
+
+            debug!("Loaded server configs: {:#?}", &server_configs);
+
+            for server_config in server_configs.iter() {
+                if server_config.use_iptables {
+                    iptables_util::clear_iptables(server_config.server_address);
+                }
+            }
+
+            if clear_iptables_only {
+                info!("iptables cleared, exiting.");
+                return;
+            }
+
+            let mut join_handles = Vec::with_capacity(server_configs.len());
+            for server_config in server_configs {
+                join_handles.push(tokio::spawn(async move {
+                    run(server_config).await;
+                }));
+            }
+
+            config_rx.recv().await.unwrap();
+
+            println!("Configs changed, restarting servers in 3 seconds..");
+
+            for join_handle in join_handles {
+                join_handle.abort();
+            }
+
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+            // Remove any extra events
+            while let Ok(_) = config_rx.try_recv() {}
+        }
     });
 }

@@ -110,20 +110,45 @@ pub struct UdpTargetConfig {
     pub association_timeout_secs: Option<u32>,
 }
 
-pub fn load_configs(config_paths: Vec<String>, config_urls: Vec<String>) -> Vec<ServerConfig> {
-    let mut config_objects: Vec<JsonValue> = config_paths
-        .iter()
-        .map(|config_path| {
-            let config_str =
-                std::fs::read_to_string(config_path).expect("Failed to read from config file");
-            let config_str = config_str
-                .split('\n')
-                .filter(|line| return !line.trim_start().starts_with("//"))
-                .collect::<Vec<&str>>()
-                .join("\n");
-            json::parse(&config_str).expect("Invalid JSON in config")
-        })
-        .collect();
+pub async fn load_configs(
+    config_paths: Vec<String>,
+    config_urls: Vec<String>,
+    is_initial: bool,
+) -> Vec<ServerConfig> {
+    let mut config_objects = vec![];
+    for config_path in config_paths {
+        let config_str = match tokio::fs::read_to_string(&config_path).await {
+            Ok(s) => s,
+            Err(e) => {
+                println!("Failed to read {}, skipping: {}", config_path, e);
+                if is_initial {
+                    panic!("Initial load failed.");
+                }
+                continue;
+            }
+        };
+        let config_str = config_str
+            .split('\n')
+            .filter(|line| return !line.trim_start().starts_with("//"))
+            .collect::<Vec<&str>>()
+            .join("\n");
+        let config_object = match json::parse(&config_str) {
+            Ok(o) => o,
+            Err(e) => {
+                println!("Failed to read {}, invalid JSON: {}", config_path, e);
+                if is_initial {
+                    panic!("Initial load failed.");
+                }
+                continue;
+            }
+        };
+        config_objects.push(config_object);
+    }
+
+    for config_url in config_urls {
+        let config_object = convert_url_to_obj(&config_url).unwrap();
+        config_objects.push(config_object);
+    }
 
     let mut ip_groups = HashMap::new();
     for config_object in config_objects.iter_mut() {
@@ -134,12 +159,6 @@ pub fn load_configs(config_paths: Vec<String>, config_urls: Vec<String>) -> Vec<
 
     let mut all_configs = vec![];
     for config_object in config_objects.into_iter() {
-        let configs = load_config(config_object, &ip_groups);
-        all_configs.extend(configs.into_iter())
-    }
-
-    for config_url in config_urls {
-        let config_object = convert_url_to_obj(&config_url).unwrap();
         let configs = load_config(config_object, &ip_groups);
         all_configs.extend(configs.into_iter())
     }
