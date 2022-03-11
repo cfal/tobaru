@@ -21,7 +21,7 @@ parking_lot = "*"
 percent-encoding = "*"
 rustls = { version = "*", features = ["dangerous_configuration"] }
 rustls-pemfile = { version = "*" }
-tokio = { version = "*", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "*", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
 tokio-rustls = { version = "*", features = ["dangerous_configuration"] }
 treebitmap = "*"
 url = "*"

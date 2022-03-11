@@ -124,7 +124,7 @@ fn main() {
 
             for server_config in server_configs.iter() {
                 if server_config.use_iptables {
-                    iptables_util::clear_iptables(server_config.server_address);
+                    iptables_util::clear_iptables(server_config.server_address).await;
                 }
             }
 

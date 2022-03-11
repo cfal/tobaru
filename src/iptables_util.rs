@@ -1,6 +1,7 @@
 use log::{debug, error};
 use std::net::{Ipv6Addr, SocketAddr};
-use std::process::{Command, Output};
+use std::process::Output;
+use tokio::process::Command;
 
 const IPTABLES_PATH: &str = "/usr/sbin/iptables";
 const IP6TABLES_PATH: &str = "/usr/sbin/ip6tables";
@@ -19,7 +20,7 @@ impl Protocol {
     }
 }
 
-fn run(program: &str, args: &[&str]) -> Vec<String> {
+async fn run(program: &str, args: &[&str]) -> Vec<String> {
     debug!("Running {} with arguments: {:?}", program, args);
     let Output {
         status,
@@ -28,6 +29,7 @@ fn run(program: &str, args: &[&str]) -> Vec<String> {
     } = Command::new(program)
         .args(args)
         .output()
+        .await
         .expect("Failed to run iptables.");
 
     if stderr.len() > 0 {
@@ -59,7 +61,7 @@ fn format_ipv6(addr: &Ipv6Addr) -> String {
         .join(":")
 }
 
-pub fn configure_iptables(
+pub async fn configure_iptables(
     protocol: Protocol,
     socket_addr: SocketAddr,
     ip_masks: &[(Ipv6Addr, u32)],
@@ -88,7 +90,8 @@ pub fn configure_iptables(
                 "--comment",
                 &comment,
             ],
-        );
+        )
+        .await;
 
         if let Some(addr_v4) = addr.to_ipv4() {
             run(
@@ -111,7 +114,8 @@ pub fn configure_iptables(
                     "--comment",
                     &comment,
                 ],
-            );
+            )
+            .await;
         }
     }
 
@@ -134,11 +138,12 @@ pub fn configure_iptables(
                 "--comment",
                 &comment,
             ],
-        );
+        )
+        .await;
     }
 }
 
-pub fn clear_iptables(socket_addr: SocketAddr) {
+pub async fn clear_iptables(socket_addr: SocketAddr) {
     let comment = create_comment(&socket_addr);
     for program in &[IPTABLES_PATH, IP6TABLES_PATH] {
         // Iterate through line backwards so that rule numbers don't change as we remove them.
@@ -146,12 +151,13 @@ pub fn clear_iptables(socket_addr: SocketAddr) {
             program,
             &["--wait", "5", "-n", "-L", "INPUT", "--line-numbers"],
         )
+        .await
         .into_iter()
         .rev()
         {
             if line.find(&comment).is_some() {
                 let rule_number = line.trim_start().split(' ').next().unwrap();
-                run(program, &["--wait", "5", "-D", "INPUT", rule_number]);
+                run(program, &["--wait", "5", "-D", "INPUT", rule_number]).await;
             }
         }
     }

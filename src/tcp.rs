@@ -210,7 +210,7 @@ pub async fn run_tcp_server(
     }
 
     if use_iptables {
-        configure_iptables(Protocol::Tcp, server_address.clone(), &iptable_masks);
+        configure_iptables(Protocol::Tcp, server_address.clone(), &iptable_masks).await;
     }
 
     let sni_lookup_map = Arc::new(sni_lookup_map);

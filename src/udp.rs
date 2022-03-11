@@ -93,7 +93,7 @@ pub async fn run_udp_server(
             .iter()
             .map(|(addr, masklen, _)| (addr, masklen))
             .collect();
-        configure_iptables(Protocol::Udp, server_address, &ip_masks);
+        configure_iptables(Protocol::Udp, server_address, &ip_masks).await;
     }
 
     for entry in lookup_table.iter() {
