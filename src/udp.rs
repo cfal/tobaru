@@ -105,7 +105,10 @@ pub async fn run_udp_server(
 
     let mut buf = [0u8; MAX_UDP_PACKET_SIZE];
 
-    start_cleanup_task(associations.clone(), min_association_timeout_secs);
+    let _cleanup_drop_guard = TaskDropGuard(start_cleanup_task(
+        associations.clone(),
+        min_association_timeout_secs,
+    ));
 
     loop {
         let (len, addr) = server_socket
@@ -162,10 +165,17 @@ pub async fn run_udp_server(
     }
 }
 
+struct TaskDropGuard<T>(JoinHandle<T>);
+impl<T> Drop for TaskDropGuard<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 fn start_cleanup_task(
     associations: Arc<Mutex<HashMap<(SocketAddr, UdpTargetAddress), Association>>>,
     min_association_timeout_secs: u32,
-) {
+) -> JoinHandle<()> {
     let cleanup_interval = Duration::from_secs(min_association_timeout_secs as u64);
 
     tokio::spawn(async move {
@@ -182,7 +192,7 @@ fn start_cleanup_task(
                 }
             });
         }
-    });
+    })
 }
 
 struct Association {
