@@ -2,12 +2,62 @@
 
 Port forwarding tool written in Rust with advanced features, such as:
 
-- **Allowlists**: Only forwards connections from known IPv4 or IPv6 ranges.
+- **Multiple target addresses**: Forwards to different target addresses based on IP and TLS SNI/ALPN.
+  - **IPv4/IPv6 allowlists**: Only forwards connections from known IP ranges.
+  - **TLS support**:
+    - Accept and connect to unencrypted and TLS-enabled connections
+    - Detect and clients to optionally use TLS on a single port
+- **Hot reloading**: Updated configs are automatically reloaded.
 - **iptables support**: Automatically configures iptables to drop packets from unallowed ranges.
-- **Multiple target addresses**: Forwards to different target addresses based on IP.
-- **TLS encryption/decryption**: Accepts unencrypted and TLS-enabled connections, and connects to both unencrypted and TLS-enabled destinations.
-- **TLS detection**: Allows clients to optionally use TLS, and forward them without the TLS layer if they aren't.
 - **IP groups**: named groups of IPs that can be reused amongst different server configurations.
+
+Here's a quick example of TLS-based forwarding:
+
+```js
+{
+  "bindAddress": "0.0.0.0:443",
+  "protocol": "tcp",
+  "targets": [
+    // target 1: clients from ip 1.2.3.4 asking for SNI example.com and ALPN protocol http/1.1
+    // will get forwarded here.
+    {
+      "address": "127.0.0.1:3000",
+      "serverTls": {
+        "cert": "cert.pem",
+        "key": "cert.pem",
+        "sni_hostnames": ["example.com"],
+        // allow any alpn protocol, or to skip ALPN negotiation.
+        "alpn_protocols": ["http/1.1"]
+      },
+      "allowlist": [ "1.2.3.4" ]
+    },
+    // target 2: clients from ip 12.34.0.0 asking for SNI example.com and any other ALPN protocol,
+    // or no ALPN negotiation, will get forwarded here.
+    {
+      "address": "127.0.0.1:3001",
+      "serverTls": {
+        "cert": "cert.pem",
+        "key": "cert.pem",
+        "sni_hostnames": ["example.com"],
+        // allow any alpn protocol, or to skip ALPN negotiation.
+        "alpn_protocols": [ "any", "none" ]
+      },
+      "allowlist": [ "12.34.0.0" ]
+    },
+    // target 3: clients from ip 1.2.3.4 asking for SNI test.com get forwarded here.
+    {
+      "address": "127.0.0.1:3002",
+      "serverTls": {
+        "cert": "cert.pem",
+        "key": "cert.pem",
+        "sni_hostnames": [ "test.com" ],
+        "alpn_protocols": [ "any", "none" ]
+      },
+      "allowlist": [ "5.6.7.8" ]
+    }
+  ]
+}
+```
 
 ## Usage
 
