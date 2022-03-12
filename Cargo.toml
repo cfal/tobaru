@@ -11,21 +11,21 @@ keywords = ["tunnel", "proxy", "tcp", "forward", "port"]
 categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]
-async-trait = "*"
-env_logger = "*"
-futures = "*"
-ipnet = "*"
-json = "*"
-log = "*"
-parking_lot = "*"
-percent-encoding = "*"
-rustls = { version = "*", features = ["dangerous_configuration"] }
-rustls-pemfile = { version = "*" }
-tokio = { version = "*", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
-tokio-rustls = { version = "*", features = ["dangerous_configuration"] }
-treebitmap = "*"
-url = "*"
-webpki-roots = { version = "*" }
+async-trait = "0.1.52"
+env_logger = "0.9.0"
+futures = "0.3.21"
+ipnet = "2.3.1"
+json = "0.12.4"
+log = "0.4.14"
+parking_lot = "0.12.0"
+percent-encoding = "2.1.0"
+rustls = { version = "0.20.4", features = ["dangerous_configuration"] }
+rustls-pemfile = { version = "0.3.0" }
+tokio = { version = "1.17.0", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+tokio-rustls = { version = "0.23.2", features = ["dangerous_configuration"] }
+treebitmap = "0.4.0"
+url = "2.2.2"
+webpki-roots = { version = "0.22.2" }
 notify = "5.0.0-pre.13"
 
 [profile.release]
