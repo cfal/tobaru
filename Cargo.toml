@@ -1,6 +1,6 @@
 [package]
 name = "tobaru"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2021"
 license = "MIT"
 description = "Port forwarding CLI utility written in Rust with allowlists, TLS SNI and ALPN routing, round-robin forwarding (load balancing), IP-to-destination mapping, and iptables support."
