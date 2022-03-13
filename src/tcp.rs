@@ -146,15 +146,10 @@ pub async fn run_tcp_server(
 
                 let mut config_lookup_table = IpLookupTable::new();
                 for (addr, masklen) in allowed_ips.iter() {
-                    if tls_lookup_table
-                        .insert(addr.clone(), *masklen, true)
-                        .is_some()
-                    {
-                        panic!(
-                            "Address {}/{} is duplicated in the TLS config.",
-                            addr, masklen
-                        );
-                    }
+                    // addresses can be the same across different TLS configs
+                    let _ = tls_lookup_table.insert(addr.clone(), *masklen, true);
+
+                    // .. but shouldn't be duplicated in a single config.
                     if config_lookup_table
                         .insert(addr.clone(), *masklen, true)
                         .is_some()
