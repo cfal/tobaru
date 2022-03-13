@@ -11,15 +11,20 @@ Port forwarding tool written in Rust with advanced features, such as:
 - **iptables support**: Automatically configures iptables to drop packets from unallowed ranges.
 - **IP groups**: named groups of IPs that can be reused amongst different server configurations.
 
-Here's a quick example of TLS-based forwarding:
+Here's a quick example:
 
 ```js
 {
   "bindAddress": "0.0.0.0:443",
   "protocol": "tcp",
   "targets": [
-    // target 1: clients from ip 1.2.3.4 asking for SNI example.com and ALPN protocol http/1.1
-    // will get forwarded here.
+    // target 1: non-TLS clients from any IP will be forwarded here.
+    {
+      "address": "127.0.0.1:2999",
+      "allowlist": [ "0.0.0.0/0" ]
+    },
+    // target 2: TLS clients from any IP asking for SNI example.com and ALPN protocol
+    // http/1.1 will be forwarded here.
     {
       "address": "127.0.0.1:3000",
       "serverTls": {
@@ -29,10 +34,10 @@ Here's a quick example of TLS-based forwarding:
         // allow any alpn protocol, or to skip ALPN negotiation.
         "alpn_protocols": ["http/1.1"]
       },
-      "allowlist": [ "1.2.3.4" ]
+      "allowlist": [ "0.0.0.0/0" ]
     },
-    // target 2: clients from ip 12.34.0.0 asking for SNI example.com and any other ALPN protocol,
-    // or no ALPN negotiation, will get forwarded here.
+    // target 3: TLS clients from ip 1.2.3.4 asking for SNI example.com and any other
+    // ALPN protocol, or no ALPN negotiation, will be forwarded here.
     {
       "address": "127.0.0.1:3001",
       "serverTls": {
@@ -42,9 +47,9 @@ Here's a quick example of TLS-based forwarding:
         // allow any alpn protocol, or to skip ALPN negotiation.
         "alpn_protocols": [ "any", "none" ]
       },
-      "allowlist": [ "12.34.0.0" ]
+      "allowlist": [ "1.2.3.4" ]
     },
-    // target 3: clients from ip 1.2.3.4 asking for SNI test.com get forwarded here.
+    // target 4: TLS clients from ip 1.2.3.4 asking for SNI test.com will be forwarded here.
     {
       "address": "127.0.0.1:3002",
       "serverTls": {
