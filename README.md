@@ -2,14 +2,14 @@
 
 Port forwarding tool written in Rust with advanced features, such as:
 
-- **Multiple target addresses**: Forwards to different target addresses based on IP and TLS SNI/ALPN.
-  - **IPv4/IPv6 allowlists**: Only forwards connections from known IP ranges.
+- **Multiple target addresses**: Forwards to different target addresses based on IP and TLS SNI/ALPN
+  - **IPv4/IPv6 allowlists**: Only forwards connections from known IP ranges
   - **TLS support**:
-    - Accept and connect to unencrypted and TLS-enabled connections
-    - Detect and clients to optionally use TLS on a single port
-- **Hot reloading**: Updated configs are automatically reloaded.
-- **iptables support**: Automatically configures iptables to drop packets from unallowed ranges.
-- **IP groups**: named groups of IPs that can be reused amongst different server configurations.
+    - Allow both TLS and non-TLS clients on a single port
+    - Connect to TLS and non-TLS endpoints
+- **Hot reloading**: Updated configs are automatically reloaded
+- **iptables support**: Automatically configures iptables to drop packets from unallowed ranges
+- **IP groups**: named groups of IPs that can be reused amongst different server configurations
 
 Here's a quick example:
 
@@ -30,9 +30,8 @@ Here's a quick example:
       "serverTls": {
         "cert": "cert.pem",
         "key": "cert.pem",
-        "sni_hostnames": ["example.com"],
-        // allow any alpn protocol, or to skip ALPN negotiation.
-        "alpn_protocols": ["http/1.1"]
+        "sni_hostnames": [ "example.com" ],
+        "alpn_protocols": [ "http/1.1" ]
       },
       "allowlist": [ "0.0.0.0/0" ]
     },
@@ -43,7 +42,7 @@ Here's a quick example:
       "serverTls": {
         "cert": "cert.pem",
         "key": "cert.pem",
-        "sni_hostnames": ["example.com"],
+        "sni_hostnames": [ "example.com" ],
         // allow any alpn protocol, or to skip ALPN negotiation.
         "alpn_protocols": [ "any", "none" ]
       },
