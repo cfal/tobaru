@@ -1,10 +1,12 @@
+use std::collections::{HashMap, HashSet};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+
 use json::JsonValue;
-use log::debug;
+use log::{debug, warn};
 use percent_encoding::percent_decode_str;
 use url::Url;
 
-use std::collections::{HashMap, HashSet};
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use crate::location::Location;
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -20,12 +22,8 @@ pub enum TargetConfigs {
 }
 
 #[derive(Debug, Clone)]
-pub struct TcpTargetAddress {
-    // We don't convert to SocketAddr here so that if it's a hostname,
-    // it could be updated without restarting the process depending on
-    // the system's DNS settings.
-    pub address: String,
-    pub port: u16,
+pub struct TcpTargetLocation {
+    pub location: Location,
     pub client_tls_config: Option<ClientTlsConfig>,
 }
 
@@ -82,7 +80,7 @@ pub struct ClientTlsConfig {
 #[derive(Debug, Clone)]
 pub struct TcpTargetConfig {
     pub allowed_ips: Vec<IpMask>,
-    pub target_addresses: Vec<TcpTargetAddress>,
+    pub target_locations: Vec<TcpTargetLocation>,
     pub server_tls_config: Option<ServerTlsConfig>,
     pub tcp_nodelay: bool,
 }
@@ -314,26 +312,42 @@ fn parse_server_object(
     }
 }
 
+fn take_target_location_objects(obj: &mut JsonValue) -> Vec<JsonValue> {
+    if obj.has_key("location") {
+        vec![obj["location"].take()]
+    } else if obj.has_key("locations") {
+        match obj["locations"].take() {
+            JsonValue::Array(v) => v,
+            _ => panic!("Invalid target addresses"),
+        }
+    } else if obj.has_key("address") {
+        warn!("Target key 'address' is deprecated");
+        vec![obj["address"].take()]
+    } else if obj.has_key("addresses") {
+        warn!("Target key 'addresses' is deprecated");
+        match obj["addresses"].take() {
+            JsonValue::Array(v) => v,
+            _ => panic!("Invalid target addresses"),
+        }
+    } else {
+        panic!("Target object has no location field");
+    }
+}
+
 fn parse_tcp_target_object(
     mut obj: JsonValue,
     ip_groups: &HashMap<String, Vec<IpMask>>,
 ) -> TcpTargetConfig {
     let server_tls_config = parse_server_tls_object(obj["serverTls"].take());
 
-    let target_addresses = if obj.has_key("address") {
-        vec![parse_tcp_target_address(obj["address"].take())]
-    } else {
-        let addresses_objs = match obj["addresses"].take() {
-            JsonValue::Array(v) => v,
-            _ => panic!("Invalid target addresses"),
-        };
-        addresses_objs
-            .into_iter()
-            .map(parse_tcp_target_address)
-            .collect()
-    };
+    let location_objs = take_target_location_objects(&mut obj);
 
-    if target_addresses.is_empty() {
+    let target_locations: Vec<TcpTargetLocation> = location_objs
+        .into_iter()
+        .map(parse_tcp_target_location)
+        .collect();
+
+    if target_locations.is_empty() {
         panic!("No target addresses specified.");
     }
 
@@ -349,7 +363,7 @@ fn parse_tcp_target_object(
     TcpTargetConfig {
         allowed_ips,
         server_tls_config,
-        target_addresses,
+        target_locations,
         tcp_nodelay,
     }
 }
@@ -464,45 +478,49 @@ fn parse_client_tls_object(obj: JsonValue) -> Option<ClientTlsConfig> {
     }
 }
 
-fn parse_tcp_target_address(mut obj: JsonValue) -> TcpTargetAddress {
+fn parse_tcp_target_location(mut obj: JsonValue) -> TcpTargetLocation {
     if obj.is_object() {
-        TcpTargetAddress {
-            address: obj["address"]
+        let location = if obj.has_key("path") {
+            let path_str = obj["path"]
                 .take_string()
-                .expect("Target address is not a string"),
-            port: obj["port"]
-                .as_u16()
-                .expect("Target port is not a valid number"),
+                .expect("Target path is not a string");
+            Location::from_path(path_str.as_str())
+        } else {
+            let address = obj["address"]
+                .take_string()
+                .expect("Target address is not a string");
+            if obj.has_key("port") {
+                let port = obj["port"]
+                    .as_u16()
+                    .expect("Target port is not a valid number");
+                (address.as_str(), port).into()
+            } else {
+                Location::from_net_address(&address).expect("Target address is invalid")
+            }
+        };
+
+        TcpTargetLocation {
+            location,
             client_tls_config: parse_client_tls_object(obj["tls"].take()),
         }
     } else if obj.is_string() {
         let mut s = obj.take_string().unwrap();
-        let i = s.rfind(':').expect("No port separator in address string");
-        let mut suffix_str = s.split_off(i + 1);
-        // Remove the colon.
-        s.pop();
 
-        let (mut port_str, query_str) = match suffix_str.find("/?") {
+        let (location_str, query_str) = match s.find("/?") {
             Some(i) => {
-                let query_str = suffix_str.split_off(i + 2);
+                let query_str = s.split_off(i + 2);
                 // Remove the question mark and the slash.
-                suffix_str.pop();
-                suffix_str.pop();
-                (suffix_str, query_str)
+                s.pop();
+                s.pop();
+                (s, query_str)
             }
-            None => (suffix_str, String::new()),
+            None => (s, String::new()),
         };
 
-        let (port_str, tls) = if port_str.starts_with("+") {
-            (port_str.split_off(1), true)
-        } else {
-            (port_str, false)
-        };
-
-        TcpTargetAddress {
-            address: s,
-            port: port_str.parse().expect("Invalid target port"),
-            client_tls_config: if tls {
+        let location = Location::from(location_str.as_str());
+        TcpTargetLocation {
+            location,
+            client_tls_config: if query_str.find("tls=true").is_some() {
                 Some(ClientTlsConfig {
                     verify: !query_str.find("verify=false").is_some(),
                 })
@@ -519,18 +537,12 @@ fn parse_udp_target_object(
     mut obj: JsonValue,
     ip_groups: &HashMap<String, Vec<IpMask>>,
 ) -> UdpTargetConfig {
-    let target_addresses = if obj.has_key("address") {
-        vec![parse_udp_target_address(obj["address"].take())]
-    } else {
-        let addresses_objs = match obj["addresses"].take() {
-            JsonValue::Array(v) => v,
-            _ => panic!("Invalid target addresses"),
-        };
-        addresses_objs
-            .into_iter()
-            .map(parse_udp_target_address)
-            .collect()
-    };
+    let location_objs = take_target_location_objects(&mut obj);
+
+    let target_addresses: Vec<UdpTargetAddress> = location_objs
+        .into_iter()
+        .map(parse_udp_target_address)
+        .collect();
 
     if target_addresses.is_empty() {
         panic!("No target addresses specified.");

@@ -10,7 +10,7 @@ use futures::join;
 use log::{debug, error, warn};
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UnixStream};
 use tokio_rustls::LazyConfigAcceptor;
 use treebitmap::IpLookupTable;
 
@@ -18,19 +18,19 @@ use crate::async_stream::AsyncStream;
 use crate::config::{ServerTlsConfig, TcpTargetConfig, TlsOption};
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::iptables_util::{configure_iptables, Protocol};
+use crate::location::Location;
 use crate::rustls_util::{
     create_connector, create_server_config, get_dummy_server_name, load_certs, load_private_key,
 };
 use crate::tokio_util::resolve_host;
 
-struct TargetAddressData {
-    pub address: String,
-    pub port: u16,
+struct TargetLocationData {
+    pub location: Location,
     pub tls_connector: Option<tokio_rustls::TlsConnector>,
 }
 
 struct TargetData {
-    pub address_data: Vec<TargetAddressData>,
+    pub location_data: Vec<TargetLocationData>,
     pub next_address_index: AtomicUsize,
     pub tcp_nodelay: bool,
 }
@@ -67,17 +67,16 @@ pub async fn run_tcp_server(
     for target_config in target_configs {
         let TcpTargetConfig {
             allowed_ips,
-            target_addresses,
+            target_locations,
             server_tls_config,
             tcp_nodelay,
         } = target_config;
 
-        let address_data = target_addresses
+        let location_data = target_locations
             .into_iter()
-            .map(|target_address| TargetAddressData {
-                address: target_address.address,
-                port: target_address.port,
-                tls_connector: if let Some(cfg) = target_address.client_tls_config {
+            .map(|target_location| TargetLocationData {
+                location: target_location.location,
+                tls_connector: if let Some(cfg) = target_location.client_tls_config {
                     Some(create_connector(cfg.verify))
                 } else {
                     None
@@ -86,7 +85,7 @@ pub async fn run_tcp_server(
             .collect();
 
         let target_data = Arc::new(TargetData {
-            address_data,
+            location_data,
             next_address_index: AtomicUsize::new(0),
             tcp_nodelay,
         });
@@ -380,18 +379,18 @@ async fn process_generic_stream(
     addr: &std::net::SocketAddr,
     target_data: Arc<TargetData>,
 ) -> std::io::Result<()> {
-    let target_address = if target_data.address_data.len() > 1 {
+    let target_location = if target_data.location_data.len() > 1 {
         // fetch_add wraps around on overflow.
         let index = target_data
             .next_address_index
             .fetch_add(1, Ordering::Relaxed);
-        &target_data.address_data[index % target_data.address_data.len()]
+        &target_data.location_data[index % target_data.location_data.len()]
     } else {
-        &target_data.address_data[0]
+        &target_data.location_data[0]
     };
 
     let mut target_stream =
-        match setup_target_stream(addr, &target_address, target_data.tcp_nodelay).await {
+        match setup_target_stream(addr, &target_location, target_data.tcp_nodelay).await {
             Ok(s) => s,
             Err(e) => {
                 source_stream.try_shutdown().await?;
@@ -400,31 +399,28 @@ async fn process_generic_stream(
         };
 
     debug!(
-        "Copying: {}:{} to {}:{}",
+        "Copying: {}:{} to {}",
         addr.ip(),
         addr.port(),
-        &target_address.address,
-        &target_address.port
+        &target_location.location,
     );
 
     let copy_result = copy_bidirectional(&mut source_stream, &mut target_stream, BUFFER_SIZE).await;
 
     debug!(
-        "Shutdown: {}:{} to {}:{}",
+        "Shutdown: {}:{} to {}",
         addr.ip(),
         addr.port(),
-        &target_address.address,
-        &target_address.port
+        &target_location.location,
     );
 
     let (_, _) = join!(source_stream.try_shutdown(), target_stream.try_shutdown());
 
     debug!(
-        "Done: {}:{} to {}:{}",
+        "Done: {}:{} to {}",
         addr.ip(),
         addr.port(),
-        &target_address.address,
-        &target_address.port
+        &target_location.location,
     );
 
     copy_result?;
@@ -491,37 +487,60 @@ async fn peek_tls_client_hello(stream: &TcpStream) -> std::io::Result<bool> {
 
 async fn setup_target_stream(
     addr: &std::net::SocketAddr,
-    target_address: &TargetAddressData,
+    target_location: &TargetLocationData,
     tcp_nodelay: bool,
 ) -> std::io::Result<Box<dyn AsyncStream>> {
-    let target_addr = resolve_host((target_address.address.as_str(), target_address.port)).await?;
-    let target_stream = TcpStream::connect(target_addr).await?;
+    match target_location.location {
+        Location::Net((ref address, port)) => {
+            let target_addr = resolve_host((address.as_str(), port)).await?;
+            let tcp_stream = TcpStream::connect(target_addr).await?;
+            if tcp_nodelay {
+                if let Err(e) = tcp_stream.set_nodelay(true) {
+                    error!("Failed to set tcp_nodelay: {}", e);
+                }
+            }
+            debug!(
+                "Connected to remote: {} using local addr {}",
+                addr,
+                tcp_stream.local_addr().unwrap()
+            );
 
-    if tcp_nodelay {
-        if let Err(e) = target_stream.set_nodelay(true) {
-            error!("Failed to set tcp_nodelay: {}", e);
+            if let Some(ref connector) = target_location.tls_connector {
+                // TODO: allow specifying or disabling SNI
+                let server_name = match rustls::ServerName::try_from(address.as_str()) {
+                    Ok(s) => s,
+                    Err(_) => get_dummy_server_name(),
+                };
+                let tls_stream = connector
+                    .connect_with(server_name, tcp_stream, |server_conn| {
+                        server_conn.set_buffer_limit(Some(32768));
+                    })
+                    .await?;
+                Ok(Box::new(tls_stream))
+            } else {
+                Ok(Box::new(tcp_stream))
+            }
         }
-    }
+        Location::Unix(ref path_buf) => {
+            let unix_stream = UnixStream::connect(path_buf.as_path()).await?;
+            debug!(
+                "Connected to unix domain socket: {} using local addr {:?}",
+                path_buf.as_path().display(),
+                unix_stream.local_addr().unwrap()
+            );
 
-    debug!(
-        "Connected to remote: {} using local addr {}",
-        addr,
-        target_stream.local_addr().unwrap()
-    );
-
-    if let Some(ref connector) = target_address.tls_connector {
-        let server_name = match rustls::ServerName::try_from(target_address.address.as_str()) {
-            Ok(s) => s,
-            Err(_) => get_dummy_server_name(),
-        };
-
-        let tls_stream = connector
-            .connect_with(server_name, target_stream, |server_conn| {
-                server_conn.set_buffer_limit(Some(32768));
-            })
-            .await?;
-        Ok(Box::new(tls_stream))
-    } else {
-        Ok(Box::new(target_stream))
+            if let Some(ref connector) = target_location.tls_connector {
+                // TODO: allow specifying or disabling SNI
+                let server_name = get_dummy_server_name();
+                let tls_stream = connector
+                    .connect_with(server_name, unix_stream, |server_conn| {
+                        server_conn.set_buffer_limit(Some(32768));
+                    })
+                    .await?;
+                Ok(Box::new(tls_stream))
+            } else {
+                Ok(Box::new(unix_stream))
+            }
+        }
     }
 }

@@ -5,6 +5,7 @@ mod async_stream;
 mod config;
 mod copy_bidirectional;
 mod iptables_util;
+mod location;
 mod rustls_util;
 mod tcp;
 mod tokio_util;
