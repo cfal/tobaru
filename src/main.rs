@@ -98,10 +98,17 @@ fn main() {
         );
     }
 
-    debug!("Runtime threads: {}", num_threads);
+    debug!("Worker threads: {}", num_threads);
 
-    let runtime = Builder::new_multi_thread()
-        .worker_threads(num_threads)
+    let mut builder = if num_threads == 1 {
+        Builder::new_current_thread()
+    } else {
+        let mut mt = Builder::new_multi_thread();
+        mt.worker_threads(num_threads);
+        mt
+    };
+
+    let runtime = builder
         .enable_io()
         .enable_time()
         .build()
