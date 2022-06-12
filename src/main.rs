@@ -5,7 +5,6 @@ mod async_stream;
 mod config;
 mod copy_bidirectional;
 mod iptables_util;
-mod location;
 mod rustls_util;
 mod tcp;
 mod tokio_util;
@@ -49,21 +48,21 @@ fn start_notify_thread(
 
 async fn run(server_config: ServerConfig) {
     let ServerConfig {
-        server_address,
+        address,
         use_iptables,
         target_configs,
     } = server_config;
 
     match target_configs {
-        TargetConfigs::Tcp(target_configs) => {
+        TargetConfigs::Tcp { targets } => {
             // TODO: restart or panic?
-            if let Err(e) = run_tcp_server(server_address, use_iptables, target_configs).await {
+            if let Err(e) = run_tcp_server(address, use_iptables, targets.into_vec()).await {
                 error!("TCP forwarder finished with error: {}", e);
             }
         }
-        TargetConfigs::Udp(target_configs) => {
+        TargetConfigs::Udp { targets } => {
             // TODO: restart or panic?
-            if let Err(e) = run_udp_server(server_address, use_iptables, target_configs).await {
+            if let Err(e) = run_udp_server(address, use_iptables, targets.into_vec()).await {
                 error!("UDP forwarder finished with error: {}", e);
             }
         }
@@ -116,12 +115,11 @@ fn main() {
 
     runtime.block_on(async move {
         let (_watcher, mut config_rx) = start_notify_thread(config_paths.clone());
-        let mut is_initial = true;
-
         loop {
             let server_configs: Vec<ServerConfig> =
-                config::load_configs(config_paths.clone(), config_urls.clone(), is_initial).await;
-            is_initial = false;
+                config::load_server_configs(config_paths.clone(), config_urls.clone())
+                    .await
+                    .unwrap();
 
             if server_configs.is_empty() {
                 error!("No server configs found.");
@@ -132,7 +130,7 @@ fn main() {
 
             for server_config in server_configs.iter() {
                 if server_config.use_iptables {
-                    iptables_util::clear_iptables(server_config.server_address).await;
+                    iptables_util::clear_iptables(server_config.address).await;
                 }
             }
 

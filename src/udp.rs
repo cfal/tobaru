@@ -6,15 +6,15 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use futures::join;
+use ip_network_table_deps_treebitmap::IpLookupTable;
 use log::{debug, error, warn};
 use parking_lot::Mutex;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, Duration};
-use treebitmap::IpLookupTable;
 
-use crate::config::{UdpTargetAddress, UdpTargetConfig};
+use crate::config::{IpMask, IpMaskSelection, NetLocation, UdpTargetConfig};
 use crate::iptables_util::{configure_iptables, Protocol};
 use crate::tokio_util::resolve_host;
 
@@ -26,7 +26,7 @@ const MIN_ASSOCIATION_TIMEOUT_SECS: u32 = 5;
 const DEFAULT_ASSOCIATION_TIMEOUT_SECS: u32 = 200;
 
 struct UdpTargetData {
-    addresses: Vec<UdpTargetAddress>,
+    addresses: Vec<NetLocation>,
     next_address_index: AtomicUsize,
     association_timeout_secs: u32,
 }
@@ -42,17 +42,21 @@ pub async fn run_udp_server(
     target_configs: Vec<UdpTargetConfig>,
 ) -> std::io::Result<()> {
     let mut lookup_table = IpLookupTable::new();
-    let associations: Arc<Mutex<HashMap<(SocketAddr, UdpTargetAddress), Association>>> =
+    let associations: Arc<Mutex<HashMap<(SocketAddr, NetLocation), Association>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
     let mut min_association_timeout_secs: u32 = 0;
 
     for target_config in target_configs {
+        let UdpTargetConfig {
+            addresses,
+            allowlist,
+            association_timeout_secs,
+        } = target_config;
+
         let association_timeout_secs = std::cmp::max(
             MIN_ASSOCIATION_TIMEOUT_SECS,
-            target_config
-                .association_timeout_secs
-                .unwrap_or(DEFAULT_ASSOCIATION_TIMEOUT_SECS),
+            association_timeout_secs.unwrap_or(DEFAULT_ASSOCIATION_TIMEOUT_SECS),
         );
         if min_association_timeout_secs == 0 {
             min_association_timeout_secs = association_timeout_secs;
@@ -62,12 +66,12 @@ pub async fn run_udp_server(
         }
 
         let target_data = Arc::new(UdpTargetData {
-            addresses: target_config.target_addresses,
+            addresses: addresses.into_vec(),
             next_address_index: AtomicUsize::new(0),
             association_timeout_secs,
         });
 
-        for (addr, masklen) in target_config.allowed_ips.into_iter() {
+        for IpMask(addr, masklen) in allowlist.into_iter().map(IpMaskSelection::unwrap_literal) {
             if lookup_table
                 .insert(addr, masklen, target_data.clone())
                 .is_some()
@@ -89,9 +93,9 @@ pub async fn run_udp_server(
     }
 
     if use_iptables {
-        let ip_masks: Vec<(std::net::Ipv6Addr, u32)> = lookup_table
+        let ip_masks: Vec<IpMask> = lookup_table
             .iter()
-            .map(|(addr, masklen, _)| (addr, masklen))
+            .map(|(addr, masklen, _)| IpMask(addr, masklen))
             .collect();
         configure_iptables(Protocol::Udp, server_address, &ip_masks).await;
     }
@@ -173,7 +177,7 @@ impl<T> Drop for TaskDropGuard<T> {
 }
 
 fn start_cleanup_task(
-    associations: Arc<Mutex<HashMap<(SocketAddr, UdpTargetAddress), Association>>>,
+    associations: Arc<Mutex<HashMap<(SocketAddr, NetLocation), Association>>>,
     min_association_timeout_secs: u32,
 ) -> JoinHandle<()> {
     let cleanup_interval = Duration::from_secs(min_association_timeout_secs as u64);
@@ -206,7 +210,7 @@ impl Association {
     fn new(
         client_address: SocketAddr,
         server_socket: Arc<UdpSocket>,
-        target_address: UdpTargetAddress,
+        target_address: NetLocation,
         timeout_secs: u32,
     ) -> Self {
         let last_active = Arc::new(AtomicU32::new(get_timestamp_secs()));
@@ -283,7 +287,7 @@ async fn run_forward_from_target_task(
 async fn run_forward_tasks(
     client_address: SocketAddr,
     server_socket: Arc<UdpSocket>,
-    target_address: UdpTargetAddress,
+    target_address: NetLocation,
     last_active: Arc<AtomicU32>,
     rx: Receiver<Box<[u8]>>,
 ) -> std::io::Result<()> {

@@ -7,18 +7,20 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use futures::join;
+use ip_network_table_deps_treebitmap::IpLookupTable;
 use log::{debug, error, warn};
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream, UnixStream};
 use tokio_rustls::LazyConfigAcceptor;
-use treebitmap::IpLookupTable;
 
 use crate::async_stream::AsyncStream;
-use crate::config::{ServerTlsConfig, TcpTargetConfig, TlsOption};
+use crate::config::{
+    ClientTlsConfig, IpMask, IpMaskSelection, Location, NetLocation, ServerTlsConfig,
+    TcpTargetConfig, TlsOption,
+};
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::iptables_util::{configure_iptables, Protocol};
-use crate::location::Location;
 use crate::rustls_util::{
     create_connector, create_server_config, get_dummy_server_name, load_certs, load_private_key,
 };
@@ -66,21 +68,32 @@ pub async fn run_tcp_server(
 
     for target_config in target_configs {
         let TcpTargetConfig {
-            allowed_ips,
-            target_locations,
-            server_tls_config,
+            allowlist,
+            locations,
+            server_tls,
             tcp_nodelay,
         } = target_config;
 
-        let location_data = target_locations
+        let allowlist = allowlist
             .into_iter()
-            .map(|target_location| TargetLocationData {
-                location: target_location.location,
-                tls_connector: if let Some(cfg) = target_location.client_tls_config {
-                    Some(create_connector(cfg.verify))
-                } else {
-                    None
-                },
+            .map(IpMaskSelection::unwrap_literal)
+            .collect::<Vec<_>>();
+
+        let location_data = locations
+            .into_iter()
+            .map(|target_location| {
+                let (location, client_tls) = target_location.into_components();
+                TargetLocationData {
+                    location: location,
+                    tls_connector: match client_tls {
+                        ClientTlsConfig::Enable(true) => Some(create_connector(true)),
+                        ClientTlsConfig::WithSettings {
+                            enable: true,
+                            verify,
+                        } => Some(create_connector(verify)),
+                        _ => None,
+                    },
+                }
             })
             .collect();
 
@@ -90,20 +103,20 @@ pub async fn run_tcp_server(
             tcp_nodelay,
         });
 
-        let is_non_tls_target = match server_tls_config {
+        let is_non_tls_target = match server_tls {
             Some(ServerTlsConfig {
                 sni_hostnames,
                 alpn_protocols,
-                cert_path,
-                key_path,
+                cert,
+                key,
                 optional,
             }) => {
-                let mut cert_file = File::open(&cert_path).await?;
+                let mut cert_file = File::open(&cert).await?;
                 let mut cert_bytes = vec![];
                 cert_file.read_to_end(&mut cert_bytes).await?;
                 let certs = load_certs(&cert_bytes);
 
-                let mut key_file = File::open(&key_path).await?;
+                let mut key_file = File::open(&key).await?;
                 let mut key_bytes = vec![];
                 key_file.read_to_end(&mut key_bytes).await?;
                 let private_key = load_private_key(&key_bytes);
@@ -112,7 +125,14 @@ pub async fn run_tcp_server(
                 let mut allow_any_alpn = false;
                 let mut alpn_protocol_hashes = HashSet::new();
                 let mut alpn_protocol_bytes = vec![];
-                for alpn_protocol in alpn_protocols {
+
+                let alpn_protocols = if alpn_protocols.is_empty() {
+                    vec![TlsOption::Any, TlsOption::None]
+                } else {
+                    alpn_protocols.into_vec()
+                };
+
+                for alpn_protocol in alpn_protocols.into_iter() {
                     match alpn_protocol {
                         TlsOption::None => {
                             allow_no_alpn = true;
@@ -144,7 +164,7 @@ pub async fn run_tcp_server(
                 };
 
                 let mut config_lookup_table = IpLookupTable::new();
-                for (addr, masklen) in allowed_ips.iter() {
+                for IpMask(addr, masklen) in allowlist.iter() {
                     // addresses can be the same across different TLS configs
                     let _ = tls_lookup_table.insert(addr.clone(), *masklen, true);
 
@@ -170,7 +190,13 @@ pub async fn run_tcp_server(
                     target_data: target_data.clone(),
                 });
 
-                for sni_hostname in sni_hostnames {
+                let sni_hostnames = if sni_hostnames.is_empty() {
+                    vec![TlsOption::Any, TlsOption::None]
+                } else {
+                    sni_hostnames.into_vec()
+                };
+
+                for sni_hostname in sni_hostnames.into_iter() {
                     match sni_lookup_map.entry(sni_hostname) {
                         Entry::Occupied(mut o) => {
                             o.get_mut().push(tls_target_data.clone());
@@ -187,7 +213,7 @@ pub async fn run_tcp_server(
         };
 
         if is_non_tls_target {
-            for (addr, masklen) in allowed_ips.iter() {
+            for IpMask(addr, masklen) in allowlist.iter() {
                 if non_tls_lookup_table
                     .insert(addr.clone(), *masklen, target_data.clone())
                     .is_some()
@@ -200,13 +226,14 @@ pub async fn run_tcp_server(
             }
         }
 
-        iptable_masks.extend(allowed_ips);
+        iptable_masks.extend(allowlist.into_iter());
     }
 
     if use_iptables {
         configure_iptables(Protocol::Tcp, server_address.clone(), &iptable_masks).await;
     }
 
+    // TODO: check that there is only a single item under TlsOption::None and TlsOption::Any
     let sni_lookup_map = Arc::new(sni_lookup_map);
 
     let listener = TcpListener::bind(server_address).await.unwrap();
@@ -491,7 +518,7 @@ async fn setup_target_stream(
     tcp_nodelay: bool,
 ) -> std::io::Result<Box<dyn AsyncStream>> {
     match target_location.location {
-        Location::Net((ref address, port)) => {
+        Location::Address(NetLocation { ref address, port }) => {
             let target_addr = resolve_host((address.as_str(), port)).await?;
             let tcp_stream = TcpStream::connect(target_addr).await?;
             if tcp_nodelay {
@@ -521,7 +548,7 @@ async fn setup_target_stream(
                 Ok(Box::new(tcp_stream))
             }
         }
-        Location::Unix(ref path_buf) => {
+        Location::Path(ref path_buf) => {
             let unix_stream = UnixStream::connect(path_buf.as_path()).await?;
             debug!(
                 "Connected to unix domain socket: {} using local addr {:?}",

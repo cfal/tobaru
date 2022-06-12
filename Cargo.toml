@@ -15,15 +15,16 @@ async-trait = "*"
 env_logger = "*"
 futures = "*"
 ipnet = "*"
-json = "*"
 log = "*"
 parking_lot = "*"
 percent-encoding = "*"
 rustls = { version = "*", features = ["dangerous_configuration"] }
 rustls-pemfile = { version = "*" }
+serde = { version = "*", features = ["derive", "std"] }
+serde_yaml = "*"
 tokio = { version = "*", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
 tokio-rustls = { version = "*", features = ["dangerous_configuration"] }
-treebitmap = "*"
+ip_network_table-deps-treebitmap = "*"
 url = "*"
 webpki-roots = { version = "*" }
 notify = ">=5.0.0-pre.13"

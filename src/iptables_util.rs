@@ -1,7 +1,10 @@
 use log::{debug, error};
 use std::net::{Ipv6Addr, SocketAddr};
 use std::process::Output;
+
 use tokio::process::Command;
+
+use crate::config::IpMask;
 
 const IPTABLES_PATH: &str = "/usr/sbin/iptables";
 const IP6TABLES_PATH: &str = "/usr/sbin/ip6tables";
@@ -61,15 +64,11 @@ fn format_ipv6(addr: &Ipv6Addr) -> String {
         .join(":")
 }
 
-pub async fn configure_iptables(
-    protocol: Protocol,
-    socket_addr: SocketAddr,
-    ip_masks: &[(Ipv6Addr, u32)],
-) {
+pub async fn configure_iptables(protocol: Protocol, socket_addr: SocketAddr, ip_masks: &[IpMask]) {
     let comment = create_comment(&socket_addr);
     let port_str = socket_addr.port().to_string();
 
-    for (addr, masklen) in ip_masks {
+    for IpMask(addr, masklen) in ip_masks {
         run(
             IP6TABLES_PATH,
             &[
