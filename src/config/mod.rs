@@ -78,7 +78,7 @@ impl IpMaskSelection {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
     pub address: SocketAddr,
-    #[serde(default)]
+    #[serde(default, alias = "iptables")]
     pub use_iptables: bool,
     #[serde(flatten)]
     pub target_configs: TargetConfigs,
