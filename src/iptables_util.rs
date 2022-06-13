@@ -142,8 +142,16 @@ pub async fn configure_iptables(protocol: Protocol, socket_addr: SocketAddr, ip_
     }
 }
 
-pub async fn clear_iptables(socket_addr: SocketAddr) {
+pub async fn clear_matching_iptables(socket_addr: SocketAddr) {
     let comment = create_comment(&socket_addr);
+    clear_iptables(&comment).await
+}
+
+pub async fn clear_all_iptables() {
+    clear_iptables("tobaru-rs").await
+}
+
+async fn clear_iptables(comment: &str) {
     for program in &[IPTABLES_PATH, IP6TABLES_PATH] {
         // Iterate through line backwards so that rule numbers don't change as we remove them.
         for line in run(

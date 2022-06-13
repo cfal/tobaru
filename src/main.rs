@@ -74,11 +74,14 @@ fn main() {
 
     let mut config_paths = vec![];
     let mut config_urls = vec![];
-    let mut clear_iptables_only = false;
+    let mut clear_iptables_matching = false;
+    let mut clear_iptables_all = false;
     let mut num_threads = 0usize;
     for arg in std::env::args().skip(1) {
-        if arg == "--clear-iptables" {
-            clear_iptables_only = true;
+        if arg == "--clear-iptables-all" {
+            clear_iptables_all = true;
+        } else if arg == "--clear-iptables-matching" {
+            clear_iptables_matching = true;
         } else if arg.starts_with("-t") {
             num_threads = arg[2..].parse::<usize>().expect("Invalid thread count");
         } else if arg.find("://").is_some() {
@@ -114,6 +117,12 @@ fn main() {
         .expect("Could not build tokio runtime");
 
     runtime.block_on(async move {
+        if clear_iptables_all {
+            iptables_util::clear_all_iptables().await;
+            println!("iptables cleared of all tobaru rules, exiting.");
+            return;
+        }
+
         let (_watcher, mut config_rx) = start_notify_thread(config_paths.clone());
         loop {
             let server_configs: Vec<ServerConfig> =
@@ -129,13 +138,13 @@ fn main() {
             debug!("Loaded server configs: {:#?}", &server_configs);
 
             for server_config in server_configs.iter() {
-                if server_config.use_iptables {
-                    iptables_util::clear_iptables(server_config.address).await;
+                if server_config.use_iptables || clear_iptables_matching {
+                    iptables_util::clear_matching_iptables(server_config.address).await;
                 }
             }
 
-            if clear_iptables_only {
-                info!("iptables cleared, exiting.");
+            if clear_iptables_matching {
+                println!("iptables cleared of matching server rules, exiting.");
                 return;
             }
 
