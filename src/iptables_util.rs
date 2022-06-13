@@ -105,7 +105,7 @@ pub async fn configure_iptables(protocol: Protocol, socket_addr: SocketAddr, ip_
                     "--dport",
                     &port_str,
                     "-s",
-                    &format!("{}/{}", addr_v4, masklen - 96),
+                    &format!("{}/{}", addr_v4, masklen.saturating_sub(96)),
                     "-j",
                     "ACCEPT",
                     "-m",
