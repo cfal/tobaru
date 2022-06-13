@@ -204,6 +204,12 @@ pub async fn load_server_configs(
                     group,
                     mut ip_masks,
                 } => {
+                    if IpMask::try_from(group.as_str()).is_ok() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!("invalid IP group name, looks like an IP mask: {}", group),
+                        ));
+                    }
                     IpMaskSelection::replace_groups(&mut ip_masks, &groups)?;
                     let ip_masks = ip_masks
                         .into_iter()
