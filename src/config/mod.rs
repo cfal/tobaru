@@ -174,7 +174,7 @@ impl Default for ClientTlsConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct UdpTargetConfig {
-    #[serde(alias = "address")]
+    #[serde(alias = "address", alias = "locations", alias = "location")]
     pub addresses: OneOrSome<NetLocation>,
     pub allowlist: OneOrSome<IpMaskSelection>,
     pub association_timeout_secs: Option<u32>,
