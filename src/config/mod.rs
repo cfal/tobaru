@@ -77,11 +77,37 @@ impl IpMaskSelection {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
+    #[serde(deserialize_with = "deserialize_socket_addr")]
     pub address: SocketAddr,
     #[serde(default, alias = "iptables")]
     pub use_iptables: bool,
     #[serde(flatten)]
     pub target_configs: TargetConfigs,
+}
+
+// serde can't seem to deserialize IPv6 addresses directly.
+// see https://github.com/serde-rs/serde/issues/2227
+fn deserialize_socket_addr<'de, D>(deserializer: D) -> Result<SocketAddr, D::Error>
+where
+    D: serde::de::Deserializer<'de>,
+{
+    use std::net::ToSocketAddrs;
+    let value = String::deserialize(deserializer)?;
+    let mut iter = value.to_socket_addrs().map_err(|e| {
+        serde::de::Error::invalid_value(
+            serde::de::Unexpected::Other("invalid socket address"),
+            &"invalid socket address",
+        )
+    })?;
+
+    let socket_addr = iter.next().ok_or_else(|| {
+        serde::de::Error::invalid_value(
+            serde::de::Unexpected::Other("unable to resolve socket address"),
+            &"unable to resolve socket address",
+        )
+    })?;
+
+    Ok(socket_addr)
 }
 
 #[derive(Debug, Clone, Deserialize)]
