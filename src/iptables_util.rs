@@ -68,55 +68,60 @@ pub async fn configure_iptables(protocol: Protocol, socket_addr: SocketAddr, ip_
     let comment = create_comment(&socket_addr);
     let port_str = socket_addr.port().to_string();
 
+    let mut ipv6_masks = vec![];
+    let mut ipv4_masks = vec![];
     for IpMask(addr, masklen) in ip_masks {
-        run(
-            IP6TABLES_PATH,
-            &[
-                "--wait",
-                "5",
-                "-A",
-                "INPUT",
-                "--protocol",
-                protocol.as_str(),
-                "--dport",
-                &port_str,
-                "-s",
-                &format!("{}/{}", format_ipv6(addr), masklen),
-                "-j",
-                "ACCEPT",
-                "-m",
-                "comment",
-                "--comment",
-                &comment,
-            ],
-        )
-        .await;
-
+        ipv6_masks.push(format!("{}/{}", format_ipv6(addr), masklen));
         if let Some(addr_v4) = addr.to_ipv4() {
-            run(
-                IPTABLES_PATH,
-                &[
-                    "--wait",
-                    "5",
-                    "-A",
-                    "INPUT",
-                    "--protocol",
-                    protocol.as_str(),
-                    "--dport",
-                    &port_str,
-                    "-s",
-                    &format!("{}/{}", addr_v4, masklen.saturating_sub(96)),
-                    "-j",
-                    "ACCEPT",
-                    "-m",
-                    "comment",
-                    "--comment",
-                    &comment,
-                ],
-            )
-            .await;
+            ipv4_masks.push(format!("{}/{}", addr_v4, masklen.saturating_sub(96)));
         }
     }
+
+    run(
+        IP6TABLES_PATH,
+        &[
+            "--wait",
+            "10",
+            "-A",
+            "INPUT",
+            "--protocol",
+            protocol.as_str(),
+            "--dport",
+            &port_str,
+            "-s",
+            &ipv6_masks.join(","),
+            "-j",
+            "ACCEPT",
+            "-m",
+            "comment",
+            "--comment",
+            &comment,
+        ],
+    )
+    .await;
+
+    run(
+        IPTABLES_PATH,
+        &[
+            "--wait",
+            "10",
+            "-A",
+            "INPUT",
+            "--protocol",
+            protocol.as_str(),
+            "--dport",
+            &port_str,
+            "-s",
+            &ipv4_masks.join(","),
+            "-j",
+            "ACCEPT",
+            "-m",
+            "comment",
+            "--comment",
+            &comment,
+        ],
+    )
+    .await;
 
     for program in &[IPTABLES_PATH, IP6TABLES_PATH] {
         run(
