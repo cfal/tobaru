@@ -62,7 +62,8 @@ where
     IO: AsyncStream,
 {
     async fn try_shutdown(&mut self) -> std::io::Result<()> {
-        self.shutdown().await
+        let _ = self.shutdown().await;
+        self.get_mut().0.try_shutdown().await
     }
 }
 
@@ -72,6 +73,7 @@ where
     IO: AsyncStream,
 {
     async fn try_shutdown(&mut self) -> std::io::Result<()> {
-        self.shutdown().await
+        let _ = self.shutdown().await;
+        self.get_mut().0.try_shutdown().await
     }
 }
