@@ -55,7 +55,7 @@ impl CopyBuffer {
             let mut write_pending = false;
 
             // If our buffer has some space, let's read up!
-            if !self.read_done && self.cache_length < self.size {
+            while !self.read_done && self.cache_length < self.size {
                 let unused_start_index = (self.start_index + self.cache_length) % self.size;
                 let unused_end_index_exclusive = if unused_start_index < self.start_index {
                     self.start_index
@@ -80,6 +80,7 @@ impl CopyBuffer {
                         // Try flushing when the reader has no progress to avoid deadlock
                         // when the reader depends on buffered writer.
                         read_pending = true;
+                        break;
                     }
                 }
             }
@@ -130,7 +131,6 @@ impl CopyBuffer {
             // If we've written all the data and we've seen EOF, flush out the
             // data and finish the transfer.
             if self.read_done && self.cache_length == 0 {
-                ready!(writer.as_mut().poll_flush(cx))?;
                 return Poll::Ready(Ok(()));
             }
 
