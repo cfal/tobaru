@@ -26,6 +26,7 @@ pub enum Config {
     ServerConfig(ServerConfig),
     IpMaskGroup {
         group: String,
+        #[serde(alias = "ip_mask")]
         ip_masks: OneOrSome<IpMaskSelection>,
     },
 }
