@@ -13,95 +13,183 @@ Port forwarding tool written in Rust with advanced features, such as:
 
 Here's a quick example:
 
-```js
-{
-  "bindAddress": "0.0.0.0:443",
-  "protocol": "tcp",
-  "targets": [
-    // target 1: non-TLS clients from any IP will be forwarded here.
-    {
-      "address": "127.0.0.1:2999",
-      "allowlist": [ "0.0.0.0/0" ]
-    },
-    // target 2: TLS clients from any IP asking for SNI example.com and ALPN protocol
-    // http/1.1 will be forwarded here.
-    {
-      "address": "127.0.0.1:3000",
-      "serverTls": {
-        "cert": "cert.pem",
-        "key": "cert.pem",
-        "sni_hostnames": [ "example.com" ],
-        "alpn_protocols": [ "http/1.1" ]
-      },
-      "allowlist": [ "0.0.0.0/0" ]
-    },
-    // target 3: TLS clients from ip 1.2.3.4 asking for SNI example.com and any other
-    // ALPN protocol, or no ALPN negotiation, will be forwarded here.
-    {
-      "address": "127.0.0.1:3001",
-      "serverTls": {
-        "cert": "cert.pem",
-        "key": "cert.pem",
-        "sni_hostnames": [ "example.com" ],
-        // allow any alpn protocol, or to skip ALPN negotiation.
-        "alpn_protocols": [ "any", "none" ]
-      },
-      "allowlist": [ "1.2.3.4" ]
-    },
-    // target 4: TLS clients from ip 1.2.3.4 asking for SNI test.com will be forwarded here.
-    {
-      "address": "127.0.0.1:3002",
-      "serverTls": {
-        "cert": "cert.pem",
-        "key": "cert.pem",
-        "sni_hostnames": [ "test.com" ],
-        "alpn_protocols": [ "any", "none" ]
-      },
-      "allowlist": [ "5.6.7.8" ]
-    }
-  ]
-}
+```yaml
+- address: 0.0.0.0:443
+  transport: tcp
+  targets:
+
+    # target 1: non-TLS clients from any IP will be forwarded to 127.0.0.1:2999.
+    - location: 127.0.0.1:2999
+      allowlist: 0.0.0.0/0
+
+    # target 2: TLS clients from specified IP masks asking for SNI example.com and
+    # ALPN protocol http/1.1 will be forwarded to a listening UNIX domain socket.
+    - location: /run/service.sock
+      server_tls:
+        cert: cert.pem
+        key: key.pem
+        sni_hostnames: example.com
+        alpn_protocols: http/1.1
+      allowlist:
+        - 1.2.3.4
+        - 2.3.0.0/16
+
+    # target 3: TLS clients from ip 1.2.3.4 asking for SNI example.com or test.com,
+    # and any other ALPN protocol, or no ALPN negotiation, will be forwarded here.
+    - location: 127.0.0.1:3001
+      server_tls:
+        cert: cert.pem
+        key: key.pem
+        sni_hostnames:
+          - example.com
+          - test.com
+        alpn_protocols:
+          - any
+          - none
+      allowlist: 1.2.3.4
 ```
 
 ## Usage
 
-`tobaru <config URL or file> [config URL or file..]`
+```
+USAGE:
 
-## Simple configuration
+    tobaru [OPTIONS] <CONFIG PATH or CONFIG URL> [CONFIG PATH or CONFIG URL] [..]
 
-Simple configuration can be done by passing in URLs on the command line. The format is as follows:
+OPTIONS:
+
+    -t, --threads NUM
+        Number of worker threads, defaults to an estimated amount of parallelism.
+
+    --clear-iptables-all
+        Clear all tobaru-created rules from iptables and exit immediately.
+
+    --clear-iptables-matching
+        Clear tobaru-created rules for the addresses specified in the specified
+        config files and exit immediately.
+
+    -h, --help
+        Show this help screen.
+
+IPTABLES PERMISSIONS:
+
+    To run iptable commands, this binary needs to have CAP_NET_RAW and CAP_NET_ADMIN
+    permissions, or else be invoked by root.
+
+EXAMPLES:
+
+    tobaru -t 1 config1.yaml config2.yaml
+
+        Run listeners from configs in config1.yaml and config2.yaml on a single thread.
+
+    tobaru tcp://127.0.0.1:1000?target=127.0.0.1:2000
+
+        Run a tcp listener on 127.0.0.1 port 1000, forwarding to 127.0.0.1 port 2000.
+
+    sudo tobaru --clear-iptables-matching config1.yaml
+
+        Clear iptable configs only for the config addresses in config1.yaml.
+```
+
+## URL-based configuration
+
+Simple TCP forwarding can be done using the config URL format:
 
 ```
-<protocol>://<bind ip>:<bind port>?to=<target ip>:<target port>&key=value&key2=value2&...
+tcp://<bind ip>:<bind port>?target=<target ip>:<target port>
 ```
 
-- **protocol**: one of `tcp` or `udp`.
-- **bind ip** and **bind port**: ip of the interface and port to listen on
+TCP forwarding to a UNIX domain socket can be done with the `target-path` key:
 
-Supported query keys:
 
-- **to, target**: address to forward to.
-- **allowlist**: list of comma separated netmasks to allow. if this is omitted, all source addresses are allowed.
-- **tcp_nodelay**: enables tcp_nodelay.
+```
+tcp://<bind ip>:<bind port>?target-path=<unix domain socket path>
+```
 
-## Advanced Configuration
+## File-based configuration
 
-Advanced configuration is done using JSON files. One difference from JSON is that configuration files can contain comment lines that begin with `//`.
+Configuration files are in the YAML file format. tobaru expects to read an array of objects, where each object is a listener configuration, or an IP mask group.
+
+### Listener object configuration
+
+`address`: The address to listen on.
+
+`transport`: The transport protocol, a string of either `tcp` or `udp`.
+
+`use_iptables` (_optional_, default: `false`): Whether to enable iptables support.
+  - IP masks in allowlists specified in the targets would be added to iptables, and unspecified IP masks would be denied.
+
+`targets` (or `target`): An target location object or an array of target location objects that specify where to forward to.
+
+`tcp_nodelay` (_optional_, default: `true`): Specifies whether to disable Nagle's algorithm on the accepted socket.
+  - Only accepted when `transport` is `tcp`.
+
+#### Target object configuration (TCP transport)
+
+`locations` (or `location`): A single TCP location, or an array of TCP locations.
+
+  - When an array of multiple locations is provided, connections will be forwarded in a round-robin fashion.
+
+`allowlist`: A single IP mask or IP group name, or an array of IP mask or IP group names.
+
+`tcp_nodelay` (_optional_, default: `true`): Specifies whether to disable Nagle's algorithm on the target connected socket.
+
+`server_tls` (_optional_, default: `null`): A server TLS object. When non-null, only TLS connections will be accepted for this target. The object keys are:
+  - `cert`: A file path to the TLS certificate.
+  - `key`: A file path to the TLS private key.
+  - `optional` (_optional_, default: `false`): Specifies whether TLS is optional. When true, this means that non-TLS streams will also be accepted and forwarded.
+  - `sni_hostnames` (_optional_, default: `any, none`): A SNI hostname, or an array of SNI hostnames, with special keywords:
+    - `any`: Accept any provided SNI hostname.
+    - `none`: Accept handshakes without SNI negotiation.
+  - `alpn_protocols` (_optional_: default: `any, none`): An accepted ALPN protocol, or an array of supported ALPN protocols, with special keywords:
+    - `any`: Accept any provided ALPN protocol.
+    - `none`: Accept handshakes without ALPN protocol selection.
+
+#### TCP location configuration
+
+A TCP location can be specified as:
+
+- an address string. eg. `127.0.0.1:1234`
+- a UNIX domain socket path. eg. `/path/to/something.sock`
+- an object with the following keys:
+
+  `address`: an address string.
+    - only one of `address` or `path` can be specified.
+
+  `path`: a UNIX domain socket path.
+    - only one of `address` or `path` can be specified.
+
+  `client_tls` (_optional_, default: `false`): Specifies whether to handle TLS when connecting to this location. The supported values are:
+    - `true`: Enables client TLS handling, with certificate verification.
+    - `no-verify`: Enables client TLS handling, without certificate verification.
+    - `false`: Disables client TLS handling.
+
+#### Target object configuration (UDP transport)
+
+`addresses` (or `address`): A single address string, or an array of `host:port` address strings
+
+`allowlist`: A single IP mask or IP group name, or an array of IP mask or IP group names.
+
+`association_timeout_secs` (_optional_, default: `200`): Number of seconds before an inactive UDP association times out.
+
+### IP group object configuration
+
+`group`: Name of the IP group
+
+`ip_masks` (or `ip_mask`): A single IP mask or IP group name, or an array of IP mask or IP group names.
+
+A default IP group with name `all` and IP mask `0.0.0.0/0` is automatically added.
 
 ## Examples
 
-### Simple forwarding (command line)
+### TCP to TCP forwarding, all IPs allowed
 
-```bash
-tobaru 'udp://0.0.0.0:5353?to=192.168.8.1:8053'
-```
+```yaml
+- address: 0.0.0.0:8080
+  transport: tcp
+  target:
+    location: 192.168.8.1:80
 
-Listens for udp traffic on port 5353 of all interfaces, and forwards to 192.168.8.1 port 8053. All source addresses are allowed.
-
-
-### Simple forwarding (config file)
-
-```js
 {
   // Listen on all interfaces, on port 8080.
   "bindAddress": "0.0.0.0:8080",
