@@ -248,6 +248,10 @@ pub async fn load_server_configs(
     config_urls: Vec<String>,
 ) -> std::io::Result<Vec<ServerConfig>> {
     let mut groups: HashMap<String, Vec<IpMask>> = HashMap::new();
+
+    // add the default 'all' ip group.
+    groups.insert(String::from("all"), vec![IpMask::all()]);
+
     let mut server_configs = vec![];
 
     for config_path in config_paths {
