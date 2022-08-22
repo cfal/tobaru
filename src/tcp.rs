@@ -86,12 +86,9 @@ pub async fn run_tcp_server(
                 TargetLocationData {
                     location: location,
                     tls_connector: match client_tls {
-                        ClientTlsConfig::Enable(true) => Some(create_connector(true)),
-                        ClientTlsConfig::WithSettings {
-                            enable: true,
-                            verify,
-                        } => Some(create_connector(verify)),
-                        _ => None,
+                        ClientTlsConfig::Enabled => Some(create_connector(true)),
+                        ClientTlsConfig::EnabledWithoutVerify => Some(create_connector(false)),
+                        ClientTlsConfig::Disabled => None,
                     },
                 }
             })

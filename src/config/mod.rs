@@ -181,20 +181,57 @@ pub struct ServerTlsConfig {
     pub optional: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone)]
 pub enum ClientTlsConfig {
-    Enable(bool),
-    WithSettings {
-        #[serde(default = "default_true")]
-        enable: bool,
-        verify: bool,
-    },
+    Enabled,
+    EnabledWithoutVerify,
+    Disabled,
+}
+
+impl<'de> Deserialize<'de> for ClientTlsConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::de::Deserializer<'de>,
+    {
+        struct ClientTlsConfigVisitor;
+        impl<'de> serde::de::Visitor<'de> for ClientTlsConfigVisitor {
+            type Value = ClientTlsConfig;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a boolean or the string 'no-verify'")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if value != "no-verify" {
+                    return Err(serde::de::Error::invalid_value(
+                        serde::de::Unexpected::Other("invalid client tls string value"),
+                        &"invalid client tls string value, only supported string value is no-verify",
+                    ));
+                }
+                Ok(ClientTlsConfig::EnabledWithoutVerify)
+            }
+
+            fn visit_bool<E>(self, v: bool) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                match v {
+                    true => Ok(ClientTlsConfig::Enabled),
+                    false => Ok(ClientTlsConfig::Disabled),
+                }
+            }
+        }
+
+        deserializer.deserialize_any(ClientTlsConfigVisitor)
+    }
 }
 
 impl Default for ClientTlsConfig {
     fn default() -> Self {
-        ClientTlsConfig::Enable(false)
+        ClientTlsConfig::Disabled
     }
 }
 
