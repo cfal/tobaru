@@ -133,7 +133,7 @@ fn main() {
     let mut config_urls = vec![];
     let mut clear_iptables_matching = false;
     let mut clear_iptables_all = false;
-    let mut num_threads = 0usize;
+    let mut num_threads: Option<usize> = None;
 
     let mut args = std::env::args();
     let command = args.next().unwrap();
@@ -144,17 +144,29 @@ fn main() {
         } else if arg == "--clear-iptables-matching" {
             clear_iptables_matching = true;
         } else if arg == "--threads" || arg == "-t" {
-            num_threads = match args.next() {
-                Some(n) => match n.parse::<usize>() {
-                    Ok(t) => t,
-                    Err(e) => {
-                        print_help(&command, Some("Invalid thread count"));
-                    }
-                },
+            if num_threads.is_some() {
+                print_help(&command, Some("Thread count was already specified"))
+            }
+
+            let num_threads_str = match args.next() {
+                Some(s) => s,
                 None => {
                     print_help(&command, Some("Missing thread count"));
                 }
+            };
+
+            let t = match num_threads_str.parse::<usize>() {
+                Ok(t) => t,
+                Err(e) => {
+                    print_help(&command, Some("Invalid thread count"));
+                }
+            };
+
+            if t == 0 {
+                print_help(&command, Some("Cannot specify zero thread count"));
             }
+
+            num_threads = Some(t);
         } else if arg.find("://").is_some() {
             config_urls.push(arg);
         } else if arg == "--help" || arg == "-h" {
@@ -170,14 +182,11 @@ fn main() {
         print_help(&command, Some("No config URLs or config paths specified"));
     }
 
-    if num_threads == 0 {
-        num_threads = std::cmp::max(
-            2,
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1),
-        );
-    }
+    let num_threads = num_threads.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(2)
+    });
 
     debug!("Worker threads: {}", num_threads);
 
