@@ -57,6 +57,7 @@ fn hash_alpn<T: Hash>(x: T) -> u64 {
 pub async fn run_tcp_server(
     server_address: SocketAddr,
     use_iptables: bool,
+    tcp_nodelay: bool,
     target_configs: Vec<TcpTargetConfig>,
 ) -> std::io::Result<()> {
     let mut non_tls_lookup_table: IpLookupTable<Ipv6Addr, Arc<TargetData>> = IpLookupTable::new();
@@ -258,6 +259,12 @@ pub async fn run_tcp_server(
         if non_tls_data.is_none() && !has_tls_data {
             warn!("Unknown address, not allowing: {}", addr.ip());
             continue;
+        }
+
+        if tcp_nodelay {
+            if let Err(e) = stream.set_nodelay(true) {
+                error!("Failed to set tcp_nodelay on server stream: {}", e);
+            }
         }
 
         if has_tls_data {
@@ -520,7 +527,7 @@ async fn setup_target_stream(
             let tcp_stream = TcpStream::connect(target_addr).await?;
             if tcp_nodelay {
                 if let Err(e) = tcp_stream.set_nodelay(true) {
-                    error!("Failed to set tcp_nodelay: {}", e);
+                    error!("Failed to set tcp_nodelay on target stream: {}", e);
                 }
             }
             debug!(

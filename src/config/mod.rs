@@ -114,6 +114,8 @@ where
 #[serde(tag = "transport", rename_all = "lowercase")]
 pub enum TargetConfigs {
     Tcp {
+        #[serde(default = "default_true")]
+        tcp_nodelay: bool,
         #[serde(alias = "target")]
         targets: OneOrSome<TcpTargetConfig>,
     },
@@ -295,7 +297,9 @@ pub async fn load_server_configs(
 
     for server_config in server_configs.iter_mut() {
         match server_config.target_configs {
-            TargetConfigs::Tcp { ref mut targets } => {
+            TargetConfigs::Tcp {
+                ref mut targets, ..
+            } => {
                 for target in targets.iter_mut() {
                     IpMaskSelection::replace_groups(&mut target.allowlist, &groups)?;
                 }
@@ -402,6 +406,7 @@ pub async fn load_url(config_url: &str) -> std::io::Result<ServerConfig> {
         address,
         use_iptables: false,
         target_configs: TargetConfigs::Tcp {
+            tcp_nodelay: true,
             targets: OneOrSome::One(tcp_target_config),
         },
     })

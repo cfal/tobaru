@@ -54,9 +54,14 @@ async fn run(server_config: ServerConfig) {
     } = server_config;
 
     match target_configs {
-        TargetConfigs::Tcp { targets } => {
+        TargetConfigs::Tcp {
+            tcp_nodelay,
+            targets,
+        } => {
             // TODO: restart or panic?
-            if let Err(e) = run_tcp_server(address, use_iptables, targets.into_vec()).await {
+            if let Err(e) =
+                run_tcp_server(address, use_iptables, tcp_nodelay, targets.into_vec()).await
+            {
                 error!("TCP forwarder finished with error: {}", e);
             }
         }
