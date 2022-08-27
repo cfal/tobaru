@@ -42,7 +42,7 @@ pub async fn run_udp_server(
     target_configs: Vec<UdpTargetConfig>,
 ) -> std::io::Result<()> {
     let mut lookup_table = IpLookupTable::new();
-    let associations: Arc<Mutex<HashMap<(SocketAddr, NetLocation), Association>>> =
+    let associations: Arc<Mutex<HashMap<SocketAddr, Association>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
     let mut min_association_timeout_secs: u32 = 0;
@@ -126,7 +126,7 @@ pub async fn run_udp_server(
         };
 
         let target_data = match lookup_table.longest_match(ip) {
-            Some((_, _, d)) => d.clone(),
+            Some((_, _, d)) => d,
             None => {
                 // Not allowed.
                 warn!("Unknown address, ignoring: {}", addr.ip());
@@ -136,21 +136,18 @@ pub async fn run_udp_server(
 
         let copied_msg = buf[0..len].to_vec().into_boxed_slice();
 
-        let target_address = if target_data.addresses.len() > 1 {
-            // fetch_add wraps around on overflow.
-            let index = target_data
-                .next_address_index
-                .fetch_add(1, Ordering::Relaxed);
-            &target_data.addresses[index % target_data.addresses.len()]
-        } else {
-            &target_data.addresses[0]
-        };
-
-        // Use `addr` here for the key, we only need `ip` for the lookup.
-        let key = (addr, target_address.clone());
-        let send_result = match associations.lock().entry(key) {
+        let send_result = match associations.lock().entry(addr) {
             Entry::Occupied(o) => o.get().try_send(copied_msg),
             Entry::Vacant(v) => {
+                let target_address = if target_data.addresses.len() > 1 {
+                    // fetch_add wraps around on overflow.
+                    let index = target_data
+                        .next_address_index
+                        .fetch_add(1, Ordering::Relaxed);
+                    &target_data.addresses[index % target_data.addresses.len()]
+                } else {
+                    &target_data.addresses[0]
+                };
                 debug!("Creating new association: {} -> {}", &addr, &target_address);
                 let new_assoc = Association::new(
                     addr,
@@ -177,7 +174,7 @@ impl<T> Drop for TaskDropGuard<T> {
 }
 
 fn start_cleanup_task(
-    associations: Arc<Mutex<HashMap<(SocketAddr, NetLocation), Association>>>,
+    associations: Arc<Mutex<HashMap<SocketAddr, Association>>>,
     min_association_timeout_secs: u32,
 ) -> JoinHandle<()> {
     let cleanup_interval = Duration::from_secs(min_association_timeout_secs as u64);
