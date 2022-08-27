@@ -12,6 +12,7 @@ use log::{debug, error, warn};
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream, UnixStream};
+use tokio::time::{sleep, timeout, Duration};
 use tokio_rustls::LazyConfigAcceptor;
 
 use crate::async_stream::AsyncStream;
@@ -269,8 +270,6 @@ pub async fn run_tcp_server(
 
         if has_tls_data {
             let cloned_sni_map = sni_lookup_map.clone();
-            // TODO: determine if it's a TLS connection, and act accordingly.
-            // if non_tls_data is None, then it's definitely a TLS connection.
             tokio::spawn(async move {
                 if let Err(e) =
                     process_tls_stream(stream, &addr, ip, non_tls_data, cloned_sni_map).await
@@ -302,12 +301,48 @@ async fn process_tls_stream(
     sni_lookup_map: Arc<HashMap<TlsOption, Vec<Arc<TlsTargetData>>>>,
 ) -> std::io::Result<()> {
     if non_tls_data.is_some() {
-        let is_tls_client_hello = peek_tls_client_hello(&stream).await?;
-        if !is_tls_client_hello {
-            return process_generic_stream(Box::new(stream), addr, non_tls_data.unwrap()).await;
+        let peek_client_hello_timeout =
+            timeout(Duration::from_secs(5), peek_tls_client_hello(&stream));
+        match peek_client_hello_timeout.await {
+            Ok(peek_result) => {
+                let is_tls_client_hello = peek_result?;
+                if !is_tls_client_hello {
+                    return process_generic_stream(Box::new(stream), addr, non_tls_data.unwrap())
+                        .await;
+                }
+            }
+            Err(elapsed) => {
+                warn!("TLS client hello read timed out, assuming non-TLS connection.");
+                return process_generic_stream(Box::new(stream), addr, non_tls_data.unwrap()).await;
+            }
         }
     }
 
+    let tls_handshake_timeout = timeout(
+        Duration::from_secs(5),
+        handle_tls_handshake(stream, addr, ip, non_tls_data, sni_lookup_map),
+    );
+
+    let (tls_stream, target_data) = match tls_handshake_timeout.await {
+        Ok(handshake_result) => handshake_result?,
+        Err(elapsed) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("tls handshake timed out: {}", elapsed),
+            ));
+        }
+    };
+
+    process_generic_stream(tls_stream, addr, target_data).await
+}
+
+async fn handle_tls_handshake(
+    stream: TcpStream,
+    addr: &std::net::SocketAddr,
+    ip: Ipv6Addr,
+    non_tls_data: Option<Arc<TargetData>>,
+    sni_lookup_map: Arc<HashMap<TlsOption, Vec<Arc<TlsTargetData>>>>,
+) -> std::io::Result<(Box<dyn AsyncStream>, Arc<TargetData>)> {
     let acceptor = LazyConfigAcceptor::new(rustls::server::Acceptor::new().unwrap(), stream);
     let start_handshake = acceptor.await?;
     let client_hello = start_handshake.client_hello();
@@ -373,12 +408,7 @@ async fn process_tls_stream(
                 })
                 .await?;
 
-            return process_generic_stream(
-                Box::new(tls_stream),
-                addr,
-                sni_data.target_data.clone(),
-            )
-            .await;
+            return Ok((Box::new(tls_stream), sni_data.target_data.clone()));
         }
     }
 
@@ -505,7 +535,7 @@ async fn peek_tls_client_hello(stream: &TcpStream) -> std::io::Result<bool> {
                 }
             }
         }
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(50)).await;
     }
 
     debug!("Unable to fetch all bytes to determine TLS.");
