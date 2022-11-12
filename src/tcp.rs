@@ -360,7 +360,7 @@ async fn handle_tls_handshake(
             if !sni_hostname.is_specified() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
-                    "no matching SNI hostname",
+                    "no SNI hostname unspecified",
                 ));
             }
             match sni_lookup_map.get(&TlsOption::Any) {
