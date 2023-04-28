@@ -3,7 +3,7 @@ mod location;
 mod option_util;
 mod tls_option;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
