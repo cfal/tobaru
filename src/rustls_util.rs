@@ -1,4 +1,4 @@
-use std::lazy::SyncOnceCell;
+use std::sync::OnceLock;
 use std::sync::Arc;
 
 use rustls::client::{ServerCertVerified, ServerName};
@@ -31,8 +31,8 @@ fn create_client_config(verify: bool) -> ClientConfig {
 }
 
 fn get_client_config(verify: bool) -> Arc<ClientConfig> {
-    static VERIFIED_INSTANCE: SyncOnceCell<Arc<ClientConfig>> = SyncOnceCell::new();
-    static UNVERIFIED_INSTANCE: SyncOnceCell<Arc<ClientConfig>> = SyncOnceCell::new();
+    static VERIFIED_INSTANCE: OnceLock<Arc<ClientConfig>> = OnceLock::new();
+    static UNVERIFIED_INSTANCE: OnceLock<Arc<ClientConfig>> = OnceLock::new();
     if verify {
         VERIFIED_INSTANCE
             .get_or_init(|| Arc::new(create_client_config(true)))
@@ -117,7 +117,7 @@ pub fn create_server_config(
 }
 
 pub fn get_dummy_server_name() -> ServerName {
-    static INSTANCE: SyncOnceCell<ServerName> = SyncOnceCell::new();
+    static INSTANCE: OnceLock<ServerName> = OnceLock::new();
     INSTANCE
         .get_or_init(|| ServerName::try_from("example.com").unwrap())
         .clone()

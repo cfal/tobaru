@@ -1,7 +1,7 @@
 use std::collections::hash_map::{Entry, RandomState};
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, Hash};
-use std::lazy::SyncOnceCell;
+use std::sync::OnceLock;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -51,7 +51,7 @@ struct TlsTargetData {
 const BUFFER_SIZE: usize = 8192;
 
 fn hash_alpn<T: Hash>(x: T) -> u64 {
-    static ALPN_HASHER: SyncOnceCell<RandomState> = SyncOnceCell::new();
+    static ALPN_HASHER: OnceLock<RandomState> = OnceLock::new();
     ALPN_HASHER.get_or_init(RandomState::new).hash_one(x)
 }
 
