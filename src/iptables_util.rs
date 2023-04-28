@@ -77,51 +77,56 @@ pub async fn configure_iptables(protocol: Protocol, socket_addr: SocketAddr, ip_
         }
     }
 
-    run(
-        IP6TABLES_PATH,
-        &[
-            "--wait",
-            "10",
-            "-A",
-            "INPUT",
-            "--protocol",
-            protocol.as_str(),
-            "--dport",
-            &port_str,
-            "-s",
-            &ipv6_masks.join(","),
-            "-j",
-            "ACCEPT",
-            "-m",
-            "comment",
-            "--comment",
-            &comment,
-        ],
-    )
-    .await;
+    // we need to chunk to avoid ArgumentListTooLong errors.
+    for chunk in ipv6_masks.chunks(50) {
+        run(
+            IP6TABLES_PATH,
+            &[
+                "--wait",
+                "10",
+                "-A",
+                "INPUT",
+                "--protocol",
+                protocol.as_str(),
+                "--dport",
+                &port_str,
+                "-s",
+                &chunk.join(","),
+                "-j",
+                "ACCEPT",
+                "-m",
+                "comment",
+                "--comment",
+                &comment,
+            ],
+        )
+        .await;
+    }
 
-    run(
-        IPTABLES_PATH,
-        &[
-            "--wait",
-            "10",
-            "-A",
-            "INPUT",
-            "--protocol",
-            protocol.as_str(),
-            "--dport",
-            &port_str,
-            "-s",
-            &ipv4_masks.join(","),
-            "-j",
-            "ACCEPT",
-            "-m",
-            "comment",
-            "--comment",
-            &comment,
-        ],
-    )
-    .await;
+    for chunk in ipv4_masks.chunks(50) {
+        run(
+            IPTABLES_PATH,
+            &[
+                "--wait",
+                "10",
+                "-A",
+                "INPUT",
+                "--protocol",
+                protocol.as_str(),
+                "--dport",
+                &port_str,
+                "-s",
+                &chunk.join(","),
+                "-j",
+                "ACCEPT",
+                "-m",
+                "comment",
+                "--comment",
+                &comment,
+            ],
+        )
+        .await;
+    }
 
     for program in &[IPTABLES_PATH, IP6TABLES_PATH] {
         run(
