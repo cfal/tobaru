@@ -9,7 +9,7 @@ mod udp;
 
 use std::path::Path;
 
-use log::{debug, error, info};
+use log::{debug, error};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::runtime::Builder;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
@@ -154,7 +154,7 @@ fn main() {
 
             let t = match num_threads_str.parse::<usize>() {
                 Ok(t) => t,
-                Err(e) => {
+                Err(_) => {
                     print_help(&command, Some("Invalid thread count"));
                 }
             };
