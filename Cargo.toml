@@ -33,3 +33,4 @@ notify = ">=5.0.0-pre.13"
 [profile.release]
 opt-level = 3
 lto = "fat"
+strip = true
