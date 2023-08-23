@@ -1,10 +1,10 @@
 use std::collections::hash_map::{Entry, RandomState};
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, Hash};
-use std::sync::OnceLock;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use futures::join;
 use ip_network_table_deps_treebitmap::IpLookupTable;
@@ -343,7 +343,7 @@ async fn handle_tls_handshake(
     non_tls_data: Option<Arc<TargetData>>,
     sni_lookup_map: Arc<HashMap<TlsOption, Vec<Arc<TlsTargetData>>>>,
 ) -> std::io::Result<(Box<dyn AsyncStream>, Arc<TargetData>)> {
-    let acceptor = LazyConfigAcceptor::new(rustls::server::Acceptor::new().unwrap(), stream);
+    let acceptor = LazyConfigAcceptor::new(rustls::server::Acceptor::default(), stream);
     let start_handshake = acceptor.await?;
     let client_hello = start_handshake.client_hello();
     let sni_hostname = client_hello
