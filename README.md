@@ -80,11 +80,11 @@ EXAMPLES:
 
     tobaru -t 1 config1.yaml config2.yaml
 
-        Run listeners from configs in config1.yaml and config2.yaml on a single thread.
+        Run servers from configs in config1.yaml and config2.yaml on a single thread.
 
     tobaru tcp://127.0.0.1:1000?target=127.0.0.1:2000
 
-        Run a tcp listener on 127.0.0.1 port 1000, forwarding to 127.0.0.1 port 2000.
+        Run a tcp server on 127.0.0.1 port 1000, forwarding to 127.0.0.1 port 2000.
 
     sudo tobaru --clear-iptables-matching config1.yaml
 
@@ -108,9 +108,9 @@ tcp://<bind ip>:<bind port>?target-path=<unix domain socket path>
 
 ## File-based configuration
 
-Configuration files are in the YAML file format. tobaru expects to read an array of objects, where each object is a listener configuration, or an IP mask group.
+Configuration files are in the YAML or JSON file format. tobaru expects to read an array of objects, where each object is a server configuration, or an IP mask group.
 
-### Listener object configuration
+### Server object configuration
 
 `address`: The address to listen on.
 
@@ -231,6 +231,7 @@ Connections from addresses that are not specified in `allowlist` will either be 
 {
   // Listen on all interfaces, port 8080.
   "bindAddress": "0.0.0.0:8080",
+  "transport": "tcp",
   "target": {
     // Round-robin forward to different addresses.
     "addresses": [
@@ -250,6 +251,7 @@ Connections from addresses that are not specified in `allowlist` will either be 
 {
   // Listen on port 8080
   "bindAddress": "0.0.0.0:8080",
+  "transport": "tcp",
   "targets": [
     // Forward some IP ranges to 192.168.8.1 port 80.
     {
@@ -274,8 +276,7 @@ Connections from addresses that are not specified in `allowlist` will either be 
 ### TLS support
 
 ```js
-{
-  "servers": [
+[
     // Server listening on port 443 (HTTPS).
     {
       "bindAddress": "192.168.0.1:443",
@@ -314,8 +315,7 @@ Connections from addresses that are not specified in `allowlist` will either be 
         "allowlist": "all"
       }
     }
-  ]
-}
+]
 ```
 
 ### iptables support
@@ -363,11 +363,10 @@ IP groups can be used to quickly specify groups of IPs in multiple servers. Note
       "bindAddress": "0.0.0.0:8080",
       "target": {
         "address": "192.168.5.1:8080",
-        // Use '@' to specify IP groups.
         // Only allow IP ranges from 'local' and 'friends' to connect.
         "allowlist": [
-          "@local",
-          "@friends"
+          "local",
+          "friends"
         ]
       }
     },
@@ -382,3 +381,7 @@ IP groups can be used to quickly specify groups of IPs in multiple servers. Note
   ]
 }
 ```
+
+### Upgrading from 0.8.0 or lower
+
+See [UPGRADING.md](UPGRADING.md).

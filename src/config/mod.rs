@@ -79,7 +79,7 @@ impl IpMaskSelection {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
-    #[serde(deserialize_with = "deserialize_socket_addr")]
+    #[serde(deserialize_with = "deserialize_socket_addr", alias = "bindAddress")]
     pub address: SocketAddr,
     #[serde(default, alias = "iptables")]
     pub use_iptables: bool,
@@ -130,9 +130,9 @@ pub enum TargetConfigs {
 #[derive(Debug, Clone, Deserialize)]
 pub struct TcpTargetConfig {
     pub allowlist: OneOrSome<IpMaskSelection>,
-    #[serde(alias = "location")]
+    #[serde(alias = "location", alias = "addresses", alias = "address")]
     pub locations: OneOrSome<TcpTargetLocation>,
-    #[serde(default)]
+    #[serde(default, alias = "serverTls")]
     pub server_tls: Option<ServerTlsConfig>,
     #[serde(default = "default_true")]
     pub tcp_nodelay: bool,

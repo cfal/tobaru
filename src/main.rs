@@ -100,11 +100,11 @@ EXAMPLES:
 
     {} -t 1 config1.yaml config2.yaml
 
-        Run listeners from configs in config1.yaml and config2.yaml on a single thread.
+        Run servers from configs in config1.yaml and config2.yaml on a single thread.
 
     {} tcp://127.0.0.1:1000?target=127.0.0.1:2000
 
-        Run a tcp listener on 127.0.0.1 port 1000, forwarding to 127.0.0.1 port 2000.
+        Run a tcp server on 127.0.0.1 port 1000, forwarding to 127.0.0.1 port 2000.
 
     sudo {} --clear-iptables-matching config1.yaml
 
