@@ -1,6 +1,6 @@
 # Upgrading
 
-## Upgrading from 0.8.0 and lower
+## Upgrading from 0.7.1 and lower
 
 ### Breaking changes
 

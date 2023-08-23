@@ -49,6 +49,16 @@ Here's a quick example:
       allowlist: 1.2.3.4
 ```
 
+## Installation
+
+Precompiled binaries for x86_64 and Apple aarch64 are available on [Github Releases](https://github.com/cfal/tobaru/releases).
+
+Else, if you have a fairly recent Rust and cargo installation on your system, tobaru can be installed with `cargo`.
+
+```bash
+cargo install tobaru
+```
+
 ## Usage
 
 ```
@@ -382,6 +392,6 @@ IP groups can be used to quickly specify groups of IPs in multiple servers. Note
 }
 ```
 
-### Upgrading from 0.8.0 or lower
+### Upgrading from 0.7.1 or lower
 
 See [UPGRADING.md](UPGRADING.md).
