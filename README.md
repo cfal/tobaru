@@ -189,49 +189,38 @@ A default IP group with name `all` and IP mask `0.0.0.0/0` is automatically adde
   transport: tcp
   target:
     location: 192.168.8.1:80
-
-{
-  // Listen on all interfaces, on port 8080.
-  "bindAddress": "0.0.0.0:8080",
-  "target": {
-    // Forward to 192.168.8.1 port 80.
-    "address": "192.168.8.1:80",
-    // Allow connections from all addresses. 'all' is a special alias for 0.0.0.0/0.
-    "allowlist": "all"
-  }
-}
+    allowlist: all
 ```
 
 or with multiple servers and specific IP ranges:
 
-```js
-{
-  "servers": [
-    // Forward port 8080 to 192.168.8.1 port 80, but only for some IP ranges.
-    {
-      "bindAddress": "0.0.0.0:8080",
-      "target": {
-        "address": "192.168.8.1:80",
-        "allowlist": [
-          // Some local IP ranges..
-          "192.168.9.0/24",
-          "192.168.10.0/24",
-          // ..and some specific IPs.
-          "162.39.217.12",
-          "fa71::e09d:92fa:fd2c:8297"
-        ]
-      }
-    },
-    // Forward port 8081 to 192.168.8.2 port 80, for any IP.
-    {
-      "bindAddress": "0.0.0.0:8081",
-      "target": {
-        "address": "192.168.8.2:80",
-        "allowlist": "all"
-      }
-    }
-  ]
-}
+```yaml
+# Forward port 8080 to 192.168.8.1 port 80 for some IP ranges.
+- address: 0.0.0.0:8080
+  transport: tcp
+  targets:
+    - address: 192.168.8.1:80
+      allowlist:
+        # Some local IP ranges..
+        - 192.168.9.0/24
+        - 192.168.10.0/24
+
+        # .. and some specific IPs
+        - 12.34.56.78
+        - fa71::e09d:92fa:beef:1234
+
+    - address: 192.168.8.2:80
+      allowlist:
+        - 192.168.11.0/24
+        - 192.168.12.0/24
+
+# Forward port 8081 to 192.168.8.2 port 80 for all IPs.
+- address: 0.0.0.0:8081
+  transport: udp
+  target:
+    - address: 192.168.8.3:80
+      allowlist:
+        - all
 ```
 
 Connections from addresses that are not specified in `allowlist` will either be dropped (if `iptables` is set to `true`), or be immediately closed after accept.
