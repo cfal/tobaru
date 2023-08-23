@@ -266,11 +266,28 @@ fn deserialize_configs(mut config_str: String) -> std::io::Result<Vec<Config>> {
     };
 
     if is_json {
-        let config_str = config_str
+        config_str = config_str
             .split('\n')
             .filter(|s| !s.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
             .join("\n");
+    }
+
+    if config_str.find("serverTls").is_some() {
+        eprintln!("WARNING: serverTls is deprecated and has been renamed to server_tls. This will be removed in future versions.");
+    }
+
+    if config_str.find("bindAddress").is_some() {
+        eprintln!("WARNING: bindAddress is deprecated and has been renamed to address. This will be removed in future versions.");
+    }
+
+    // Unfortunately, we can't grep for `address` in target configs since it's valid for server
+    // configs.
+    if config_str.find("addresses").is_some() {
+        eprintln!("WARNING: addresses is deprecated and has been renamed to locations. This will be removed in future versions.");
+    }
+
+    if is_json {
         serde_json::from_str(&config_str).map_err(|e| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
