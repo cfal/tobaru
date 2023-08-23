@@ -28,7 +28,7 @@ tokio-rustls = { version = "*", features = ["dangerous_configuration"] }
 ip_network_table-deps-treebitmap = "*"
 url = "*"
 webpki-roots = { version = "*" }
-notify = ">=5.0.0-pre.13"
+notify = ">=6.1.1"
 
 [profile.release]
 opt-level = 3
