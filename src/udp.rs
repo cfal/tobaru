@@ -271,8 +271,7 @@ async fn run_forward_from_target_task(
     client_address: SocketAddr,
     last_active: Arc<AtomicU32>,
 ) {
-    let mut buf: [u8; MAX_UDP_PACKET_SIZE] =
-        unsafe { std::mem::MaybeUninit::uninit().assume_init() };
+    let mut buf = [0u8; MAX_UDP_PACKET_SIZE];
     while let Ok(len) = forward_socket.recv(&mut buf).await {
         if let Err(e) = server_socket.send_to(&buf[0..len], client_address).await {
             error!("Failed to relay response: {}", e);
