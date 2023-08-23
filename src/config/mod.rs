@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+use log::warn;
 use percent_encoding::percent_decode_str;
 use serde::Deserialize;
 use url::Url;
@@ -246,6 +247,46 @@ pub struct UdpTargetConfig {
     pub association_timeout_secs: Option<u32>,
 }
 
+fn deserialize_configs(mut config_str: String) -> std::io::Result<Vec<Config>> {
+    let trimmed_str = config_str.trim();
+    let is_json = if trimmed_str.starts_with("//") {
+        // if we detect a single-line comment as previously allowed in the
+        // JSON config.
+        true
+    } else if trimmed_str.starts_with("{") && trimmed_str.ends_with("}") {
+        // previously, a single config object was supported, convert into an array.
+        config_str = format!("[\n{}\n]\n", config_str);
+        true
+    } else if trimmed_str.starts_with("-") {
+        // yaml item in array
+        false
+    } else {
+        warn!("Could not detect config format, assuming YAML.");
+        false
+    };
+
+    if is_json {
+        let config_str = config_str
+            .split('\n')
+            .filter(|s| !s.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        serde_json::from_str(&config_str).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("failed to parse config JSON: {}", e),
+            )
+        })
+    } else {
+        serde_yaml::from_str(&config_str).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("failed to parse config YAML: {}", e),
+            )
+        })
+    }
+}
+
 pub async fn load_server_configs(
     config_paths: Vec<String>,
     config_urls: Vec<String>,
@@ -259,12 +300,7 @@ pub async fn load_server_configs(
 
     for config_path in config_paths {
         let config_str = tokio::fs::read_to_string(&config_path).await?;
-        let configs = serde_yaml::from_str::<Vec<Config>>(&config_str).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("failed to parse config YAML: {}", e),
-            )
-        })?;
+        let configs = deserialize_configs(config_str)?;
         for config in configs {
             match config {
                 Config::ServerConfig(server_config) => {

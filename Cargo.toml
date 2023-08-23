@@ -21,6 +21,7 @@ percent-encoding = "*"
 rustls = { version = "*", features = ["dangerous_configuration"] }
 rustls-pemfile = { version = "*" }
 serde = { version = "*", features = ["derive", "std"] }
+serde_json = "*"
 serde_yaml = "*"
 tokio = { version = "*", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
 tokio-rustls = { version = "*", features = ["dangerous_configuration"] }
