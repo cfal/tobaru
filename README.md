@@ -101,6 +101,10 @@ EXAMPLES:
         Clear iptable configs only for the config addresses in config1.yaml.
 ```
 
+## Upgrading from 0.7.1 or lower
+
+See [UPGRADING.md](UPGRADING.md).
+
 ## URL-based configuration
 
 Simple TCP forwarding can be done using the config URL format:
@@ -392,6 +396,3 @@ IP groups can be used to quickly specify groups of IPs in multiple servers. Note
 }
 ```
 
-### Upgrading from 0.7.1 or lower
-
-See [UPGRADING.md](UPGRADING.md).
