@@ -124,13 +124,19 @@ fn print_help(command: &str, error: Option<&str>) -> ! {
     std::process::exit(if error.is_some() { 1 } else { 0 });
 }
 
+#[derive(Debug, PartialEq)]
+enum QuickAction {
+    ClearIptablesMatching,
+    ClearIptablesAll,
+    DryRun,
+}
+
 fn main() {
     env_logger::init();
 
     let mut config_paths = vec![];
     let mut config_urls = vec![];
-    let mut clear_iptables_matching = false;
-    let mut clear_iptables_all = false;
+    let mut quick_action: Option<QuickAction> = None;
     let mut num_threads: Option<usize> = None;
 
     let mut args = std::env::args();
@@ -138,9 +144,11 @@ fn main() {
 
     while let Some(arg) = args.next() {
         if arg == "--clear-iptables-all" {
-            clear_iptables_all = true;
+            quick_action = Some(QuickAction::ClearIptablesAll);
         } else if arg == "--clear-iptables-matching" {
-            clear_iptables_matching = true;
+            quick_action = Some(QuickAction::ClearIptablesMatching);
+        } else if arg == "--dry-run" {
+            quick_action = Some(QuickAction::DryRun);
         } else if arg == "--threads" || arg == "-t" {
             if num_threads.is_some() {
                 print_help(&command, Some("Thread count was already specified"))
@@ -203,7 +211,7 @@ fn main() {
         .expect("Could not build tokio runtime");
 
     runtime.block_on(async move {
-        if clear_iptables_all {
+        if matches!(quick_action, Some(QuickAction::ClearIptablesAll)) {
             iptables_util::clear_all_iptables().await;
             println!("iptables cleared of all tobaru rules, exiting.");
             return;
@@ -222,14 +230,21 @@ fn main() {
             }
 
             debug!("Loaded server configs: {:#?}", &server_configs);
+            if matches!(quick_action, Some(QuickAction::DryRun)) {
+                println!("Dry run complete, exiting.");
+                return;
+            }
+
+            let is_clear_matching =
+                matches!(quick_action, Some(QuickAction::ClearIptablesMatching));
 
             for server_config in server_configs.iter() {
-                if server_config.use_iptables || clear_iptables_matching {
+                if server_config.use_iptables || is_clear_matching {
                     iptables_util::clear_matching_iptables(server_config.address).await;
                 }
             }
 
-            if clear_iptables_matching {
+            if is_clear_matching {
                 println!("iptables cleared of matching server rules, exiting.");
                 return;
             }
