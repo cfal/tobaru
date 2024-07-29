@@ -162,15 +162,29 @@ pub struct HttpPathConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
 pub enum HttpValueMatch {
     Any,
-    Exact(Vec<String>),
+    Single(String),
+    Multiple(Vec<String>),
+}
+
+impl Default for HttpValueMatch {
+    fn default() -> Self {
+        HttpValueMatch::Any
+    }
 }
 
 impl HttpValueMatch {
     pub fn matches(&self, value: Option<&str>) -> bool {
         match self {
-            HttpValueMatch::Exact(ref allowed_values) => {
+            HttpValueMatch::Single(ref allowed_value) => {
+                if value.is_none() {
+                    return false;
+                }
+                allowed_value == value.unwrap()
+            }
+            HttpValueMatch::Multiple(ref allowed_values) => {
                 if value.is_none() {
                     return false;
                 }
