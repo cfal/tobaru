@@ -29,6 +29,7 @@ ip_network_table-deps-treebitmap = "*"
 url = "*"
 webpki-roots = { version = "*" }
 notify = ">=6.1.1"
+radix_trie = { version = "*", features = ["serde"] }
 
 [profile.release]
 opt-level = 3

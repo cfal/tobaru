@@ -130,12 +130,75 @@ pub enum TargetConfigs {
 #[derive(Debug, Clone, Deserialize)]
 pub struct TcpTargetConfig {
     pub allowlist: OneOrSome<IpMaskSelection>,
+    // deprecated - use Tcp::Action Forward configuration
     #[serde(alias = "location", alias = "addresses", alias = "address")]
-    pub locations: OneOrSome<TcpTargetLocation>,
+    pub locations: NoneOrSome<TcpTargetLocation>,
     #[serde(default, alias = "serverTls")]
     pub server_tls: Option<ServerTlsConfig>,
     #[serde(default = "default_true")]
     pub tcp_nodelay: bool,
+    #[serde(default)]
+    pub action: Option<TcpAction>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum TcpAction {
+    #[serde(alias = "forward")]
+    Forward {
+        locations: OneOrSome<TcpTargetLocation>,
+    },
+    #[serde(alias = "http")]
+    Http {
+        paths: HashMap<String, Vec<HttpPathConfig>>,
+        default_action: HttpPathAction,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct HttpPathConfig {
+    pub required_request_headers: Option<HashMap<String, HttpValueMatch>>,
+    pub action: HttpPathAction,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub enum HttpValueMatch {
+    Any,
+    Exact(Vec<String>),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub enum HttpPathAction {
+    CloseConnection,
+    ServeMessage {
+        status_code: u16,
+        status_message: Option<String>,
+        content: String,
+        response_headers: HashMap<String, String>,
+        response_id_header_name: Option<String>,
+    },
+    ServeDirectory {
+        path: String,
+        response_headers: HashMap<String, String>,
+        response_id_header_name: Option<String>,
+    },
+    Forward {
+        target_locations: OneOrSome<TcpTargetLocation>,
+        // replacement paths are best effort - it's entirely possible that absolute paths are specified
+        // in the returned content and it would break.
+        replacement_path: Option<String>,
+        request_header_patch: Option<HttpHeaderPatch>,
+        response_header_patch: Option<HttpHeaderPatch>,
+        request_id_header_name: Option<String>,
+        response_id_header_name: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct HttpHeaderPatch {
+    pub default_headers: HashMap<String, String>,
+    pub overwrite_headers: HashMap<String, String>,
+    pub remove_headers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -355,6 +418,25 @@ pub async fn load_server_configs(
                 ref mut targets, ..
             } => {
                 for target in targets.iter_mut() {
+                    if !target.locations.is_empty() {
+                        if target.action.is_some() {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "Target config cannot have both locations and action",
+                            ));
+                        }
+                        let locations = std::mem::replace(&mut target.locations, NoneOrSome::None);
+                        eprintln!("WARNING: locations is deprecated, use action forward instead");
+                        target.action = Some(TcpAction::Forward {
+                            locations: OneOrSome::Some(locations.into_vec()),
+                        });
+                    }
+                    if target.action.is_none() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "Target config must have action",
+                        ));
+                    }
                     IpMaskSelection::replace_groups(&mut target.allowlist, &groups)?;
                 }
             }
@@ -451,9 +533,10 @@ pub async fn load_url(config_url: &str) -> std::io::Result<ServerConfig> {
 
     let tcp_target_config = TcpTargetConfig {
         allowlist: OneOrSome::One(IpMaskSelection::Literal(IpMask::all())),
-        locations: OneOrSome::Some(locations),
+        locations: NoneOrSome::Some(locations),
         server_tls: None,
         tcp_nodelay: true,
+        action: None,
     };
 
     Ok(ServerConfig {

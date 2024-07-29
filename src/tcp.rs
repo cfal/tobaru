@@ -9,6 +9,7 @@ use std::sync::OnceLock;
 use futures::join;
 use ip_network_table_deps_treebitmap::IpLookupTable;
 use log::{debug, error, warn};
+use radix_trie::Trie;
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream, UnixStream};
@@ -17,8 +18,8 @@ use tokio_rustls::LazyConfigAcceptor;
 
 use crate::async_stream::AsyncStream;
 use crate::config::{
-    ClientTlsConfig, IpMask, IpMaskSelection, Location, NetLocation, ServerTlsConfig,
-    TcpTargetConfig, TlsOption,
+    ClientTlsConfig, HttpPathAction, HttpPathConfig, IpMask, IpMaskSelection, Location,
+    NetLocation, ServerTlsConfig, TcpAction, TcpTargetConfig, TlsOption,
 };
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::iptables_util::{configure_iptables, Protocol};
@@ -33,9 +34,19 @@ struct TargetLocationData {
 }
 
 struct TargetData {
-    pub location_data: Vec<TargetLocationData>,
-    pub next_address_index: AtomicUsize,
     pub tcp_nodelay: bool,
+    pub action_data: TargetActionData,
+}
+
+enum TargetActionData {
+    Forward {
+        location_data: Vec<TargetLocationData>,
+        next_address_index: AtomicUsize,
+    },
+    Http {
+        path_configs: Trie<String, Vec<HttpPathConfig>>,
+        default_action: HttpPathAction,
+    },
 }
 
 struct TlsTargetData {
@@ -71,9 +82,10 @@ pub async fn run_tcp_server(
     for target_config in target_configs {
         let TcpTargetConfig {
             allowlist,
-            locations,
             server_tls,
             tcp_nodelay,
+            action,
+            ..
         } = target_config;
 
         let allowlist = allowlist
@@ -81,25 +93,44 @@ pub async fn run_tcp_server(
             .map(IpMaskSelection::unwrap_literal)
             .collect::<Vec<_>>();
 
-        let location_data = locations
-            .into_iter()
-            .map(|target_location| {
-                let (location, client_tls) = target_location.into_components();
-                TargetLocationData {
-                    location: location,
-                    tls_connector: match client_tls {
-                        ClientTlsConfig::Enabled => Some(create_connector(true)),
-                        ClientTlsConfig::EnabledWithoutVerify => Some(create_connector(false)),
-                        ClientTlsConfig::Disabled => None,
-                    },
+        let action_data = match action.unwrap() {
+            TcpAction::Forward { locations } => TargetActionData::Forward {
+                location_data: locations
+                    .into_iter()
+                    .map(|target_location| {
+                        let (location, client_tls) = target_location.into_components();
+                        TargetLocationData {
+                            location: location,
+                            tls_connector: match client_tls {
+                                ClientTlsConfig::Enabled => Some(create_connector(true)),
+                                ClientTlsConfig::EnabledWithoutVerify => {
+                                    Some(create_connector(false))
+                                }
+                                ClientTlsConfig::Disabled => None,
+                            },
+                        }
+                    })
+                    .collect(),
+                next_address_index: AtomicUsize::new(0),
+            },
+            TcpAction::Http {
+                paths,
+                default_action,
+            } => {
+                let mut path_configs = Trie::new();
+                for (path, path_config_vec) in paths {
+                    path_configs.insert(path, path_config_vec);
                 }
-            })
-            .collect();
+                TargetActionData::Http {
+                    path_configs,
+                    default_action,
+                }
+            }
+        };
 
         let target_data = Arc::new(TargetData {
-            location_data,
-            next_address_index: AtomicUsize::new(0),
             tcp_nodelay,
+            action_data,
         });
 
         let is_non_tls_target = match server_tls {
@@ -440,53 +471,64 @@ async fn process_generic_stream(
     addr: &std::net::SocketAddr,
     target_data: Arc<TargetData>,
 ) -> std::io::Result<()> {
-    let target_location = if target_data.location_data.len() > 1 {
-        // fetch_add wraps around on overflow.
-        let index = target_data
-            .next_address_index
-            .fetch_add(1, Ordering::Relaxed);
-        &target_data.location_data[index % target_data.location_data.len()]
-    } else {
-        &target_data.location_data[0]
-    };
+    match &target_data.action_data {
+        TargetActionData::Forward {
+            location_data,
+            next_address_index,
+        } => {
+            let target_location = if location_data.len() > 1 {
+                // fetch_add wraps around on overflow.
+                let index = next_address_index.fetch_add(1, Ordering::Relaxed);
+                &location_data[index % location_data.len()]
+            } else {
+                &location_data[0]
+            };
+            let mut target_stream =
+                match setup_target_stream(addr, &target_location, target_data.tcp_nodelay).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        source_stream.try_shutdown().await?;
+                        return Err(e);
+                    }
+                };
 
-    let mut target_stream =
-        match setup_target_stream(addr, &target_location, target_data.tcp_nodelay).await {
-            Ok(s) => s,
-            Err(e) => {
-                source_stream.try_shutdown().await?;
-                return Err(e);
-            }
-        };
+            debug!(
+                "Copying: {}:{} to {}",
+                addr.ip(),
+                addr.port(),
+                &target_location.location,
+            );
 
-    debug!(
-        "Copying: {}:{} to {}",
-        addr.ip(),
-        addr.port(),
-        &target_location.location,
-    );
+            let copy_result =
+                copy_bidirectional(&mut source_stream, &mut target_stream, BUFFER_SIZE).await;
 
-    let copy_result = copy_bidirectional(&mut source_stream, &mut target_stream, BUFFER_SIZE).await;
+            debug!(
+                "Shutdown: {}:{} to {}",
+                addr.ip(),
+                addr.port(),
+                &target_location.location,
+            );
 
-    debug!(
-        "Shutdown: {}:{} to {}",
-        addr.ip(),
-        addr.port(),
-        &target_location.location,
-    );
+            let (_, _) = join!(source_stream.try_shutdown(), target_stream.try_shutdown());
 
-    let (_, _) = join!(source_stream.try_shutdown(), target_stream.try_shutdown());
+            debug!(
+                "Done: {}:{} to {}",
+                addr.ip(),
+                addr.port(),
+                &target_location.location,
+            );
 
-    debug!(
-        "Done: {}:{} to {}",
-        addr.ip(),
-        addr.port(),
-        &target_location.location,
-    );
+            copy_result?;
 
-    copy_result?;
-
-    Ok(())
+            Ok(())
+        }
+        TargetActionData::Http {
+            path_configs,
+            default_action,
+        } => {
+            panic!("TODO")
+        }
+    }
 }
 
 async fn peek_tls_client_hello(stream: &TcpStream) -> std::io::Result<bool> {
