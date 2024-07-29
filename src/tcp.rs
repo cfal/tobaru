@@ -313,7 +313,7 @@ pub async fn run_tcp_server(
         } else {
             tokio::spawn(async move {
                 if let Err(e) =
-                    process_generic_stream(Box::new(stream), &addr, non_tls_data.unwrap()).await
+                    run_stream_action(Box::new(stream), &addr, non_tls_data.unwrap()).await
                 {
                     error!("{}:{} finished with error: {:?}", addr.ip(), addr.port(), e);
                 } else {
@@ -338,13 +338,12 @@ async fn process_tls_stream(
             Ok(peek_result) => {
                 let is_tls_client_hello = peek_result?;
                 if !is_tls_client_hello {
-                    return process_generic_stream(Box::new(stream), addr, non_tls_data.unwrap())
-                        .await;
+                    return run_stream_action(Box::new(stream), addr, non_tls_data.unwrap()).await;
                 }
             }
             Err(elapsed) => {
                 warn!("TLS client hello read timed out, assuming non-TLS connection.");
-                return process_generic_stream(Box::new(stream), addr, non_tls_data.unwrap()).await;
+                return run_stream_action(Box::new(stream), addr, non_tls_data.unwrap()).await;
             }
         }
     }
@@ -364,7 +363,7 @@ async fn process_tls_stream(
         }
     };
 
-    process_generic_stream(tls_stream, addr, target_data).await
+    run_stream_action(tls_stream, addr, target_data).await
 }
 
 async fn handle_tls_handshake(
@@ -466,7 +465,7 @@ async fn handle_tls_handshake(
     ))
 }
 
-async fn process_generic_stream(
+async fn run_stream_action(
     mut source_stream: Box<dyn AsyncStream>,
     addr: &std::net::SocketAddr,
     target_data: Arc<TargetData>,
