@@ -30,6 +30,9 @@ url = "*"
 webpki-roots = { version = "*" }
 notify = ">=6.1.1"
 radix_trie = { version = "*", features = ["serde"] }
+rand = "*"
+memchr = "2.7.4"
+mime_guess = "2.0.5"
 
 [profile.release]
 opt-level = 3

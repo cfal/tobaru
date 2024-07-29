@@ -151,20 +151,40 @@ pub enum TcpAction {
     #[serde(alias = "http")]
     Http {
         paths: HashMap<String, Vec<HttpPathConfig>>,
-        default_action: HttpPathAction,
+        default_http_action: HttpPathAction,
     },
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct HttpPathConfig {
     pub required_request_headers: Option<HashMap<String, HttpValueMatch>>,
-    pub action: HttpPathAction,
+    pub http_action: HttpPathAction,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub enum HttpValueMatch {
     Any,
     Exact(Vec<String>),
+}
+
+impl HttpValueMatch {
+    pub fn matches(&self, value: Option<&str>) -> bool {
+        match self {
+            HttpValueMatch::Exact(ref allowed_values) => {
+                if value.is_none() {
+                    return false;
+                }
+                let value = value.unwrap();
+                for v in allowed_values.iter() {
+                    if v == value {
+                        return true;
+                    }
+                }
+                false
+            }
+            HttpValueMatch::Any => !value.is_none(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

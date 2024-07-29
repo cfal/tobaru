@@ -18,35 +18,134 @@ use tokio_rustls::LazyConfigAcceptor;
 
 use crate::async_stream::AsyncStream;
 use crate::config::{
-    ClientTlsConfig, HttpPathAction, HttpPathConfig, IpMask, IpMaskSelection, Location,
-    NetLocation, ServerTlsConfig, TcpAction, TcpTargetConfig, TlsOption,
+    ClientTlsConfig, HttpHeaderPatch, HttpPathAction, HttpPathConfig, HttpValueMatch, IpMask,
+    IpMaskSelection, Location, NetLocation, ServerTlsConfig, TcpAction, TcpTargetConfig,
+    TcpTargetLocation, TlsOption,
 };
 use crate::copy_bidirectional::copy_bidirectional;
+use crate::http::handle_http_stream;
 use crate::iptables_util::{configure_iptables, Protocol};
 use crate::rustls_util::{
     create_connector, create_server_config, get_dummy_server_name, load_certs, load_private_key,
 };
 use crate::tokio_util::resolve_host;
 
-struct TargetLocationData {
+pub struct TargetLocationData {
     pub location: Location,
     pub tls_connector: Option<tokio_rustls::TlsConnector>,
 }
 
-struct TargetData {
+impl From<TcpTargetLocation> for TargetLocationData {
+    fn from(tcp_target_location: TcpTargetLocation) -> Self {
+        let (location, client_tls) = tcp_target_location.into_components();
+        Self {
+            location,
+            tls_connector: match client_tls {
+                ClientTlsConfig::Enabled => Some(create_connector(true)),
+                ClientTlsConfig::EnabledWithoutVerify => Some(create_connector(false)),
+                ClientTlsConfig::Disabled => None,
+            },
+        }
+    }
+}
+
+pub struct TargetData {
     pub tcp_nodelay: bool,
     pub action_data: TargetActionData,
 }
 
-enum TargetActionData {
+pub enum TargetActionData {
     Forward {
         location_data: Vec<TargetLocationData>,
         next_address_index: AtomicUsize,
     },
     Http {
-        path_configs: Trie<String, Vec<HttpPathConfig>>,
-        default_action: HttpPathAction,
+        path_configs: Trie<String, Vec<TargetHttpPathData>>,
+        default_http_action: TargetHttpActionData,
     },
+}
+
+pub struct TargetHttpPathData {
+    pub required_request_headers: Option<HashMap<String, HttpValueMatch>>,
+    pub http_action: TargetHttpActionData,
+}
+
+// TODO: preprocess some of these fields, eg status_code/status_message/content into a single
+// prepared response.
+pub enum TargetHttpActionData {
+    CloseConnection,
+    ServeMessage {
+        status_code: u16,
+        status_message: Option<String>,
+        content: String,
+        response_headers: HashMap<String, String>,
+        response_id_header_name: Option<String>,
+    },
+    ServeDirectory {
+        path: String,
+        response_headers: HashMap<String, String>,
+        response_id_header_name: Option<String>,
+    },
+    Forward {
+        location_data: Vec<TargetLocationData>,
+        next_address_index: AtomicUsize,
+        // replacement paths are best effort - it's entirely possible that absolute paths are specified
+        // in the returned content and it would break.
+        replacement_path: Option<String>,
+        request_header_patch: Option<HttpHeaderPatch>,
+        response_header_patch: Option<HttpHeaderPatch>,
+        request_id_header_name: Option<String>,
+        response_id_header_name: Option<String>,
+    },
+}
+
+impl From<HttpPathAction> for TargetHttpActionData {
+    fn from(http_path_action: HttpPathAction) -> Self {
+        match http_path_action {
+            HttpPathAction::CloseConnection => TargetHttpActionData::CloseConnection,
+            HttpPathAction::ServeMessage {
+                status_code,
+                status_message,
+                content,
+                response_headers,
+                response_id_header_name,
+            } => TargetHttpActionData::ServeMessage {
+                status_code,
+                status_message,
+                content,
+                response_headers,
+                response_id_header_name,
+            },
+            HttpPathAction::ServeDirectory {
+                path,
+                response_headers,
+                response_id_header_name,
+            } => TargetHttpActionData::ServeDirectory {
+                path,
+                response_headers,
+                response_id_header_name,
+            },
+            HttpPathAction::Forward {
+                target_locations,
+                replacement_path,
+                request_header_patch,
+                response_header_patch,
+                request_id_header_name,
+                response_id_header_name,
+            } => TargetHttpActionData::Forward {
+                location_data: target_locations
+                    .into_iter()
+                    .map(TargetLocationData::from)
+                    .collect(),
+                next_address_index: AtomicUsize::new(0),
+                replacement_path,
+                request_header_patch,
+                response_header_patch,
+                request_id_header_name,
+                response_id_header_name,
+            },
+        }
+    }
 }
 
 struct TlsTargetData {
@@ -97,33 +196,28 @@ pub async fn run_tcp_server(
             TcpAction::Forward { locations } => TargetActionData::Forward {
                 location_data: locations
                     .into_iter()
-                    .map(|target_location| {
-                        let (location, client_tls) = target_location.into_components();
-                        TargetLocationData {
-                            location: location,
-                            tls_connector: match client_tls {
-                                ClientTlsConfig::Enabled => Some(create_connector(true)),
-                                ClientTlsConfig::EnabledWithoutVerify => {
-                                    Some(create_connector(false))
-                                }
-                                ClientTlsConfig::Disabled => None,
-                            },
-                        }
-                    })
+                    .map(TargetLocationData::from)
                     .collect(),
                 next_address_index: AtomicUsize::new(0),
             },
             TcpAction::Http {
                 paths,
-                default_action,
+                default_http_action,
             } => {
                 let mut path_configs = Trie::new();
                 for (path, path_config_vec) in paths {
-                    path_configs.insert(path, path_config_vec);
+                    let path_data_vec = path_config_vec
+                        .into_iter()
+                        .map(|path_config| TargetHttpPathData {
+                            required_request_headers: path_config.required_request_headers,
+                            http_action: path_config.http_action.into(),
+                        })
+                        .collect();
+                    path_configs.insert(path, path_data_vec);
                 }
                 TargetActionData::Http {
                     path_configs,
-                    default_action,
+                    default_http_action: default_http_action.into(),
                 }
             }
         };
@@ -523,9 +617,16 @@ async fn run_stream_action(
         }
         TargetActionData::Http {
             path_configs,
-            default_action,
+            default_http_action,
         } => {
-            panic!("TODO")
+            handle_http_stream(
+                target_data.tcp_nodelay,
+                path_configs,
+                default_http_action,
+                source_stream,
+                addr,
+            )
+            .await
         }
     }
 }
@@ -587,7 +688,7 @@ async fn peek_tls_client_hello(stream: &TcpStream) -> std::io::Result<bool> {
     Ok(false)
 }
 
-async fn setup_target_stream(
+pub async fn setup_target_stream(
     addr: &std::net::SocketAddr,
     target_location: &TargetLocationData,
     tcp_nodelay: bool,
