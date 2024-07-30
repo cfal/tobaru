@@ -74,11 +74,50 @@ impl<'de> serde::de::Deserialize<'de> for Config {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone)]
 pub enum IpMaskSelection {
     Literal(IpMask),
     Group(String),
+}
+
+impl<'de> Deserialize<'de> for IpMaskSelection {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::de::Deserializer<'de>,
+    {
+        struct IpMaskSelectionVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for IpMaskSelectionVisitor {
+            type Value = IpMaskSelection;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("an IP mask or a group name")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                // First, try to parse as an IpMask
+                match value.try_into() {
+                    Ok(ip_mask) => Ok(IpMaskSelection::Literal(ip_mask)),
+                    Err(_) => {
+                        // If it's not a valid IpMask, treat it as a Group
+                        Ok(IpMaskSelection::Group(value.to_string()))
+                    }
+                }
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                self.visit_str(&value)
+            }
+        }
+
+        deserializer.deserialize_str(IpMaskSelectionVisitor)
+    }
 }
 
 impl IpMaskSelection {
@@ -202,14 +241,70 @@ pub struct HttpPathConfig {
     pub http_action: HttpPathAction,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone)]
 pub enum HttpValueMatch {
     Any,
     Single(String),
     Multiple(Vec<String>),
 }
 
+impl<'de> Deserialize<'de> for HttpValueMatch {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct HttpValueMatchVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for HttpValueMatchVisitor {
+            type Value = HttpValueMatch;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a string, an array of strings, or null")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(HttpValueMatch::Single(value.to_string()))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(HttpValueMatch::Single(value))
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut values = Vec::new();
+                while let Some(value) = seq.next_element()? {
+                    values.push(value);
+                }
+                Ok(HttpValueMatch::Multiple(values))
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(HttpValueMatch::Any)
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(HttpValueMatch::Any)
+            }
+        }
+
+        deserializer.deserialize_any(HttpValueMatchVisitor)
+    }
+}
 impl Default for HttpValueMatch {
     fn default() -> Self {
         HttpValueMatch::Any
@@ -287,17 +382,70 @@ pub struct HttpHeaderPatch {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
+pub struct TcpTargetLocationConfig {
+    #[serde(flatten)]
+    pub location: Location,
+
+    #[serde(default)]
+    pub client_tls: ClientTlsConfig,
+}
+
+#[derive(Debug, Clone)]
 pub enum TcpTargetLocation {
     OnlyAddress(NetLocation),
     OnlyPath(PathBuf),
-    Config {
-        #[serde(flatten)]
-        location: Location,
+    Config(TcpTargetLocationConfig),
+}
 
-        #[serde(default)]
-        client_tls: ClientTlsConfig,
-    },
+impl<'de> Deserialize<'de> for TcpTargetLocation {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::de::Deserializer<'de>,
+    {
+        struct TcpTargetLocationVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for TcpTargetLocationVisitor {
+            type Value = TcpTargetLocation;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str(
+                    "a string, an object with 'address' and 'port', or a location config",
+                )
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                // Try to parse as NetLocation
+                if let Ok(net_location) = NetLocation::try_from(value) {
+                    return Ok(TcpTargetLocation::OnlyAddress(net_location));
+                }
+
+                // If not NetLocation, treat as PathBuf
+                Ok(TcpTargetLocation::OnlyPath(PathBuf::from(value)))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                self.visit_str(&value)
+            }
+
+            fn visit_map<M>(self, map: M) -> Result<Self::Value, M::Error>
+            where
+                M: serde::de::MapAccess<'de>,
+            {
+                let config = TcpTargetLocationConfig::deserialize(
+                    serde::de::value::MapAccessDeserializer::new(map),
+                )?;
+                Ok(TcpTargetLocation::Config(config))
+            }
+        }
+
+        deserializer.deserialize_any(TcpTargetLocationVisitor)
+    }
 }
 
 impl TcpTargetLocation {
@@ -309,10 +457,10 @@ impl TcpTargetLocation {
             TcpTargetLocation::OnlyPath(path_buf) => {
                 (Location::Path(path_buf), ClientTlsConfig::default())
             }
-            TcpTargetLocation::Config {
+            TcpTargetLocation::Config(TcpTargetLocationConfig {
                 location,
                 client_tls,
-            } => (location, client_tls),
+            }) => (location, client_tls),
         }
     }
 }
@@ -364,6 +512,13 @@ impl<'de> Deserialize<'de> for ClientTlsConfig {
                     ));
                 }
                 Ok(ClientTlsConfig::EnabledWithoutVerify)
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                self.visit_str(&value)
             }
 
             fn visit_bool<E>(self, v: bool) -> Result<Self::Value, E>
@@ -589,16 +744,16 @@ pub async fn load_url(config_url: &str) -> std::io::Result<ServerConfig> {
 
         match query_key.as_str() {
             "target" | "target-address" => {
-                locations.push(TcpTargetLocation::Config {
+                locations.push(TcpTargetLocation::Config(TcpTargetLocationConfig {
                     location: Location::Address(query_value.as_str().try_into()?),
                     client_tls: ClientTlsConfig::default(),
-                });
+                }));
             }
             "target-path" => {
-                locations.push(TcpTargetLocation::Config {
+                locations.push(TcpTargetLocation::Config(TcpTargetLocationConfig {
                     location: Location::Path(PathBuf::from(query_value)),
                     client_tls: ClientTlsConfig::default(),
-                });
+                }));
             }
             unknown_key => {
                 return Err(std::io::Error::new(
