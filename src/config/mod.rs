@@ -21,15 +21,57 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone)]
 pub enum Config {
     ServerConfig(ServerConfig),
-    IpMaskGroup {
-        group: String,
-        #[serde(alias = "ip_mask")]
-        ip_masks: OneOrSome<IpMaskSelection>,
-    },
+    IpMaskGroup(IpMaskGroupConfig),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct IpMaskGroupConfig {
+    group: String,
+    #[serde(alias = "ip_mask")]
+    ip_masks: OneOrSome<IpMaskSelection>,
+}
+
+impl<'de> serde::de::Deserialize<'de> for Config {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::de::Deserializer<'de>,
+    {
+        struct ConfigVisitor;
+        impl<'de> serde::de::Visitor<'de> for ConfigVisitor {
+            type Value = Config;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("server config or ip mask group config")
+            }
+
+            fn visit_map<V>(self, mut map: V) -> Result<Config, V::Error>
+            where
+                V: serde::de::MapAccess<'de>,
+            {
+                let mut data = serde_json::Map::new();
+
+                while let Some((key, value)) = map.next_entry::<String, serde_json::Value>()? {
+                    data.insert(key, value);
+                }
+
+                if data.contains_key("group") {
+                    let a: IpMaskGroupConfig =
+                        serde_json::from_value(serde_json::Value::Object(data))
+                            .map_err(serde::de::Error::custom)?;
+                    Ok(Config::IpMaskGroup(a))
+                } else {
+                    let b: ServerConfig = serde_json::from_value(serde_json::Value::Object(data))
+                        .map_err(serde::de::Error::custom)?;
+                    Ok(Config::ServerConfig(b))
+                }
+            }
+        }
+
+        deserializer.deserialize_map(ConfigVisitor)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -98,14 +140,14 @@ where
     let mut iter = value.to_socket_addrs().map_err(|e| {
         serde::de::Error::invalid_value(
             serde::de::Unexpected::Other("invalid socket address"),
-            &"invalid socket address",
+            &"valid socket address",
         )
     })?;
 
     let socket_addr = iter.next().ok_or_else(|| {
         serde::de::Error::invalid_value(
             serde::de::Unexpected::Other("unable to resolve socket address"),
-            &"unable to resolve socket address",
+            &"valid socket address",
         )
     })?;
 
@@ -131,7 +173,7 @@ pub enum TargetConfigs {
 pub struct TcpTargetConfig {
     pub allowlist: OneOrSome<IpMaskSelection>,
     // deprecated - use Tcp::Action Forward configuration
-    #[serde(alias = "location", alias = "addresses", alias = "address")]
+    #[serde(default, alias = "location", alias = "addresses", alias = "address")]
     pub locations: NoneOrSome<TcpTargetLocation>,
     #[serde(default, alias = "serverTls")]
     pub server_tls: Option<ServerTlsConfig>,
@@ -144,11 +186,10 @@ pub struct TcpTargetConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum TcpAction {
-    #[serde(alias = "forward")]
     Forward {
+        #[serde(alias = "location", alias = "addresses", alias = "address")]
         locations: OneOrSome<TcpTargetLocation>,
     },
-    #[serde(alias = "http")]
     Http {
         paths: HashMap<String, Vec<HttpPathConfig>>,
         default_http_action: HttpPathAction,
@@ -202,8 +243,11 @@ impl HttpValueMatch {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
 pub enum HttpPathAction {
+    #[serde(alias = "close")]
     CloseConnection,
+    #[serde(alias = "serve-message")]
     ServeMessage {
         status_code: u16,
         status_message: Option<String>,
@@ -211,19 +255,26 @@ pub enum HttpPathAction {
         response_headers: HashMap<String, String>,
         response_id_header_name: Option<String>,
     },
+    #[serde(alias = "serve-directory")]
     ServeDirectory {
         path: String,
         response_headers: HashMap<String, String>,
         response_id_header_name: Option<String>,
     },
+    #[serde(alias = "http-forward")]
     Forward {
         target_locations: OneOrSome<TcpTargetLocation>,
         // replacement paths are best effort - it's entirely possible that absolute paths are specified
         // in the returned content and it would break.
+        #[serde(default)]
         replacement_path: Option<String>,
+        #[serde(default)]
         request_header_patch: Option<HttpHeaderPatch>,
+        #[serde(default)]
         response_header_patch: Option<HttpHeaderPatch>,
+        #[serde(default)]
         request_id_header_name: Option<String>,
+        #[serde(default)]
         response_id_header_name: Option<String>,
     },
 }
@@ -420,10 +471,10 @@ pub async fn load_server_configs(
                 Config::ServerConfig(server_config) => {
                     server_configs.push(server_config);
                 }
-                Config::IpMaskGroup {
+                Config::IpMaskGroup(IpMaskGroupConfig {
                     group,
                     mut ip_masks,
-                } => {
+                }) => {
                     if IpMask::try_from(group.as_str()).is_ok() {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidInput,
@@ -567,10 +618,12 @@ pub async fn load_url(config_url: &str) -> std::io::Result<ServerConfig> {
 
     let tcp_target_config = TcpTargetConfig {
         allowlist: OneOrSome::One(IpMaskSelection::Literal(IpMask::all())),
-        locations: NoneOrSome::Some(locations),
+        locations: NoneOrSome::None,
         server_tls: None,
         tcp_nodelay: true,
-        action: None,
+        action: Some(TcpAction::Forward {
+            locations: OneOrSome::Some(locations),
+        }),
     };
 
     Ok(ServerConfig {
