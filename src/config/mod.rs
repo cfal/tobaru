@@ -214,7 +214,7 @@ pub struct RawTcpActionConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct HttpTcpActionConfig {
     #[serde(default)]
-    pub paths: HashMap<String, Vec<HttpPathConfig>>,
+    pub paths: HashMap<String, OneOrSome<HttpPathConfig>>,
     pub default_http_action: HttpPathAction,
 }
 
@@ -245,7 +245,10 @@ impl<'de> Deserialize<'de> for TcpAction {
             );
         }
 
-        let protocol = map.get("protocol").and_then(|v| v.as_str()).unwrap();
+        let protocol = map
+            .get("protocol")
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
 
         match protocol {
             "raw" => {
@@ -268,8 +271,8 @@ impl<'de> Deserialize<'de> for TcpAction {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct HttpPathConfig {
+    #[serde(default)]
     pub required_request_headers: Option<HashMap<String, HttpValueMatch>>,
-    #[serde(flatten)]
     pub http_action: HttpPathAction,
 }
 
@@ -369,41 +372,116 @@ impl HttpValueMatch {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
+#[derive(Debug, Clone)]
 pub enum HttpPathAction {
-    #[serde(alias = "close")]
     CloseConnection,
-    #[serde(alias = "serve-message")]
-    ServeMessage {
-        status_code: u16,
-        status_message: Option<String>,
-        content: String,
-        response_headers: HashMap<String, String>,
-        response_id_header_name: Option<String>,
-    },
-    #[serde(alias = "serve-directory")]
-    ServeDirectory {
-        path: String,
-        response_headers: HashMap<String, String>,
-        response_id_header_name: Option<String>,
-    },
-    #[serde(alias = "http-forward")]
-    Forward {
-        target_locations: OneOrSome<TcpTargetLocation>,
-        // replacement paths are best effort - it's entirely possible that absolute paths are specified
-        // in the returned content and it would break.
-        #[serde(default)]
-        replacement_path: Option<String>,
-        #[serde(default)]
-        request_header_patch: Option<HttpHeaderPatch>,
-        #[serde(default)]
-        response_header_patch: Option<HttpHeaderPatch>,
-        #[serde(default)]
-        request_id_header_name: Option<String>,
-        #[serde(default)]
-        response_id_header_name: Option<String>,
-    },
+    ServeMessage(HttpServeMessageConfig),
+    ServeDirectory(HttpServeDirectoryConfig),
+    Forward(HttpForwardConfig),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct HttpServeMessageConfig {
+    pub status_code: u16,
+    pub status_message: Option<String>,
+    pub content: String,
+    pub response_headers: HashMap<String, String>,
+    pub response_id_header_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct HttpServeDirectoryConfig {
+    pub path: String,
+    pub response_headers: HashMap<String, String>,
+    pub response_id_header_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct HttpForwardConfig {
+    pub target_locations: OneOrSome<TcpTargetLocation>,
+    #[serde(default)]
+    pub replacement_path: Option<String>,
+    #[serde(default)]
+    pub request_header_patch: Option<HttpHeaderPatch>,
+    #[serde(default)]
+    pub response_header_patch: Option<HttpHeaderPatch>,
+    #[serde(default)]
+    pub request_id_header_name: Option<String>,
+    #[serde(default)]
+    pub response_id_header_name: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for HttpPathAction {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct HttpPathActionVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for HttpPathActionVisitor {
+            type Value = HttpPathAction;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a string 'close' or a map with 'type' field")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if value == "close" {
+                    Ok(HttpPathAction::CloseConnection)
+                } else {
+                    Err(E::invalid_value(serde::de::Unexpected::Str(value), &self))
+                }
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: serde::de::MapAccess<'de>,
+            {
+                let mut json_map = serde_json::Map::new();
+                while let Some((key, value)) = map.next_entry::<String, serde_json::Value>()? {
+                    json_map.insert(key, value);
+                }
+
+                let action_type = json_map
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| serde::de::Error::missing_field("type"))?;
+
+                match action_type {
+                    "close" => Ok(HttpPathAction::CloseConnection),
+                    "serve-message" => {
+                        let config = HttpServeMessageConfig::deserialize(
+                            serde_json::Value::Object(json_map),
+                        )
+                        .map_err(serde::de::Error::custom)?;
+                        Ok(HttpPathAction::ServeMessage(config))
+                    }
+                    "serve-directory" => {
+                        let config = HttpServeDirectoryConfig::deserialize(
+                            serde_json::Value::Object(json_map),
+                        )
+                        .map_err(serde::de::Error::custom)?;
+                        Ok(HttpPathAction::ServeDirectory(config))
+                    }
+                    "http-forward" => {
+                        let config =
+                            HttpForwardConfig::deserialize(serde_json::Value::Object(json_map))
+                                .map_err(serde::de::Error::custom)?;
+                        Ok(HttpPathAction::Forward(config))
+                    }
+                    _ => Err(serde::de::Error::unknown_variant(
+                        action_type,
+                        &["close", "serve-message", "serve-directory", "http-forward"],
+                    )),
+                }
+            }
+        }
+
+        deserializer.deserialize_any(HttpPathActionVisitor)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -18,9 +18,10 @@ use tokio_rustls::LazyConfigAcceptor;
 
 use crate::async_stream::AsyncStream;
 use crate::config::{
-    ClientTlsConfig, HttpHeaderPatch, HttpPathAction, HttpPathConfig, HttpTcpActionConfig,
-    HttpValueMatch, IpMask, IpMaskSelection, Location, NetLocation, RawTcpActionConfig,
-    ServerTlsConfig, TcpAction, TcpTargetConfig, TcpTargetLocation, TlsOption,
+    ClientTlsConfig, HttpForwardConfig, HttpHeaderPatch, HttpPathAction, HttpPathConfig,
+    HttpServeDirectoryConfig, HttpServeMessageConfig, HttpTcpActionConfig, HttpValueMatch, IpMask,
+    IpMaskSelection, Location, NetLocation, RawTcpActionConfig, ServerTlsConfig, TcpAction,
+    TcpTargetConfig, TcpTargetLocation, TlsOption,
 };
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::http::handle_http_stream;
@@ -103,36 +104,36 @@ impl From<HttpPathAction> for TargetHttpActionData {
     fn from(http_path_action: HttpPathAction) -> Self {
         match http_path_action {
             HttpPathAction::CloseConnection => TargetHttpActionData::CloseConnection,
-            HttpPathAction::ServeMessage {
+            HttpPathAction::ServeMessage(HttpServeMessageConfig {
                 status_code,
                 status_message,
                 content,
                 response_headers,
                 response_id_header_name,
-            } => TargetHttpActionData::ServeMessage {
+            }) => TargetHttpActionData::ServeMessage {
                 status_code,
                 status_message,
                 content,
                 response_headers,
                 response_id_header_name,
             },
-            HttpPathAction::ServeDirectory {
+            HttpPathAction::ServeDirectory(HttpServeDirectoryConfig {
                 path,
                 response_headers,
                 response_id_header_name,
-            } => TargetHttpActionData::ServeDirectory {
+            }) => TargetHttpActionData::ServeDirectory {
                 path,
                 response_headers,
                 response_id_header_name,
             },
-            HttpPathAction::Forward {
+            HttpPathAction::Forward(HttpForwardConfig {
                 target_locations,
                 replacement_path,
                 request_header_patch,
                 response_header_patch,
                 request_id_header_name,
                 response_id_header_name,
-            } => TargetHttpActionData::Forward {
+            }) => TargetHttpActionData::Forward {
                 location_data: target_locations
                     .into_iter()
                     .map(TargetLocationData::from)
