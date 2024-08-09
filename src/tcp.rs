@@ -18,9 +18,9 @@ use tokio_rustls::LazyConfigAcceptor;
 
 use crate::async_stream::AsyncStream;
 use crate::config::{
-    ClientTlsConfig, HttpHeaderPatch, HttpPathAction, HttpPathConfig, HttpValueMatch, IpMask,
-    IpMaskSelection, Location, NetLocation, ServerTlsConfig, TcpAction, TcpTargetConfig,
-    TcpTargetLocation, TlsOption,
+    ClientTlsConfig, HttpHeaderPatch, HttpPathAction, HttpPathConfig, HttpTcpActionConfig,
+    HttpValueMatch, IpMask, IpMaskSelection, Location, NetLocation, RawTcpActionConfig,
+    ServerTlsConfig, TcpAction, TcpTargetConfig, TcpTargetLocation, TlsOption,
 };
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::http::handle_http_stream;
@@ -55,7 +55,7 @@ pub struct TargetData {
 }
 
 pub enum TargetActionData {
-    Forward {
+    Raw {
         location_data: Vec<TargetLocationData>,
         next_address_index: AtomicUsize,
     },
@@ -192,18 +192,18 @@ pub async fn run_tcp_server(
             .map(IpMaskSelection::unwrap_literal)
             .collect::<Vec<_>>();
 
-        let action_data = match action.unwrap() {
-            TcpAction::Forward { locations } => TargetActionData::Forward {
+        let action_data = match action {
+            TcpAction::Raw(RawTcpActionConfig { locations }) => TargetActionData::Raw {
                 location_data: locations
                     .into_iter()
                     .map(TargetLocationData::from)
                     .collect(),
                 next_address_index: AtomicUsize::new(0),
             },
-            TcpAction::Http {
+            TcpAction::Http(HttpTcpActionConfig {
                 paths,
                 default_http_action,
-            } => {
+            }) => {
                 let mut path_configs = Trie::new();
                 for (path, path_config_vec) in paths {
                     let path_data_vec = path_config_vec
@@ -565,7 +565,7 @@ async fn run_stream_action(
     target_data: Arc<TargetData>,
 ) -> std::io::Result<()> {
     match &target_data.action_data {
-        TargetActionData::Forward {
+        TargetActionData::Raw {
             location_data,
             next_address_index,
         } => {

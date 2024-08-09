@@ -39,38 +39,23 @@ impl<'de> serde::de::Deserialize<'de> for Config {
     where
         D: serde::de::Deserializer<'de>,
     {
-        struct ConfigVisitor;
-        impl<'de> serde::de::Visitor<'de> for ConfigVisitor {
-            type Value = Config;
+        let mut map = serde_json::Map::deserialize(deserializer)?;
 
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("server config or ip mask group config")
+        if map.contains_key("group") {
+            let config = serde_json::from_value(serde_json::Value::Object(map))
+                .map_err(serde::de::Error::custom)?;
+            Ok(Config::IpMaskGroup(config))
+        } else {
+            if !map.contains_key("transport") {
+                map.insert(
+                    "transport".to_string(),
+                    serde_json::Value::String("tcp".to_string()),
+                );
             }
-
-            fn visit_map<V>(self, mut map: V) -> Result<Config, V::Error>
-            where
-                V: serde::de::MapAccess<'de>,
-            {
-                let mut data = serde_json::Map::new();
-
-                while let Some((key, value)) = map.next_entry::<String, serde_json::Value>()? {
-                    data.insert(key, value);
-                }
-
-                if data.contains_key("group") {
-                    let a: IpMaskGroupConfig =
-                        serde_json::from_value(serde_json::Value::Object(data))
-                            .map_err(serde::de::Error::custom)?;
-                    Ok(Config::IpMaskGroup(a))
-                } else {
-                    let b: ServerConfig = serde_json::from_value(serde_json::Value::Object(data))
-                        .map_err(serde::de::Error::custom)?;
-                    Ok(Config::ServerConfig(b))
-                }
-            }
+            let config = serde_json::from_value(serde_json::Value::Object(map))
+                .map_err(serde::de::Error::custom)?;
+            Ok(Config::ServerConfig(config))
         }
-
-        deserializer.deserialize_map(ConfigVisitor)
     }
 }
 
@@ -211,33 +196,80 @@ pub enum TargetConfigs {
 #[derive(Debug, Clone, Deserialize)]
 pub struct TcpTargetConfig {
     pub allowlist: OneOrSome<IpMaskSelection>,
-    // deprecated - use Tcp::Action Forward configuration
-    #[serde(default, alias = "location", alias = "addresses", alias = "address")]
-    pub locations: NoneOrSome<TcpTargetLocation>,
     #[serde(default, alias = "serverTls")]
     pub server_tls: Option<ServerTlsConfig>,
     #[serde(default = "default_true")]
     pub tcp_nodelay: bool,
-    #[serde(default)]
-    pub action: Option<TcpAction>,
+
+    #[serde(flatten)]
+    pub action: TcpAction,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
+pub struct RawTcpActionConfig {
+    #[serde(alias = "location", alias = "addresses", alias = "address")]
+    pub locations: OneOrSome<TcpTargetLocation>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct HttpTcpActionConfig {
+    #[serde(default)]
+    pub paths: HashMap<String, Vec<HttpPathConfig>>,
+    pub default_http_action: HttpPathAction,
+}
+
+#[derive(Debug, Clone)]
 pub enum TcpAction {
-    Forward {
-        #[serde(alias = "location", alias = "addresses", alias = "address")]
-        locations: OneOrSome<TcpTargetLocation>,
-    },
-    Http {
-        paths: HashMap<String, Vec<HttpPathConfig>>,
-        default_http_action: HttpPathAction,
-    },
+    Raw(RawTcpActionConfig),
+    Http(HttpTcpActionConfig),
+}
+
+impl<'de> Deserialize<'de> for TcpAction {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::de::Deserializer<'de>,
+    {
+        let mut map = serde_json::Map::deserialize(deserializer)?;
+
+        if !map.contains_key("protocol") {
+            map.insert(
+                "protocol".to_string(),
+                serde_json::Value::String(
+                    if map.contains_key("paths") || map.contains_key("default_http_action") {
+                        "http"
+                    } else {
+                        "raw"
+                    }
+                    .to_string(),
+                ),
+            );
+        }
+
+        let protocol = map.get("protocol").and_then(|v| v.as_str()).unwrap();
+
+        match protocol {
+            "raw" => {
+                let config = RawTcpActionConfig::deserialize(serde_json::Value::Object(map))
+                    .map_err(serde::de::Error::custom)?;
+                Ok(TcpAction::Raw(config))
+            }
+            "http" => {
+                let config = HttpTcpActionConfig::deserialize(serde_json::Value::Object(map))
+                    .map_err(serde::de::Error::custom)?;
+                Ok(TcpAction::Http(config))
+            }
+            _ => Err(serde::de::Error::unknown_variant(
+                protocol,
+                &["raw", "http"],
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct HttpPathConfig {
     pub required_request_headers: Option<HashMap<String, HttpValueMatch>>,
+    #[serde(flatten)]
     pub http_action: HttpPathAction,
 }
 
@@ -658,25 +690,6 @@ pub async fn load_server_configs(
                 ref mut targets, ..
             } => {
                 for target in targets.iter_mut() {
-                    if !target.locations.is_empty() {
-                        if target.action.is_some() {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::InvalidInput,
-                                "Target config cannot have both locations and action",
-                            ));
-                        }
-                        let locations = std::mem::replace(&mut target.locations, NoneOrSome::None);
-                        eprintln!("WARNING: locations is deprecated, use action forward instead");
-                        target.action = Some(TcpAction::Forward {
-                            locations: OneOrSome::Some(locations.into_vec()),
-                        });
-                    }
-                    if target.action.is_none() {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidInput,
-                            "Target config must have action",
-                        ));
-                    }
                     IpMaskSelection::replace_groups(&mut target.allowlist, &groups)?;
                 }
             }
@@ -773,10 +786,10 @@ pub async fn load_url(config_url: &str) -> std::io::Result<ServerConfig> {
 
     let tcp_target_config = TcpTargetConfig {
         allowlist: OneOrSome::One(IpMaskSelection::Literal(IpMask::all())),
-        locations: NoneOrSome::None,
+        //forward_locations: NoneOrSome::None,
         server_tls: None,
         tcp_nodelay: true,
-        action: Some(TcpAction::Forward {
+        action: TcpAction::Raw(RawTcpActionConfig {
             locations: OneOrSome::Some(locations),
         }),
     };
