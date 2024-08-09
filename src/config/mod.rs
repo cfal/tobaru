@@ -214,7 +214,7 @@ pub struct RawTcpActionConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct HttpTcpActionConfig {
     #[serde(default)]
-    pub paths: HashMap<String, OneOrSome<HttpPathConfig>>,
+    pub http_paths: HashMap<String, OneOrSome<HttpPathConfig>>,
     pub default_http_action: HttpPathAction,
 }
 
@@ -383,22 +383,29 @@ pub enum HttpPathAction {
 #[derive(Debug, Clone, Deserialize)]
 pub struct HttpServeMessageConfig {
     pub status_code: u16,
+    #[serde(default)]
     pub status_message: Option<String>,
+    #[serde(default)]
     pub content: String,
+    #[serde(default)]
     pub response_headers: HashMap<String, String>,
+    #[serde(default)]
     pub response_id_header_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct HttpServeDirectoryConfig {
     pub path: String,
+    #[serde(default)]
     pub response_headers: HashMap<String, String>,
+    #[serde(default)]
     pub response_id_header_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct HttpForwardConfig {
-    pub target_locations: OneOrSome<TcpTargetLocation>,
+    #[serde(alias = "location", alias = "addresses", alias = "address")]
+    pub locations: OneOrSome<TcpTargetLocation>,
     #[serde(default)]
     pub replacement_path: Option<String>,
     #[serde(default)]
@@ -466,7 +473,7 @@ impl<'de> Deserialize<'de> for HttpPathAction {
                         .map_err(serde::de::Error::custom)?;
                         Ok(HttpPathAction::ServeDirectory(config))
                     }
-                    "http-forward" => {
+                    "forward" => {
                         let config =
                             HttpForwardConfig::deserialize(serde_json::Value::Object(json_map))
                                 .map_err(serde::de::Error::custom)?;

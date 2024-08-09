@@ -127,14 +127,14 @@ impl From<HttpPathAction> for TargetHttpActionData {
                 response_id_header_name,
             },
             HttpPathAction::Forward(HttpForwardConfig {
-                target_locations,
+                locations,
                 replacement_path,
                 request_header_patch,
                 response_header_patch,
                 request_id_header_name,
                 response_id_header_name,
             }) => TargetHttpActionData::Forward {
-                location_data: target_locations
+                location_data: locations
                     .into_iter()
                     .map(TargetLocationData::from)
                     .collect(),
@@ -202,11 +202,11 @@ pub async fn run_tcp_server(
                 next_address_index: AtomicUsize::new(0),
             },
             TcpAction::Http(HttpTcpActionConfig {
-                paths,
+                http_paths,
                 default_http_action,
             }) => {
                 let mut path_configs = Trie::new();
-                for (path, path_config_vec) in paths {
+                for (path, path_config_vec) in http_paths {
                     let path_data_vec = path_config_vec
                         .into_iter()
                         .map(|path_config| TargetHttpPathData {
