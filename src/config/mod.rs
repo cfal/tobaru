@@ -801,13 +801,6 @@ pub async fn load_url(config_url: &str) -> std::io::Result<ServerConfig> {
         )
     })?;
 
-    if url.scheme() != "tcp" {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "URL format only supports TCP",
-        ));
-    }
-
     let host_str = url.host_str().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -832,59 +825,110 @@ pub async fn load_url(config_url: &str) -> std::io::Result<ServerConfig> {
             )
         })?;
 
-    let mut locations = vec![];
+    match url.scheme() {
+        "tcp" => {
+            let mut locations = vec![];
 
-    for (query_key, query_value) in url.query_pairs().into_owned() {
-        let query_value = percent_decode_str(&query_value)
-            .decode_utf8()
-            .unwrap()
-            .into_owned();
+            for (query_key, query_value) in url.query_pairs().into_owned() {
+                let query_value = percent_decode_str(&query_value)
+                    .decode_utf8()
+                    .unwrap()
+                    .into_owned();
 
-        match query_key.as_str() {
-            "target" | "target-address" => {
-                locations.push(TcpTargetLocation::Config(TcpTargetLocationConfig {
-                    location: Location::Address(query_value.as_str().try_into()?),
-                    client_tls: ClientTlsConfig::default(),
-                }));
+                match query_key.as_str() {
+                    "target" | "target-address" => {
+                        locations.push(TcpTargetLocation::Config(TcpTargetLocationConfig {
+                            location: Location::Address(query_value.as_str().try_into()?),
+                            client_tls: ClientTlsConfig::default(),
+                        }));
+                    }
+                    "target-path" => {
+                        locations.push(TcpTargetLocation::Config(TcpTargetLocationConfig {
+                            location: Location::Path(PathBuf::from(query_value)),
+                            client_tls: ClientTlsConfig::default(),
+                        }));
+                    }
+                    unknown_key => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!("unknown TCP URL query key: {}", unknown_key),
+                        ));
+                    }
+                }
             }
-            "target-path" => {
-                locations.push(TcpTargetLocation::Config(TcpTargetLocationConfig {
-                    location: Location::Path(PathBuf::from(query_value)),
-                    client_tls: ClientTlsConfig::default(),
-                }));
-            }
-            unknown_key => {
+
+            if locations.is_empty() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    format!("unknown URL query key: {}", unknown_key),
+                    "No target locations specified in URL query",
                 ));
             }
+
+            let tcp_target_config = TcpTargetConfig {
+                allowlist: OneOrSome::One(IpMaskSelection::Literal(IpMask::all())),
+                //forward_locations: NoneOrSome::None,
+                server_tls: None,
+                tcp_nodelay: true,
+                action: TcpAction::Raw(RawTcpActionConfig {
+                    locations: OneOrSome::Some(locations),
+                }),
+            };
+
+            Ok(ServerConfig {
+                address,
+                use_iptables: false,
+                target_configs: TargetConfigs::Tcp {
+                    tcp_nodelay: true,
+                    targets: OneOrSome::One(tcp_target_config),
+                },
+            })
         }
-    }
+        "udp" => {
+            let mut addresses = vec![];
 
-    if locations.is_empty() {
-        return Err(std::io::Error::new(
+            for (query_key, query_value) in url.query_pairs().into_owned() {
+                let query_value = percent_decode_str(&query_value)
+                    .decode_utf8()
+                    .unwrap()
+                    .into_owned();
+
+                match query_key.as_str() {
+                    "target" | "target-address" => {
+                        addresses.push(query_value.as_str().try_into()?);
+                    }
+                    unknown_key => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!("unknown UDP URL query key: {}", unknown_key),
+                        ));
+                    }
+                }
+            }
+
+            if addresses.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "No target addresses specified in URL query",
+                ));
+            }
+
+            let udp_target_config = UdpTargetConfig {
+                addresses: OneOrSome::Some(addresses),
+                allowlist: OneOrSome::One(IpMaskSelection::Literal(IpMask::all())),
+                association_timeout_secs: None,
+            };
+
+            Ok(ServerConfig {
+                address,
+                use_iptables: false,
+                target_configs: TargetConfigs::Udp {
+                    targets: OneOrSome::One(udp_target_config),
+                },
+            })
+        }
+        unknown_scheme => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "No target locations specified in URL query",
-        ));
+            format!("Unknown URL scheme: {}", unknown_scheme),
+        )),
     }
-
-    let tcp_target_config = TcpTargetConfig {
-        allowlist: OneOrSome::One(IpMaskSelection::Literal(IpMask::all())),
-        //forward_locations: NoneOrSome::None,
-        server_tls: None,
-        tcp_nodelay: true,
-        action: TcpAction::Raw(RawTcpActionConfig {
-            locations: OneOrSome::Some(locations),
-        }),
-    };
-
-    Ok(ServerConfig {
-        address,
-        use_iptables: false,
-        target_configs: TargetConfigs::Tcp {
-            tcp_nodelay: true,
-            targets: OneOrSome::One(tcp_target_config),
-        },
-    })
 }
