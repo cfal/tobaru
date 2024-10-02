@@ -1,0 +1,56 @@
+# using tobaru's html forwarding for bookmarks, inspired by https://github.com/yourselfhosted/slash
+#
+# $ curl -v http://127.0.0.1:8080/
+# *   Trying 127.0.0.1:8080...
+# * Connected to 127.0.0.1 (127.0.0.1) port 8080
+# > GET / HTTP/1.1
+# > Host: 127.0.0.1:8080
+# > User-Agent: curl/8.5.0
+# > Accept: */*
+# >
+# < HTTP/1.1 302 Default Bookmark
+# < Location: https://example.com
+# < transfer-encoding: chunked
+# < connection: close
+# <
+# * Closing connection
+#
+# $ curl -v http://127.0.0.1:8080/google
+# *   Trying 127.0.0.1:8080...
+# * Connected to 127.0.0.1 (127.0.0.1) port 8080
+# > GET /google HTTP/1.1
+# > Host: 127.0.0.1:8080
+# > User-Agent: curl/8.5.0
+# > Accept: */*
+# >
+# < HTTP/1.1 302
+# < Location: https://google.com
+# < transfer-encoding: chunked
+# < connection: close
+# <
+# * Closing connection
+
+- address: 127.0.0.1:8080
+  iptables: false
+  target:
+    allowlist: 0.0.0.0/0
+    http_paths:
+      /google:
+        http_action:
+          type: serve-message
+          status_code: 302
+          response_headers:
+            Location: https://google.com
+      /bing:
+        http_action:
+          type: serve-message
+          status_code: 302
+          response_headers:
+            Location: https://bing.com
+    # serve a redirect to https://example.com for all paths that don't match.
+    default_http_action:
+      type: serve-message
+      status_code: 302
+      status_message: Default Bookmark
+      response_headers:
+        Location: https://example.com
