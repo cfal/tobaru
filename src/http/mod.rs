@@ -138,11 +138,14 @@ pub async fn handle_http_stream(
                         .push_str("transfer-encoding: chunked\r\nconnection: close\r\n\r\n");
                     stream.write_all(&error_response.into_bytes()).await?;
                     if verb != "HEAD" {
-                        stream
-                            .write_all(&format!("{:X}\r\n", content.len()).into_bytes())
-                            .await?;
-                        stream.write_all(content.as_bytes()).await?;
-                        stream.write_all(b"\r\n0\r\n\r\n").await?;
+                        if content.len() > 0 {
+                            stream
+                                .write_all(&format!("{:X}\r\n", content.len()).into_bytes())
+                                .await?;
+                            stream.write_all(content.as_bytes()).await?;
+                            stream.write_all(b"\r\n").await?;
+                        }
+                        stream.write_all(b"0\r\n\r\n").await?;
                     }
                 }
 
