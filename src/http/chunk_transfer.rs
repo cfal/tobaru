@@ -1,15 +1,17 @@
 use std::collections::HashMap;
 
-use memchr::memmem;
+use memchr::{memchr, memmem};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
-// 8 byte length + \r\n. max chunk size is 0xffffffff which is over 4gb.
-const CHUNK_SIZE_LEN: usize = 10;
+// 8 byte length + \r\n = 10 bytes. max chunk size is 0xffffffff which is over 4gb.
+// We need to support semi-colon delimited chunk extensions, expect at most 64 bytes.
+// TODO: is that enough?
+const CHUNK_SIZE_LINE_MAX_LEN: usize = 10 + 64;
 const TRAILER_HEADER_LEN: usize = 4096;
 
 pub struct ChunkTransfer {
     state: ChunkTransferState,
-    read_size_buf: [u8; CHUNK_SIZE_LEN],
+    read_size_buf: Vec<u8>,
     trailer_header_buf: [u8; TRAILER_HEADER_LEN],
     trailer_headers: HashMap<String, String>,
 }
@@ -33,7 +35,7 @@ impl ChunkTransfer {
     pub fn new() -> Self {
         Self {
             state: ChunkTransferState::ReadSize { cached_len: 0 },
-            read_size_buf: [0u8; CHUNK_SIZE_LEN],
+            read_size_buf: Vec::with_capacity(CHUNK_SIZE_LINE_MAX_LEN),
             trailer_header_buf: [0u8; TRAILER_HEADER_LEN],
             trailer_headers: HashMap::new(),
         }
@@ -56,82 +58,123 @@ impl ChunkTransfer {
 
             match self.state {
                 ReadSize { cached_len } => {
-                    let copy_len = std::cmp::min(CHUNK_SIZE_LEN - cached_len, unused.len());
-                    let new_cached_len = cached_len + copy_len;
-                    self.read_size_buf[cached_len..new_cached_len]
-                        .copy_from_slice(&unused[0..copy_len]);
+                    // Determine how much we can copy without exceeding the buffer capacity
+                    let space_available = CHUNK_SIZE_LINE_MAX_LEN.saturating_sub(cached_len);
+                    let copy_len = std::cmp::min(space_available, unused.len());
 
-                    match memmem::find(&self.read_size_buf[0..new_cached_len], b"\r\n") {
-                        Some(i) => {
-                            if i == 0 {
+                    // Append new data to the vector buffer
+                    self.read_size_buf.extend_from_slice(&unused[0..copy_len]);
+                    let new_cached_len = self.read_size_buf.len(); // Vector keeps track of its length
+
+                    match memmem::find(&self.read_size_buf, b"\r\n") {
+                        Some(crlf_index) => {
+                            // Found the end of the chunk size line (including extensions)
+
+                            // The complete chunk size line content (excluding CRLF)
+                            let line_slice = &self.read_size_buf[0..crlf_index];
+
+                            if line_slice.is_empty() {
                                 return Err(std::io::Error::new(
-                                    std::io::ErrorKind::Other,
-                                    "no chunk length",
+                                    std::io::ErrorKind::InvalidData, // Use InvalidData for parse errors
+                                    "empty chunk size line",
                                 ));
                             }
 
-                            let hex_str = match std::str::from_utf8(&self.read_size_buf[0..i]) {
+                            // Find the end of the hex part (first ';' or end of line)
+                            let hex_end_index =
+                                memchr(b';', line_slice).unwrap_or(line_slice.len()); // If no ';', hex part is the whole line slice
+
+                            let hex_part_slice = &line_slice[0..hex_end_index];
+
+                            // Check if the hex part itself is empty (e.g., ";extension\r\n")
+                            if hex_part_slice.is_empty() {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "chunk size hex part is empty",
+                                ));
+                            }
+
+                            // Parse only the hex part
+                            let hex_str = match std::str::from_utf8(hex_part_slice) {
                                 Ok(s) => s,
                                 Err(e) => {
                                     return Err(std::io::Error::new(
-                                        std::io::ErrorKind::Other,
-                                        format!("invalid hex string: {}", e),
+                                        std::io::ErrorKind::InvalidData,
+                                        format!("invalid utf8 in chunk size hex part: {}", e),
                                     ));
                                 }
                             };
 
-                            let chunk_len = match usize::from_str_radix(hex_str, 16) {
+                            // RFC 7230 Section 4.1.1: Parsers MAY ignore leading/trailing whitespace
+                            let trimmed_hex_str = hex_str.trim();
+                            if trimmed_hex_str.is_empty() {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "chunk size hex part is empty after trim",
+                                ));
+                            }
+
+                            let chunk_len = match usize::from_str_radix(trimmed_hex_str, 16) {
                                 Ok(len) => len,
                                 Err(e) => {
                                     return Err(std::io::Error::new(
-                                        std::io::ErrorKind::Other,
-                                        format!("invalid hex size ({}): {}", hex_str, e),
+                                        std::io::ErrorKind::InvalidData,
+                                        format!("invalid hex size ('{}'): {}", trimmed_hex_str, e),
                                     ));
                                 }
                             };
 
-                            // the hex string and \r\n
-                            let size_header_len = i + 2;
+                            // The total length of the size line including extensions and \r\n
+                            let size_header_len = crlf_index + 2;
 
                             if let Some(ref mut forward_stream) = maybe_forward_stream {
-                                // forward the size header.
                                 forward_stream
                                     .write_all(&self.read_size_buf[0..size_header_len])
                                     .await?;
                             }
 
-                            // this many new bytes were consumed to get to the full size header
-                            let used_len = size_header_len - cached_len;
+                            let used_from_unused = size_header_len - cached_len;
+                            start_offset += used_from_unused;
 
-                            start_offset += used_len;
+                            // Reset the size buffer for the next chunk size line
+                            self.read_size_buf.clear();
 
+                            // Transition to the next state
                             if chunk_len > 0 {
                                 self.state = ChunkTransferState::ReadData {
                                     chunk_len,
                                     // provided chunk length doesn't include \r\n, but we want to
-                                    // include it when forwarding.
-                                    remaining_len: chunk_len + 2,
+                                    // include it when forwarding the data chunk itself.
+                                    remaining_len: chunk_len + 2, // +2 for data's CRLF
                                 };
                             } else {
-                                // https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Trailer
+                                // Zero chunk indicates end of data, potentially followed by trailers
+                                // ref: https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Trailers
                                 self.state = ChunkTransferState::ReadTrailer { cached_len: 0 };
                             }
                         }
                         None => {
-                            if new_cached_len == self.read_size_buf.len() {
+                            // CRLF not found yet.
+                            if self.read_size_buf.len() >= CHUNK_SIZE_LINE_MAX_LEN {
+                                // Buffer is full, but still no CRLF
                                 return Err(std::io::Error::new(
                                     std::io::ErrorKind::Other,
-                                    "could not read chunk length in initial bytes",
+                                    format!(
+                                        "chunk size line exceeded max length ({}) without CRLF",
+                                        CHUNK_SIZE_LINE_MAX_LEN
+                                    ),
                                 ));
                             }
+
                             self.state = ChunkTransferState::ReadSize {
                                 cached_len: new_cached_len,
                             };
 
-                            start_offset += copy_len;
+                            // We consumed all the data provided in this `run` call (`unused`)
+                            start_offset += copy_len; // Consume the bytes we copied
 
                             // If we got here, we've used all the data, the read size buf is still
-                            // waiting for a crlf, and we should break out automatically.
+                            // waiting for a crlf, and we should break out of the while loop.
                             assert!(start_offset == data.len());
                         }
                     }
@@ -149,8 +192,10 @@ impl ChunkTransfer {
                     start_offset += forward_len;
 
                     if new_remaining_len == 0 {
+                        // Finished reading chunk data + CRLF, go back to reading size
                         self.state = ChunkTransferState::ReadSize { cached_len: 0 };
                     } else {
+                        // Still more data needed for this chunk
                         self.state = ChunkTransferState::ReadData {
                             chunk_len,
                             remaining_len: new_remaining_len,
@@ -166,76 +211,88 @@ impl ChunkTransfer {
 
                     match memmem::find(&self.trailer_header_buf[0..new_cached_len], b"\r\n") {
                         Some(i) => {
-                            let size_header_len = i + 2;
+                            let trailer_line_len = i + 2; // Includes CRLF
 
                             if let Some(ref mut forward_stream) = maybe_forward_stream {
                                 forward_stream
-                                    .write_all(&self.trailer_header_buf[0..size_header_len])
+                                    .write_all(&self.trailer_header_buf[0..trailer_line_len])
                                     .await?;
                             }
 
-                            // this many new bytes were consumed to get to the full size header
-                            let used_len = size_header_len - cached_len;
-
+                            // Bytes consumed from the current `unused` slice
+                            let used_len = trailer_line_len - cached_len;
                             start_offset += used_len;
 
                             if i > 0 {
+                                // Process the trailer header line (content before CRLF)
                                 let trailer_header_str =
                                     match std::str::from_utf8(&self.trailer_header_buf[0..i]) {
                                         Ok(s) => s,
                                         Err(e) => {
                                             return Err(std::io::Error::new(
-                                                std::io::ErrorKind::Other,
-                                                format!("failed to parse trailer header: {}", e),
+                                                std::io::ErrorKind::InvalidData, // Use InvalidData
+                                                format!(
+                                                    "failed to parse trailer header utf8: {}",
+                                                    e
+                                                ),
                                             ));
                                         }
                                     };
+                                // Basic parsing, could be more robust (e.g., handling LWS)
                                 let tokens: Vec<&str> = trailer_header_str.splitn(2, ':').collect();
                                 if tokens.len() != 2 {
                                     return Err(std::io::Error::new(
-                                        std::io::ErrorKind::Other,
-                                        format!("invalid trailer header: {}", trailer_header_str),
+                                        std::io::ErrorKind::InvalidData, // Use InvalidData
+                                        format!(
+                                            "invalid trailer header format: {}",
+                                            trailer_header_str
+                                        ),
                                     ));
                                 }
                                 let header_key = tokens[0].trim().to_lowercase();
-                                let header_value = tokens[1].trim().to_string();
+                                let header_value = tokens[1].trim().to_string(); // Store trimmed value
+
+                                // Prevent overwriting standard headers if they appear as trailers
+                                // (Though RFC allows it, some intermediaries might strip them)
+                                // TODO: Consider if specific trailers should be disallowed.
                                 self.trailer_headers.insert(header_key, header_value);
 
                                 self.state = ChunkTransferState::ReadTrailer { cached_len: 0 };
                             } else {
-                                // i == 0 - empty line
-                                // we've reached the end of the request/response
+                                // i == 0 means an empty line "\r\n" was found, signaling the end
                                 self.state = ChunkTransferState::Done;
                             }
                         }
                         None => {
+                            // CRLF not found yet
                             if new_cached_len == self.trailer_header_buf.len() {
                                 return Err(std::io::Error::new(
-                                    std::io::ErrorKind::Other,
-                                    "could not read trailer header, line too long",
+                                    std::io::ErrorKind::Other, // Or InvalidData?
+                                    "could not read trailer header, line exceeded max length",
                                 ));
                             }
+
                             self.state = ChunkTransferState::ReadTrailer {
                                 cached_len: new_cached_len,
                             };
 
-                            start_offset += copy_len;
+                            start_offset += copy_len; // Consume the copied bytes
 
-                            // If we got here, we've used all the data, the read size buf is still
-                            // waiting for a crlf, and we should break out automatically.
+                            // Expect to break out of the loop as all `unused` data was consumed
                             assert!(start_offset == data.len());
                         }
                     }
                 }
 
                 Done => {
+                    // If we are already Done, any further data is an error
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::Other,
-                        "extra data after chunked transfer ended",
+                        "extra data received after chunked transfer completion",
                     ));
                 }
             }
-        }
+        } // end while start_offset < data.len()
 
         Ok(())
     }
@@ -311,7 +368,24 @@ mod tests {
         };
         let mut final_result = Ok(());
 
-        for fragment in input_fragments {
+        for (i, fragment) in input_fragments.iter().enumerate() {
+            // Check if we are already done *before* calling run again
+            if transfer.is_done() && !fragment.is_empty() {
+                // If already done and there's more data, it might be an error depending on protocol
+                // The `run` method itself handles data after Done *within* a single call.
+                // This simulates receiving more data *after* completion.
+                final_result = Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Extra data fragment {} received after completion", i),
+                ));
+                break;
+            }
+
+            if fragment.is_empty() {
+                // Skip empty fragments if any
+                continue;
+            }
+
             let mut opt_writer_ref = writer.as_mut();
             match transfer.run(fragment, &mut opt_writer_ref).await {
                 Ok(_) => {}
@@ -320,15 +394,16 @@ mod tests {
                     break; // Stop processing on first error
                 }
             }
-            // Break early if done, simulating connection closure potentially
-            if transfer.is_done() && final_result.is_ok() {
-                // Check if there's unexpected data remaining in the current fragment
-                // Note: This check depends on how the caller would handle extra data.
-                // Here, we assume any data *after* Done is an error if run is called again.
-                // The original code has an error check *inside* run for extra data within a single call
-                // after trailers. This test simulates calling run *again* after Done.
-                // For a more robust test, we'd need to know the exact calling pattern.
-            }
+        }
+
+        // Check for error if not done after all fragments processed (unless error already occurred)
+        if final_result.is_ok() && !transfer.is_done() {
+            // Special case: Input might be valid but incomplete (e.g. missing final 0\r\n\r\n)
+            // We consider this an error for testing purposes, assuming complete streams.
+            final_result = Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof, // More specific?
+                "Transfer did not reach Done state after all fragments",
+            ));
         }
 
         let written_data = if let Some(w) = writer {
@@ -346,7 +421,7 @@ mod tests {
         let expected_forward = input; // Expect everything to be forwarded
         let (result, mut transfer, written_data) = run_transfer_fragmented(&[input], true).await;
 
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "Result was: {:?}", result);
         assert!(transfer.is_done());
         assert_eq!(written_data.unwrap(), expected_forward);
         assert!(transfer.trailer_headers().is_empty());
@@ -358,7 +433,7 @@ mod tests {
         let expected_forward = input;
         let (result, mut transfer, written_data) = run_transfer_fragmented(&[input], true).await;
 
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "Result was: {:?}", result);
         assert!(transfer.is_done());
         assert_eq!(written_data.unwrap(), expected_forward);
         assert!(transfer.trailer_headers().is_empty());
@@ -370,7 +445,7 @@ mod tests {
         let expected_forward = input;
         let (result, mut transfer, written_data) = run_transfer_fragmented(&[input], true).await;
 
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "Result was: {:?}", result);
         assert!(transfer.is_done());
         assert_eq!(written_data.unwrap(), expected_forward);
         assert!(transfer.trailer_headers().is_empty());
@@ -382,19 +457,14 @@ mod tests {
         let expected_forward = b"A\r\n0123456789\r\n0\r\n\r\n";
         let (result, transfer, written_data) = run_transfer_fragmented(&fragments, true).await;
 
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "Result was: {:?}", result);
         assert!(transfer.is_done());
         assert_eq!(written_data.unwrap(), expected_forward);
     }
 
     #[tokio::test]
     async fn test_fragmented_size_line_mid_hex() {
-        let fragments = [
-            b"A".as_slice(),
-            b"B\r\n".as_slice(),
-            b"Data chunk...\r\n0\r\n\r\n".as_slice(),
-        ]; // Example, assumes chunk len 0xAB
-        let expected_len = 0xAB;
+        let expected_len = 0xAB; // 171 bytes
         let chunk_data = vec![b'X'; expected_len];
         let mut full_input = Vec::new();
         full_input.extend_from_slice(b"AB\r\n");
@@ -427,7 +497,7 @@ mod tests {
         let expected_forward = b"A\r\n0123456789\r\n0\r\n\r\n";
         let (result, transfer, written_data) = run_transfer_fragmented(&fragments, true).await;
 
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "Result was: {:?}", result);
         assert!(transfer.is_done());
         assert_eq!(written_data.unwrap(), expected_forward);
     }
@@ -438,7 +508,7 @@ mod tests {
         let expected_forward = b"A\r\n0123456789\r\n0\r\n\r\n";
         let (result, transfer, written_data) = run_transfer_fragmented(&fragments, true).await;
 
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "Result was: {:?}", result);
         assert!(transfer.is_done());
         assert_eq!(written_data.unwrap(), expected_forward);
     }
@@ -449,7 +519,7 @@ mod tests {
         let expected_forward = b"A\r\n0123456789\r\n0\r\n\r\n";
         let (result, transfer, written_data) = run_transfer_fragmented(&fragments, true).await;
 
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "Result was: {:?}", result);
         assert!(transfer.is_done());
         assert_eq!(written_data.unwrap(), expected_forward);
     }
@@ -460,7 +530,7 @@ mod tests {
         let expected_forward = b"0\r\n\r\n";
         let (result, transfer, written_data) = run_transfer_fragmented(&fragments, true).await;
 
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "Result was: {:?}", result);
         assert!(transfer.is_done());
         assert_eq!(written_data.unwrap(), expected_forward);
     }
@@ -470,7 +540,7 @@ mod tests {
         let input = b"3\r\nABC\r\n0\r\nTrailer-Key: Trailer Value\r\nAnother: Yes\r\n\r\n";
         let (result, mut transfer, written_data) = run_transfer_fragmented(&[input], true).await;
 
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "Result was: {:?}", result);
         assert!(transfer.is_done());
         assert_eq!(written_data.unwrap(), input);
         assert_eq!(transfer.trailer_headers().len(), 2);
@@ -496,7 +566,7 @@ mod tests {
             b"3\r\nABC\r\n0\r\nTrailer-Key: Trailer Value\r\nAnother: Yes\r\n\r\n";
         let (result, mut transfer, written_data) = run_transfer_fragmented(&fragments, true).await;
 
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "Result was: {:?}", result);
         assert!(transfer.is_done());
         assert_eq!(written_data.unwrap(), expected_forward);
         assert_eq!(transfer.trailer_headers().len(), 2);
@@ -515,7 +585,7 @@ mod tests {
         let input = b"A\r\n0123456789\r\n0\r\n\r\n";
         let (result, mut transfer, written_data) = run_transfer_fragmented(&[input], false).await;
 
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "Result was: {:?}", result);
         assert!(transfer.is_done());
         assert!(written_data.is_none()); // No writer was provided
         assert!(transfer.trailer_headers().is_empty());
@@ -527,31 +597,47 @@ mod tests {
         let (result, transfer, _) = run_transfer_fragmented(&[input], true).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::Other);
-        assert!(err.to_string().contains("invalid hex size"));
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("invalid hex size ('G')"));
         assert!(!transfer.is_done()); // Should not be done on error
     }
 
     #[tokio::test]
-    async fn test_error_empty_size_line() {
+    async fn test_error_empty_size_line_content() {
+        // Only CRLF on the size line
         let input = b"\r\nData\r\n";
         let (result, transfer, _) = run_transfer_fragmented(&[input], true).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::Other);
-        assert!(err.to_string().contains("no chunk length"));
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("empty chunk size line"));
+        assert!(!transfer.is_done());
+    }
+
+    #[tokio::test]
+    async fn test_error_size_line_only_extension() {
+        // Starts with ';', no hex part
+        let input = b";extension\r\nData\r\n";
+        let (result, transfer, _) = run_transfer_fragmented(&[input], true).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("chunk size hex part is empty"));
         assert!(!transfer.is_done());
     }
 
     #[tokio::test]
     async fn test_error_size_line_too_long() {
-        // CHUNK_SIZE_LEN is 10. Input > 10 bytes before \r\n
-        let input = b"1234567890A\r\nData\r\n";
-        let (result, transfer, _) = run_transfer_fragmented(&[input], true).await;
+        // CHUNK_SIZE_LINE_MAX_LEN is 64. Input > 64 bytes before \r\n
+        let long_line = vec![b'1'; CHUNK_SIZE_LINE_MAX_LEN];
+        let mut input = long_line;
+        input.extend_from_slice(b"A\r\nData\r\n"); // Add one more byte to exceed limit
+
+        let (result, transfer, _) = run_transfer_fragmented(&[&input], true).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::Other);
-        assert!(err.to_string().contains("could not read chunk length")); // Error occurs when buffer fills without finding CRLF
+        assert_eq!(err.kind(), std::io::ErrorKind::Other); // Buffer full error
+        assert!(err.to_string().contains("exceeded max length"));
         assert!(!transfer.is_done());
     }
 
@@ -566,10 +652,10 @@ mod tests {
         let (result, transfer, _) = run_transfer_fragmented(&[&input], true).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert_eq!(err.kind(), std::io::ErrorKind::Other); // Buffer full error
         assert!(err
             .to_string()
-            .contains("could not read trailer header, line too long"));
+            .contains("could not read trailer header, line exceeded max length"));
         assert!(!transfer.is_done());
     }
 
@@ -579,23 +665,41 @@ mod tests {
         let (result, transfer, _) = run_transfer_fragmented(&[input], true).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::Other);
-        assert!(err.to_string().contains("invalid trailer header"));
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("invalid trailer header format"));
         assert!(!transfer.is_done());
     }
 
     #[tokio::test]
-    async fn test_error_data_after_final_trailer_crlf() {
+    async fn test_error_data_after_final_trailer_crlf_same_run() {
         // This error happens if more data is provided *within the same `run` call* after the final \r\n
         let input = b"0\r\nTrailer: Val\r\n\r\nExtraData";
+        // run_transfer_fragmented calls run once for the whole slice
         let (result, transfer, _) = run_transfer_fragmented(&[input], true).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::Other);
         assert!(err
             .to_string()
-            .contains("extra data after chunked transfer ended"));
-        assert_eq!(transfer.state, ChunkTransferState::Done); // State becomes Done just before the error
+            .contains("extra data received after chunked transfer completion"));
+        // State becomes Done *before* the error check for extra data within the *same* run call.
+        assert_eq!(transfer.state, ChunkTransferState::Done);
+    }
+
+    #[tokio::test]
+    async fn test_error_data_after_final_trailer_crlf_separate_run() {
+        // This error happens if more data is provided *in a subsequent `run` call* after the final \r\n
+        let fragments = [b"0\r\n\r\n".as_slice(), b"ExtraData".as_slice()];
+        // run_transfer_fragmented calls run for each fragment
+        let (result, transfer, _) = run_transfer_fragmented(&fragments, true).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        // This error comes from the helper function detecting data after done state was reached.
+        assert!(err
+            .to_string()
+            .contains("Extra data fragment 1 received after completion"));
+        assert!(transfer.is_done()); // Should be done after the first fragment
     }
 
     #[tokio::test]
@@ -609,71 +713,91 @@ mod tests {
             transfer.state,
             ChunkTransferState::ReadSize { cached_len: 0 }
         );
+        assert!(transfer.read_size_buf.is_empty());
 
-        // 1. Send partial size
+        // 1. Send partial size "A"
         transfer.run(b"A", &mut opt_writer_ref).await.unwrap();
         assert_eq!(
             transfer.state,
-            ChunkTransferState::ReadSize { cached_len: 1 }
+            ChunkTransferState::ReadSize { cached_len: 1 } // State reflects vec len
         );
-        assert_eq!(&transfer.read_size_buf[0..1], b"A");
+        assert_eq!(&transfer.read_size_buf, b"A");
 
-        // 2. Send rest of size and partial data
+        // 2. Send rest of size ("\r\n") and partial data ("0123")
+        // Input: b"\r\n0123"
         transfer
             .run(b"\r\n0123", &mut opt_writer_ref)
             .await
             .unwrap();
-        // State should now be ReadData, expecting A (10) bytes + 2 (\r\n) = 12 bytes total for this chunk
-        // We forwarded 4 bytes (0123), so 8 remaining.
+        // Should have parsed "A" (10), forwarded "A\r\n". Consumed "\r\n" from input.
+        // Then started reading data. Forwarded "0123". Consumed "0123" from input.
+        // State should now be ReadData, expecting 10 bytes total chunk data + 2 (\r\n) = 12 bytes.
+        // We forwarded 4 bytes data ("0123"), so 12 - 4 = 8 remaining (6 data + CRLF).
         match transfer.state {
             ChunkTransferState::ReadData {
                 chunk_len,
                 remaining_len,
             } => {
                 assert_eq!(chunk_len, 10);
-                assert_eq!(remaining_len, 10 + 2 - 4); // chunk_len + \r\n - forwarded
+                assert_eq!(remaining_len, 10 + 2 - 4); // chunk_len + \r\n - forwarded_data
             }
             _ => panic!("Incorrect state: {:?}", transfer.state),
         }
+        assert!(transfer.read_size_buf.is_empty()); // Size buf cleared
 
-        // 3. Send rest of data and partial next size
+        // 3. Send rest of data ("456789\r\n") and partial next size ("5\r")
+        // Input: b"456789\r\n5\r"
         transfer
             .run(b"456789\r\n5\r", &mut opt_writer_ref)
             .await
             .unwrap();
-        // Should have finished previous chunk, read next size (5), waiting for \n
+        // Should have forwarded "456789\r\n". Consumed "456789\r\n" from input. Chunk finished.
+        // Started reading next size. Read "5\r". Consumed "5\r" from input.
+        // Waiting for "\n" for the size line.
         assert_eq!(
             transfer.state,
-            ChunkTransferState::ReadSize { cached_len: 2 }
-        ); // "5\r" length is 2
-        assert_eq!(&transfer.read_size_buf[0..2], b"5\r"); // Should have consumed 5\r fully
+            ChunkTransferState::ReadSize { cached_len: 2 } // State reflects vec len
+        );
+        assert_eq!(&transfer.read_size_buf, b"5\r"); // Contains "5\r"
 
-        // 4. Send rest of size and all data for second chunk + zero chunk + partial trailer
+        // 4. Send rest of size ("\n"), all data for second chunk ("ABCDE\r\n"), zero chunk ("0\r\n"), and partial trailer ("Trailer:")
+        // Input: b"\nABCDE\r\n0\r\nTrailer:"
         transfer
             .run(b"\nABCDE\r\n0\r\nTrailer:", &mut opt_writer_ref)
             .await
             .unwrap();
+        // Should parse size 5. Forward "5\r\n". Consume "\n".
+        // Read data + CRLF. Forward "ABCDE\r\n". Consume "ABCDE\r\n".
+        // Read size 0. Forward "0\r\n". Consume "0\r\n".
+        // Start reading trailers. Read "Trailer:". Consume "Trailer:".
+        // Waiting for "\r\n" for trailer line.
         match transfer.state {
             ChunkTransferState::ReadTrailer { cached_len } => {
+                // Trailer buffer holds the partial line
                 assert_eq!(cached_len, 8); // "Trailer:" length is 8
                 assert_eq!(&transfer.trailer_header_buf[0..cached_len], b"Trailer:");
             }
             _ => panic!("Incorrect state: {:?}", transfer.state),
         }
+        assert!(transfer.read_size_buf.is_empty()); // Size buf still empty
 
-        // 5. Send rest of trailer and final CRLFs
+        // 5. Send rest of trailer (" Value\r\n") and final CRLFs ("\r\n")
+        // Input: b" Value\r\n\r\n"
         transfer
             .run(b" Value\r\n\r\n", &mut opt_writer_ref)
             .await
             .unwrap();
+        // Should read " Value\r\n". Parse trailer "Trailer: Value". Forward "Trailer: Value\r\n". Consume " Value\r\n".
+        // Should read "\r\n". This is the empty line ending trailers. Forward "\r\n". Consume "\r\n".
+        // State becomes Done.
         assert!(transfer.is_done());
         assert_eq!(
-            transfer.trailer_headers().get("trailer"),
-            Some(&"Value".to_string())
+            transfer.trailer_headers().get("trailer"), // Keys are lowercased
+            Some(&"Value".to_string())                 // Values stored as trimmed strings
         );
 
         // Check final forwarded data
-        let expected_forward = b"A\r\n0123456789\r\n5\r\nABCDE\r\n0\r\nTrailer: Value\r\n\r\n"; // Remember, trailers aren't forwarded by run itself
+        let expected_forward = b"A\r\n0123456789\r\n5\r\nABCDE\r\n0\r\nTrailer: Value\r\n\r\n";
         let written_data = writer.get_written_data().await;
         assert_eq!(written_data, expected_forward);
     }
@@ -681,12 +805,45 @@ mod tests {
     #[tokio::test]
     async fn test_chunk_extension_ignored() {
         // Chunk extensions are allowed but generally ignored by intermediaries unless specified.
-        // This implementation should ignore them.
+        // This implementation should ignore them *for parsing size* but forward them.
         let input = b"A;extension=value\r\n0123456789\r\n0\r\n\r\n";
         let expected_forward = input; // Forward includes the extension part of the size line
         let (result, mut transfer, written_data) = run_transfer_fragmented(&[input], true).await;
 
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "Result was: {:?}", result);
+        assert!(transfer.is_done());
+        assert_eq!(written_data.unwrap(), expected_forward);
+        assert!(transfer.trailer_headers().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_chunk_extension_fragmented() {
+        let fragments = [
+            b"A;ext".as_slice(),
+            b"ension=value\r\n".as_slice(),
+            b"0123456789\r\n".as_slice(),
+            b"0;".as_slice(), // Zero chunk with extension
+            b"last=chunk\r\n".as_slice(),
+            b"\r\n".as_slice(), // End of trailers (empty)
+        ];
+        let expected_forward = b"A;extension=value\r\n0123456789\r\n0;last=chunk\r\n\r\n";
+        let (result, mut transfer, written_data) = run_transfer_fragmented(&fragments, true).await;
+
+        assert!(result.is_ok(), "Result was: {:?}", result);
+        assert!(transfer.is_done());
+        assert_eq!(written_data.unwrap(), expected_forward);
+        assert!(transfer.trailer_headers().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_chunk_extension_with_space_before_crlf() {
+        // While discouraged, parsers should handle optional whitespace.
+        let input = b"A ; extension=value \r\n0123456789\r\n0\r\n\r\n";
+        // We parse 'A', ignoring ';...' but forward the original line
+        let expected_forward = input;
+        let (result, mut transfer, written_data) = run_transfer_fragmented(&[input], true).await;
+
+        assert!(result.is_ok(), "Result was: {:?}", result);
         assert!(transfer.is_done());
         assert_eq!(written_data.unwrap(), expected_forward);
         assert!(transfer.trailer_headers().is_empty());
