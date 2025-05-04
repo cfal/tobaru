@@ -16,18 +16,34 @@ fn create_client_config(verify: bool) -> ClientConfig {
             .with_custom_certificate_verifier(Arc::new(DisabledVerifier {}))
             .with_no_client_auth()
     } else {
-        let mut root_store = RootCertStore::empty();
-        root_store.add_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| {
-            OwnedTrustAnchor::from_subject_spki_name_constraints(
-                ta.subject,
-                ta.spki,
-                ta.name_constraints,
-            )
-        }));
         builder
-            .with_root_certificates(root_store)
+            .with_root_certificates(get_root_cert_store())
             .with_no_client_auth()
     }
+}
+
+fn get_root_cert_store() -> Arc<RootCertStore> {
+    static INSTANCE: OnceLock<Arc<RootCertStore>> = OnceLock::new();
+    INSTANCE
+        .get_or_init(|| {
+            let root_store = rustls::RootCertStore {
+                roots: webpki_roots::TLS_SERVER_ROOTS
+                    .into_iter()
+                    .map(|trust_anchor| {
+                        OwnedTrustAnchor::from_subject_spki_name_constraints(
+                            trust_anchor.subject.as_ref().to_vec(),
+                            trust_anchor.subject_public_key_info.as_ref().to_vec(),
+                            trust_anchor
+                                .name_constraints
+                                .as_ref()
+                                .map(|nc| nc.as_ref().to_vec()),
+                        )
+                    })
+                    .collect(),
+            };
+            Arc::new(root_store)
+        })
+        .clone()
 }
 
 fn get_client_config(verify: bool) -> Arc<ClientConfig> {
@@ -65,7 +81,7 @@ pub fn load_certs(cert_bytes: &[u8]) -> Vec<Certificate> {
     for item in std::iter::from_fn(|| rustls_pemfile::read_one(&mut reader).transpose()) {
         match item.unwrap() {
             rustls_pemfile::Item::X509Certificate(cert) => {
-                certs.push(Certificate(cert));
+                certs.push(Certificate(cert.as_ref().to_vec()));
             }
             _ => (),
         }
@@ -80,11 +96,14 @@ pub fn load_private_key(key_bytes: &[u8]) -> PrivateKey {
     let mut reader = std::io::Cursor::new(key_bytes);
     for item in std::iter::from_fn(|| rustls_pemfile::read_one(&mut reader).transpose()) {
         match item.unwrap() {
-            rustls_pemfile::Item::PKCS8Key(key) => {
-                return PrivateKey(key);
+            rustls_pemfile::Item::Pkcs8Key(key) => {
+                return PrivateKey(key.secret_pkcs8_der().to_vec());
             }
-            rustls_pemfile::Item::RSAKey(key) => {
-                return PrivateKey(key);
+            rustls_pemfile::Item::Pkcs1Key(key) => {
+                return PrivateKey(key.secret_pkcs1_der().to_vec());
+            }
+            rustls_pemfile::Item::Sec1Key(key) => {
+                return PrivateKey(key.secret_sec1_der().to_vec());
             }
             _ => (),
         }
