@@ -16,7 +16,7 @@ use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::async_stream::AsyncStream;
-use crate::config::{HttpPathAction, HttpPathConfig, HttpValueMatch};
+use crate::config::HttpValueMatch;
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::tcp::{setup_target_stream, TargetHttpActionData, TargetHttpPathData};
 use crate::util::{allocate_vec, write_all};
@@ -33,7 +33,7 @@ pub async fn handle_http_stream(
 ) -> std::io::Result<()> {
     const LOG_PREFIX: &str = "http";
 
-    let stream_id = format!("{:x}", rand::thread_rng().gen::<u64>());
+    let stream_id = format!("{:x}", rand::rng().random::<u64>());
 
     let mut iteration = 0usize;
 
@@ -91,7 +91,7 @@ pub async fn handle_http_stream(
         verb.make_ascii_uppercase();
 
         let (base_path, path_action) =
-            find_matching_action(&path_configs, &default_action, &request_path, &request_data);
+            find_matching_action(path_configs, default_action, &request_path, &request_data);
 
         match path_action {
             TargetHttpActionData::CloseConnection => {
@@ -125,7 +125,7 @@ pub async fn handle_http_stream(
 
                     let mut error_response = format!("HTTP/1.1 {}", status_code);
                     if let Some(msg) = status_message {
-                        error_response.push_str(" ");
+                        error_response.push(' ');
                         error_response.push_str(msg);
                     }
                     error_response.push_str("\r\n");
@@ -137,7 +137,7 @@ pub async fn handle_http_stream(
                         .push_str("transfer-encoding: chunked\r\nconnection: close\r\n\r\n");
                     write_all(&mut stream, &error_response.into_bytes()).await?;
                     if verb != "HEAD" {
-                        if content.len() > 0 {
+                        if !content.is_empty() {
                             write_all(
                                 &mut stream,
                                 &format!("{:X}\r\n", content.len()).into_bytes(),
@@ -186,7 +186,7 @@ pub async fn handle_http_stream(
                         ),
                     ));
                 }
-                let file_path = string_util::update_base_path(&request_path, &base_path, &path);
+                let file_path = string_util::update_base_path(&request_path, base_path, path);
                 match tokio::fs::canonicalize(file_path).await {
                     Ok(mut canonical_path) => {
                         // We filter out '..' from requests, so can this still occur?
@@ -339,7 +339,7 @@ pub async fn handle_http_stream(
                 }
 
                 let mut target_stream = match cached_target.take() {
-                    Some(t) if &t.base_path == base_path => t.stream,
+                    Some(t) if t.base_path == base_path => t.stream,
                     no_match => {
                         if let Some(mut t) = no_match {
                             let _ = t.stream.try_shutdown().await;
@@ -358,7 +358,7 @@ pub async fn handle_http_stream(
 
                 request_data
                     .headers_mut()
-                    .patch_headers(&request_header_patch);
+                    .patch_headers(request_header_patch);
 
                 if let Some(header_name) = request_id_header_name {
                     request_data
@@ -432,7 +432,7 @@ pub async fn handle_http_stream(
 
                 response_data
                     .headers_mut()
-                    .patch_headers(&response_header_patch);
+                    .patch_headers(response_header_patch);
 
                 if let Some(header_name) = response_id_header_name {
                     response_data
@@ -442,7 +442,7 @@ pub async fn handle_http_stream(
 
                 response_data
                     .headers_mut()
-                    .update_path_headers(base_path, &replacement_path);
+                    .update_path_headers(base_path, replacement_path);
 
                 if request_websocket_upgrade && verb != "HEAD" {
                     if response_data.first_line().starts_with("HTTP/1.1 101") {
@@ -506,7 +506,7 @@ fn find_matching_action<'a>(
     } else {
         let mut lookup_path = String::with_capacity(request_path.len() + 1);
         lookup_path.push_str(request_path);
-        lookup_path.push_str("/");
+        lookup_path.push('/');
         path_configs.get_ancestor(&lookup_path)
     };
 
@@ -521,7 +521,7 @@ fn find_matching_action<'a>(
         }
     }
 
-    ("/", &default_action)
+    ("/", default_action)
 }
 
 fn has_required_headers(
@@ -578,16 +578,14 @@ where
         forward_content_with_length(from_stream, maybe_to_stream, reader, len).await?;
     } else if chunked {
         forward_chunked_content(from_stream, maybe_to_stream, reader).await?;
-    } else {
-        if !reader.unparsed_data().is_empty() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!(
-                    "Unexpected request data with len {}",
-                    reader.unparsed_data().len()
-                ),
-            ));
-        }
+    } else if !reader.unparsed_data().is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!(
+                "Unexpected request data with len {}",
+                reader.unparsed_data().len()
+            ),
+        ));
     }
 
     Ok(())

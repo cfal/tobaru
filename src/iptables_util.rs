@@ -17,8 +17,8 @@ pub enum Protocol {
 impl Protocol {
     fn as_str(&self) -> &'static str {
         match self {
-            &Protocol::Tcp => "tcp",
-            &Protocol::Udp => "udp",
+            Protocol::Tcp => "tcp",
+            Protocol::Udp => "udp",
         }
     }
 }
@@ -35,7 +35,7 @@ async fn run(program: &str, args: &[&str]) -> Vec<String> {
         .await
         .expect("Failed to run iptables.");
 
-    if stderr.len() > 0 {
+    if !stderr.is_empty() {
         let stderr_str = String::from_utf8(stderr).expect("Failed to parse stderr");
         error!("iptables error messages: {}", stderr_str);
     }
@@ -172,7 +172,7 @@ async fn clear_iptables(comment: &str) {
         .into_iter()
         .rev()
         {
-            if line.find(&comment).is_some() {
+            if line.find(comment).is_some() {
                 let rule_number = line.trim_start().split(' ').next().unwrap();
                 run(program, &["--wait", "5", "-D", "INPUT", rule_number]).await;
             }

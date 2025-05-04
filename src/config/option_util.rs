@@ -1,18 +1,13 @@
 use serde::Deserialize;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Default, Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum NoneOrOne<T> {
     #[serde(skip_deserializing)]
+    #[default]
     Unspecified,
     None,
     One(T),
-}
-
-impl<T> Default for NoneOrOne<T> {
-    fn default() -> Self {
-        NoneOrOne::Unspecified
-    }
 }
 
 impl<T> NoneOrOne<T> {

@@ -28,7 +28,7 @@ fn get_root_cert_store() -> Arc<RootCertStore> {
         .get_or_init(|| {
             let root_store = rustls::RootCertStore {
                 roots: webpki_roots::TLS_SERVER_ROOTS
-                    .into_iter()
+                    .iter()
                     .map(|trust_anchor| {
                         OwnedTrustAnchor::from_subject_spki_name_constraints(
                             trust_anchor.subject.as_ref().to_vec(),
@@ -79,11 +79,8 @@ pub fn load_certs(cert_bytes: &[u8]) -> Vec<Certificate> {
     let mut reader = std::io::Cursor::new(cert_bytes);
     let mut certs = vec![];
     for item in std::iter::from_fn(|| rustls_pemfile::read_one(&mut reader).transpose()) {
-        match item.unwrap() {
-            rustls_pemfile::Item::X509Certificate(cert) => {
-                certs.push(Certificate(cert.as_ref().to_vec()));
-            }
-            _ => (),
+        if let rustls_pemfile::Item::X509Certificate(cert) = item.unwrap() {
+            certs.push(Certificate(cert.as_ref().to_vec()));
         }
     }
     if certs.is_empty() {

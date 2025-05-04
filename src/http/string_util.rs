@@ -18,7 +18,7 @@ pub fn update_base_path(request_path: &str, base_path: &str, new_base_path: &str
         if request_path.ends_with("/") && !new_base_path.ends_with("/") {
             let mut new_path = String::with_capacity(new_base_path.len() + 1);
             new_path.push_str(new_base_path);
-            new_path.push_str("/");
+            new_path.push('/');
             new_path
         } else {
             new_base_path.to_string()
@@ -38,7 +38,7 @@ pub fn update_base_path(request_path: &str, base_path: &str, new_base_path: &str
         } else if !end_slash && !start_slash {
             let mut new_path = String::with_capacity(new_base_path.len() + sub_path.len() + 1);
             new_path.push_str(new_base_path);
-            new_path.push_str("/");
+            new_path.push('/');
             new_path.push_str(sub_path);
             new_path
         } else {

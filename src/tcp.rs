@@ -18,10 +18,10 @@ use tokio_rustls::LazyConfigAcceptor;
 
 use crate::async_stream::AsyncStream;
 use crate::config::{
-    ClientTlsConfig, HttpForwardConfig, HttpHeaderPatch, HttpPathAction, HttpPathConfig,
-    HttpServeDirectoryConfig, HttpServeMessageConfig, HttpTcpActionConfig, HttpValueMatch, IpMask,
-    IpMaskSelection, Location, NetLocation, RawTcpActionConfig, ServerTlsConfig, TcpAction,
-    TcpTargetConfig, TcpTargetLocation, TlsOption,
+    ClientTlsConfig, HttpForwardConfig, HttpHeaderPatch, HttpPathAction, HttpServeDirectoryConfig,
+    HttpServeMessageConfig, HttpTcpActionConfig, HttpValueMatch, IpMask, IpMaskSelection, Location,
+    NetLocation, RawTcpActionConfig, ServerTlsConfig, TcpAction, TcpTargetConfig,
+    TcpTargetLocation, TlsOption,
 };
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::http::handle_http_stream;
@@ -289,13 +289,10 @@ pub async fn run_tcp_server(
                 let mut config_lookup_table = IpLookupTable::new();
                 for IpMask(addr, masklen) in allowlist.iter() {
                     // addresses can be the same across different TLS configs
-                    let _ = tls_lookup_table.insert(addr.clone(), *masklen, true);
+                    let _ = tls_lookup_table.insert(*addr, *masklen, true);
 
                     // .. but shouldn't be duplicated in a single config.
-                    if config_lookup_table
-                        .insert(addr.clone(), *masklen, true)
-                        .is_some()
-                    {
+                    if config_lookup_table.insert(*addr, *masklen, true).is_some() {
                         panic!(
                             "Address {}/{} is duplicated in the TLS config.",
                             addr, masklen
@@ -338,7 +335,7 @@ pub async fn run_tcp_server(
         if is_non_tls_target {
             for IpMask(addr, masklen) in allowlist.iter() {
                 if non_tls_lookup_table
-                    .insert(addr.clone(), *masklen, target_data.clone())
+                    .insert(*addr, *masklen, target_data.clone())
                     .is_some()
                 {
                     panic!(
@@ -353,7 +350,7 @@ pub async fn run_tcp_server(
     }
 
     if use_iptables {
-        configure_iptables(Protocol::Tcp, server_address.clone(), &iptable_masks).await;
+        configure_iptables(Protocol::Tcp, server_address, &iptable_masks).await;
     }
 
     // TODO: check that there is only a single item under TlsOption::None and TlsOption::Any
@@ -377,7 +374,7 @@ pub async fn run_tcp_server(
         };
 
         let non_tls_data = non_tls_lookup_table
-            .longest_match(ip.clone())
+            .longest_match(ip)
             .map(|(_, _, m)| m.clone());
         let has_tls_data = tls_lookup_table.longest_match(ip).is_some();
 
@@ -398,9 +395,9 @@ pub async fn run_tcp_server(
                 if let Err(e) =
                     process_tls_stream(stream, &addr, ip, non_tls_data, cloned_sni_map).await
                 {
-                    error!("{}:{} finished with error: {:?}", addr.ip(), addr.port(), e);
+                    error!("{} finished with error: {:?}", addr, e);
                 } else {
-                    debug!("{}:{} finished successfully", addr.ip(), addr.port());
+                    debug!("{} finished successfully", addr);
                 }
             });
         } else {
@@ -408,9 +405,9 @@ pub async fn run_tcp_server(
                 if let Err(e) =
                     run_stream_action(Box::new(stream), &addr, non_tls_data.unwrap()).await
                 {
-                    error!("{}:{} finished with error: {:?}", addr.ip(), addr.port(), e);
+                    error!("{} finished with error: {:?}", addr, e);
                 } else {
-                    debug!("{}:{} finished successfully", addr.ip(), addr.port());
+                    debug!("{} finished successfully", addr);
                 }
             });
         }
@@ -434,7 +431,7 @@ async fn process_tls_stream(
                     return run_stream_action(Box::new(stream), addr, non_tls_data.unwrap()).await;
                 }
             }
-            Err(elapsed) => {
+            Err(_) => {
                 warn!("TLS client hello read timed out, assuming non-TLS connection.");
                 return run_stream_action(Box::new(stream), addr, non_tls_data.unwrap()).await;
             }
@@ -443,7 +440,7 @@ async fn process_tls_stream(
 
     let tls_handshake_timeout = timeout(
         Duration::from_secs(5),
-        handle_tls_handshake(stream, addr, ip, non_tls_data, sni_lookup_map),
+        handle_tls_handshake(stream, addr, ip, sni_lookup_map),
     );
 
     let (tls_stream, target_data) = match tls_handshake_timeout.await {
@@ -463,7 +460,6 @@ async fn handle_tls_handshake(
     stream: TcpStream,
     addr: &std::net::SocketAddr,
     ip: Ipv6Addr,
-    non_tls_data: Option<Arc<TargetData>>,
     sni_lookup_map: Arc<HashMap<TlsOption, Vec<Arc<TlsTargetData>>>>,
 ) -> std::io::Result<(Box<dyn AsyncStream>, Arc<TargetData>)> {
     let acceptor = LazyConfigAcceptor::new(rustls::server::Acceptor::default(), stream);
@@ -476,14 +472,14 @@ async fn handle_tls_handshake(
 
     let sni_data_vec = match sni_lookup_map.get(&sni_hostname) {
         Some(v) => {
-            debug!("Matched SNI option: {:?}", sni_hostname);
+            debug!("matched requested SNI from {}: {:?}", addr, sni_hostname);
             v
         }
         None => {
             if !sni_hostname.is_specified() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
-                    "no SNI hostname unspecified",
+                    format!("no SNI hostname unspecified by {}", addr),
                 ));
             }
             match sni_lookup_map.get(&TlsOption::Any) {
@@ -492,7 +488,8 @@ async fn handle_tls_handshake(
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::Other,
                         format!(
-                            "no matching SNI hostname: {}",
+                            "no matching SNI hostname from {}: {}",
+                            addr,
                             sni_hostname.unwrap_specified()
                         ),
                     ));
@@ -507,22 +504,20 @@ async fn handle_tls_handshake(
         .unwrap_or_else(HashSet::new);
 
     for sni_data in sni_data_vec {
-        if sni_data.ip_lookup_table.longest_match(ip.clone()).is_some() {
+        if sni_data.ip_lookup_table.longest_match(ip).is_some() {
             let tls_config = if alpn_protocol_hashes.is_empty() {
                 if !sni_data.allow_no_alpn {
                     continue;
                 }
                 sni_data.no_alpn_tls_config.clone()
+            } else if !alpn_protocol_hashes.is_disjoint(&sni_data.alpn_protocol_hashes) {
+                sni_data.alpn_tls_config.clone()
+            } else if sni_data.allow_any_alpn {
+                // allow any ALPN - don't do ALPN negotiation since the requested ALPNs don't
+                // match any of the specified ones.
+                sni_data.no_alpn_tls_config.clone()
             } else {
-                if !alpn_protocol_hashes.is_disjoint(&sni_data.alpn_protocol_hashes) {
-                    sni_data.alpn_tls_config.clone()
-                } else if sni_data.allow_any_alpn {
-                    // allow any ALPN - don't do ALPN negotiation since the requested ALPNs don't
-                    // match any of the specified ones.
-                    sni_data.no_alpn_tls_config.clone()
-                } else {
-                    continue;
-                }
+                continue;
             };
 
             let tls_stream = start_handshake
@@ -538,7 +533,8 @@ async fn handle_tls_handshake(
     Err(std::io::Error::new(
         std::io::ErrorKind::Other,
         format!(
-            "no matching alpn ({})",
+            "no matching alpn from {} ({})",
+            addr,
             client_hello
                 .alpn()
                 .map(|alpn_iter| {
@@ -551,8 +547,7 @@ async fn handle_tls_handshake(
                         .collect::<Vec<_>>()
                         .join(", ")
                 })
-                .as_ref()
-                .map(String::as_str)
+                .as_deref()
                 .unwrap_or("not negotiated")
         ),
     ))
@@ -576,7 +571,7 @@ async fn run_stream_action(
                 &location_data[0]
             };
             let mut target_stream =
-                match setup_target_stream(addr, &target_location, target_data.tcp_nodelay).await {
+                match setup_target_stream(addr, target_location, target_data.tcp_nodelay).await {
                     Ok(s) => s,
                     Err(e) => {
                         source_stream.try_shutdown().await?;
@@ -584,31 +579,16 @@ async fn run_stream_action(
                     }
                 };
 
-            debug!(
-                "Copying: {}:{} to {}",
-                addr.ip(),
-                addr.port(),
-                &target_location.location,
-            );
+            debug!("Copying: {} to {}", addr, &target_location.location,);
 
             let copy_result =
                 copy_bidirectional(&mut source_stream, &mut target_stream, false, false).await;
 
-            debug!(
-                "Shutdown: {}:{} to {}",
-                addr.ip(),
-                addr.port(),
-                &target_location.location,
-            );
+            debug!("Shutdown: {} to {}", addr, &target_location.location,);
 
             let (_, _) = join!(source_stream.try_shutdown(), target_stream.try_shutdown());
 
-            debug!(
-                "Done: {}:{} to {}",
-                addr.ip(),
-                addr.port(),
-                &target_location.location,
-            );
+            debug!("Done: {} to {}", addr, &target_location.location,);
 
             copy_result?;
 

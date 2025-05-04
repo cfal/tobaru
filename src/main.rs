@@ -123,7 +123,7 @@ fn print_help(command: &str, error: Option<&str>) -> ! {
         eprintln!("ERROR: {}", s);
         eprintln!();
     }
-    eprintln!("{}", help_str(&command));
+    eprintln!("{}", help_str(command));
     std::process::exit(if error.is_some() { 1 } else { 0 });
 }
 
@@ -176,7 +176,7 @@ fn main() {
             }
 
             num_threads = Some(t);
-        } else if arg.find("://").is_some() {
+        } else if arg.contains("://") {
             config_urls.push(arg);
         } else if arg == "--help" || arg == "-h" {
             print_help(&command, None);
@@ -270,7 +270,7 @@ fn main() {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
             // Remove any extra events
-            while let Ok(_) = config_rx.try_recv() {}
+            while config_rx.try_recv().is_ok() {}
         }
     });
 }

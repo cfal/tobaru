@@ -9,10 +9,7 @@ pub enum TlsOption {
 
 impl TlsOption {
     pub fn is_specified(&self) -> bool {
-        match self {
-            TlsOption::Specified(_) => true,
-            _ => false,
-        }
+        matches!(self, TlsOption::Specified(_))
     }
     pub fn unwrap_specified(&self) -> &str {
         match self {

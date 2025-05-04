@@ -33,7 +33,7 @@ impl TryFrom<&str> for IpMask {
 
         let (addr, masklen) = match ip_str.parse::<Ipv6Addr>() {
             Ok(i) => {
-                let masklen = if masklen_str.len() == 0 {
+                let masklen = if masklen_str.is_empty() {
                     128
                 } else {
                     masklen_str.parse().map_err(|e| {
@@ -47,7 +47,7 @@ impl TryFrom<&str> for IpMask {
             }
             Err(_) => match ip_str.parse::<Ipv4Addr>() {
                 Ok(i) => {
-                    let masklen = if masklen_str.len() == 0 {
+                    let masklen = if masklen_str.is_empty() {
                         128
                     } else {
                         96 + masklen_str.parse::<u32>().map_err(|e| {

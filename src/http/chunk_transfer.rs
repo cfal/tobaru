@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use memchr::{memchr, memmem};
-use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::io::AsyncWrite;
 
 use crate::util::write_all;
 

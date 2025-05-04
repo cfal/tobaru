@@ -17,13 +17,7 @@ pub trait HeaderMap {
 impl HeaderMap for HashMap<String, String> {
     fn chunked(&self) -> bool {
         self.get("transfer-encoding")
-            .map(|value| {
-                value
-                    .split(",")
-                    .map(str::trim)
-                    .find(|s| s == &"chunked")
-                    .is_some()
-            })
+            .map(|value| value.split(",").map(str::trim).any(|s| s == "chunked"))
             .unwrap_or(false)
     }
 
@@ -31,12 +25,10 @@ impl HeaderMap for HashMap<String, String> {
         match self.get("content-length") {
             Some(value) => match value.parse::<usize>() {
                 Ok(len) => Ok(Some(len)),
-                Err(e) => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("Could not parse content length: {}", e),
-                    ));
-                }
+                Err(e) => Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Could not parse content length: {}", e),
+                )),
             },
             None => Ok(None),
         }

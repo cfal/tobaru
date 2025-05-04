@@ -72,7 +72,7 @@ impl<'de> Deserialize<'de> for IpMaskSelection {
     {
         struct IpMaskSelectionVisitor;
 
-        impl<'de> serde::de::Visitor<'de> for IpMaskSelectionVisitor {
+        impl serde::de::Visitor<'_> for IpMaskSelectionVisitor {
             type Value = IpMaskSelection;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -161,7 +161,7 @@ where
 {
     use std::net::ToSocketAddrs;
     let value = String::deserialize(deserializer)?;
-    let mut iter = value.to_socket_addrs().map_err(|e| {
+    let mut iter = value.to_socket_addrs().map_err(|_| {
         serde::de::Error::invalid_value(
             serde::de::Unexpected::Other("invalid socket address"),
             &"valid socket address",
@@ -276,8 +276,9 @@ pub struct HttpPathConfig {
     pub http_action: HttpPathAction,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Default, Debug, Clone)]
 pub enum HttpValueMatch {
+    #[default]
     Any,
     Single(String),
     Multiple(Vec<String>),
@@ -340,11 +341,6 @@ impl<'de> Deserialize<'de> for HttpValueMatch {
         deserializer.deserialize_any(HttpValueMatchVisitor)
     }
 }
-impl Default for HttpValueMatch {
-    fn default() -> Self {
-        HttpValueMatch::Any
-    }
-}
 
 impl HttpValueMatch {
     pub fn matches(&self, value: Option<&str>) -> bool {
@@ -367,7 +363,7 @@ impl HttpValueMatch {
                 }
                 false
             }
-            HttpValueMatch::Any => !value.is_none(),
+            HttpValueMatch::Any => value.is_some(),
         }
     }
 }
@@ -598,10 +594,11 @@ pub struct ServerTlsConfig {
     pub optional: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Default, Debug, Clone)]
 pub enum ClientTlsConfig {
     Enabled,
     EnabledWithoutVerify,
+    #[default]
     Disabled,
 }
 
@@ -611,7 +608,7 @@ impl<'de> Deserialize<'de> for ClientTlsConfig {
         D: serde::de::Deserializer<'de>,
     {
         struct ClientTlsConfigVisitor;
-        impl<'de> serde::de::Visitor<'de> for ClientTlsConfigVisitor {
+        impl serde::de::Visitor<'_> for ClientTlsConfigVisitor {
             type Value = ClientTlsConfig;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -653,12 +650,6 @@ impl<'de> Deserialize<'de> for ClientTlsConfig {
     }
 }
 
-impl Default for ClientTlsConfig {
-    fn default() -> Self {
-        ClientTlsConfig::Disabled
-    }
-}
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct UdpTargetConfig {
     #[serde(alias = "address", alias = "locations", alias = "location")]
@@ -693,17 +684,17 @@ fn deserialize_configs(mut config_str: String) -> std::io::Result<Vec<Config>> {
             .join("\n");
     }
 
-    if config_str.find("serverTls").is_some() {
+    if config_str.contains("serverTls") {
         eprintln!("WARNING: serverTls is deprecated and has been renamed to server_tls. This will be removed in future versions.");
     }
 
-    if config_str.find("bindAddress").is_some() {
+    if config_str.contains("bindAddress") {
         eprintln!("WARNING: bindAddress is deprecated and has been renamed to address. This will be removed in future versions.");
     }
 
     // Unfortunately, we can't grep for `address` in target configs since it's valid for server
     // configs.
-    if config_str.find("addresses").is_some() {
+    if config_str.contains("addresses") {
         eprintln!("WARNING: addresses is deprecated and has been renamed to locations. This will be removed in future versions.");
     }
 
