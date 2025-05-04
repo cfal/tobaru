@@ -28,11 +28,11 @@ tokio-rustls = { version = "*", features = ["dangerous_configuration"] }
 ip_network_table-deps-treebitmap = "*"
 url = "*"
 webpki-roots = { version = "*" }
-notify = ">=6.1.1"
+notify = "*"
 radix_trie = { version = "*", features = ["serde"] }
 rand = "*"
-memchr = "2.7.4"
-mime_guess = "2.0.5"
+memchr = "*"
+mime_guess = "*"
 
 [profile.release]
 opt-level = 3
