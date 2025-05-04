@@ -14,6 +14,8 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use crate::util::allocate_vec;
+
 const DEFAULT_BUF_SIZE: usize = 16384;
 
 #[derive(Debug)]
@@ -28,10 +30,7 @@ struct CopyBuffer {
 
 impl CopyBuffer {
     pub fn new(size: usize, need_initial_flush: bool) -> Self {
-        let mut buf = Vec::with_capacity(size);
-        unsafe {
-            buf.set_len(size);
-        }
+        let buf = allocate_vec(size);
         Self {
             read_done: false,
             need_flush: need_initial_flush,

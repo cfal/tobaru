@@ -4,7 +4,6 @@ mod header_tuple;
 mod http_parser;
 mod line_reader;
 mod string_util;
-mod util;
 
 use std::collections::HashMap;
 
@@ -20,6 +19,7 @@ use crate::async_stream::AsyncStream;
 use crate::config::{HttpPathAction, HttpPathConfig, HttpValueMatch};
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::tcp::{setup_target_stream, TargetHttpActionData, TargetHttpPathData};
+use crate::util::allocate_vec;
 
 use header_map::HeaderMap;
 use header_tuple::HeaderTuple;
@@ -210,7 +210,7 @@ pub async fn handle_http_stream(
                                 let mime_type =
                                     MimeGuess::from_path(&canonical_path).first_or_octet_stream();
                                 let mut file = File::open(canonical_path).await?;
-                                let mut buf = util::allocate_vec(4096);
+                                let mut buf = allocate_vec(4096);
 
                                 let mut ok_response = format!("HTTP/1.1 200\r\ntransfer-encoding: chunked\r\ncontent-type: {}\r\n", mime_type.essence_str());
                                 response_headers.append_headers_to_string(&mut ok_response);
