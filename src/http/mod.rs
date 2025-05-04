@@ -19,7 +19,7 @@ use crate::async_stream::AsyncStream;
 use crate::config::{HttpPathAction, HttpPathConfig, HttpValueMatch};
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::tcp::{setup_target_stream, TargetHttpActionData, TargetHttpPathData};
-use crate::util::allocate_vec;
+use crate::util::{allocate_vec, write_all};
 
 use header_map::HeaderMap;
 use header_tuple::HeaderTuple;
@@ -110,9 +110,7 @@ pub async fn handle_http_stream(
                 }
 
                 if request_data.headers().expect_100()? {
-                    stream
-                        .write_all(b"HTTP/1.1 417 Expectation Failed\r\n\r\n")
-                        .await?;
+                    write_all(&mut stream, b"HTTP/1.1 417 Expectation Failed\r\n\r\n").await?;
                     info!(
                         "[{}] {} {} [serve message: expectation failed]",
                         LOG_PREFIX, &verb, &request_path
@@ -137,16 +135,18 @@ pub async fn handle_http_stream(
                     }
                     error_response
                         .push_str("transfer-encoding: chunked\r\nconnection: close\r\n\r\n");
-                    stream.write_all(&error_response.into_bytes()).await?;
+                    write_all(&mut stream, &error_response.into_bytes()).await?;
                     if verb != "HEAD" {
                         if content.len() > 0 {
-                            stream
-                                .write_all(&format!("{:X}\r\n", content.len()).into_bytes())
-                                .await?;
-                            stream.write_all(content.as_bytes()).await?;
-                            stream.write_all(b"\r\n").await?;
+                            write_all(
+                                &mut stream,
+                                &format!("{:X}\r\n", content.len()).into_bytes(),
+                            )
+                            .await?;
+                            write_all(&mut stream, content.as_bytes()).await?;
+                            write_all(&mut stream, b"\r\n").await?;
                         }
-                        stream.write_all(b"0\r\n\r\n").await?;
+                        write_all(&mut stream, b"0\r\n\r\n").await?;
                     }
                 }
 
@@ -173,7 +173,7 @@ pub async fn handle_http_stream(
                         (header_name, &request_id).append_header_to_string(&mut error_response);
                     }
                     error_response.push_str("\r\n");
-                    stream.write_all(&error_response.into_bytes()).await?;
+                    write_all(&mut stream, &error_response.into_bytes()).await?;
                     break;
                 }
 
@@ -228,7 +228,7 @@ pub async fn handle_http_stream(
                                 };
 
                                 ok_response.push_str("\r\n");
-                                stream.write_all(&ok_response.into_bytes()).await?;
+                                write_all(&mut stream, &ok_response.into_bytes()).await?;
 
                                 if verb == "GET" {
                                     loop {
@@ -236,11 +236,13 @@ pub async fn handle_http_stream(
                                         if read_len == 0 {
                                             break;
                                         }
-                                        stream
-                                            .write_all(&format!("{:X}\r\n", read_len).into_bytes())
-                                            .await?;
-                                        stream.write_all(&buf[0..read_len]).await?;
-                                        stream.write_all(b"\r\n").await?;
+                                        write_all(
+                                            &mut stream,
+                                            &format!("{:X}\r\n", read_len).into_bytes(),
+                                        )
+                                        .await?;
+                                        write_all(&mut stream, &buf[0..read_len]).await?;
+                                        write_all(&mut stream, b"\r\n").await?;
                                     }
                                     stream.write_all(b"0\r\n\r\n").await?;
                                 }
@@ -272,7 +274,7 @@ pub async fn handle_http_stream(
                                         .append_header_to_string(&mut not_found_response);
                                 }
                                 not_found_response.push_str("\r\n");
-                                stream.write_all(&not_found_response.into_bytes()).await?;
+                                write_all(&mut stream, &not_found_response.into_bytes()).await?;
 
                                 info!(
                                     "[{}] {} {} [serve file: invalid, not a file]",
@@ -299,7 +301,7 @@ pub async fn handle_http_stream(
                                 .append_header_to_string(&mut not_found_response);
                         }
                         not_found_response.push_str("\r\n");
-                        stream.write_all(&not_found_response.into_bytes()).await?;
+                        write_all(&mut stream, &not_found_response.into_bytes()).await?;
 
                         info!(
                             "[{}] {} {} [serve file: not found]",
@@ -407,7 +409,7 @@ pub async fn handle_http_stream(
                         ));
                     }
 
-                    stream.write_all(&expect_response.into_bytes()).await?;
+                    write_all(&mut stream, &expect_response.into_bytes()).await?;
 
                     if !expectation_success {
                         cached_target = Some(CachedTarget {
@@ -444,9 +446,11 @@ pub async fn handle_http_stream(
 
                 if request_websocket_upgrade && verb != "HEAD" {
                     if response_data.first_line().starts_with("HTTP/1.1 101") {
-                        stream
-                            .write_all(&string_util::create_message(&response_data).into_bytes())
-                            .await?;
+                        write_all(
+                            &mut stream,
+                            &string_util::create_message(&response_data).into_bytes(),
+                        )
+                        .await?;
                         drop(response_data);
                         info!("[{}] {} {} [forward-ws]", LOG_PREFIX, &verb, &request_path);
                         return copy_bidirectional(
@@ -566,7 +570,7 @@ where
 
     if let Some(ref mut to_stream) = maybe_to_stream {
         let new_message = string_util::create_message(&http_data);
-        to_stream.write_all(&new_message.into_bytes()).await?;
+        write_all(to_stream, &new_message.into_bytes()).await?;
     }
 
     let reader = http_data.into_reader();
@@ -613,7 +617,7 @@ where
 
     if !unparsed_data.is_empty() {
         if let Some(ref mut to_stream) = maybe_to_stream {
-            to_stream.write_all(unparsed_data).await?;
+            write_all(to_stream, unparsed_data).await?;
         }
     }
 
@@ -632,7 +636,7 @@ where
             ));
         }
         if let Some(ref mut to_stream) = maybe_to_stream {
-            to_stream.write_all(&buf[0..read_len]).await?;
+            write_all(to_stream, &buf[0..read_len]).await?;
         }
         remaining -= read_len;
     }

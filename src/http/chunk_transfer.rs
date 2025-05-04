@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use memchr::{memchr, memmem};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
+use crate::util::write_all;
+
 // 8 byte length + \r\n = 10 bytes. max chunk size is 0xffffffff which is over 4gb.
 // We need to support semi-colon delimited chunk extensions, expect at most 64 bytes.
 // TODO: is that enough?
@@ -128,8 +130,7 @@ impl ChunkTransfer {
                             let size_header_len = crlf_index + 2;
 
                             if let Some(ref mut forward_stream) = maybe_forward_stream {
-                                forward_stream
-                                    .write_all(&self.read_size_buf[0..size_header_len])
+                                write_all(forward_stream, &self.read_size_buf[0..size_header_len])
                                     .await?;
                             }
 
@@ -185,7 +186,7 @@ impl ChunkTransfer {
                 } => {
                     let forward_len = std::cmp::min(unused.len(), remaining_len);
                     if let Some(ref mut forward_stream) = maybe_forward_stream {
-                        forward_stream.write_all(&unused[0..forward_len]).await?;
+                        write_all(forward_stream, &unused[0..forward_len]).await?;
                     }
 
                     let new_remaining_len = remaining_len - forward_len;
@@ -214,9 +215,11 @@ impl ChunkTransfer {
                             let trailer_line_len = i + 2; // Includes CRLF
 
                             if let Some(ref mut forward_stream) = maybe_forward_stream {
-                                forward_stream
-                                    .write_all(&self.trailer_header_buf[0..trailer_line_len])
-                                    .await?;
+                                write_all(
+                                    forward_stream,
+                                    &self.trailer_header_buf[0..trailer_line_len],
+                                )
+                                .await?;
                             }
 
                             // Bytes consumed from the current `unused` slice
