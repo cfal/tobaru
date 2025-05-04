@@ -18,6 +18,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::async_stream::AsyncStream;
 use crate::config::{HttpPathAction, HttpPathConfig, HttpValueMatch};
+use crate::copy_bidirectional::copy_bidirectional;
 use crate::tcp::{setup_target_stream, TargetHttpActionData, TargetHttpPathData};
 
 use header_map::HeaderMap;
@@ -448,10 +449,12 @@ pub async fn handle_http_stream(
                             .await?;
                         drop(response_data);
                         info!("[{}] {} {} [forward-ws]", LOG_PREFIX, &verb, &request_path);
-                        return crate::copy_bidirectional::copy_bidirectional(
+                        return copy_bidirectional(
                             &mut stream,
                             &mut target_stream,
-                            8192,
+                            // immediately flush 101 response
+                            true,
+                            false,
                         )
                         .await
                         .map(|_| ());

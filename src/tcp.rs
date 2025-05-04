@@ -159,8 +159,6 @@ struct TlsTargetData {
     pub target_data: Arc<TargetData>,
 }
 
-const BUFFER_SIZE: usize = 8192;
-
 fn hash_alpn<T: Hash>(x: T) -> u64 {
     static ALPN_HASHER: OnceLock<RandomState> = OnceLock::new();
     ALPN_HASHER.get_or_init(RandomState::new).hash_one(x)
@@ -594,7 +592,7 @@ async fn run_stream_action(
             );
 
             let copy_result =
-                copy_bidirectional(&mut source_stream, &mut target_stream, BUFFER_SIZE).await;
+                copy_bidirectional(&mut source_stream, &mut target_stream, false, false).await;
 
             debug!(
                 "Shutdown: {}:{} to {}",

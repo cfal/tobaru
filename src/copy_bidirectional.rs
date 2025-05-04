@@ -14,6 +14,8 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+const DEFAULT_BUF_SIZE: usize = 16384;
+
 #[derive(Debug)]
 struct CopyBuffer {
     read_done: bool,
@@ -25,14 +27,14 @@ struct CopyBuffer {
 }
 
 impl CopyBuffer {
-    pub fn new(size: usize) -> Self {
+    pub fn new(size: usize, need_initial_flush: bool) -> Self {
         let mut buf = Vec::with_capacity(size);
         unsafe {
             buf.set_len(size);
         }
         Self {
             read_done: false,
-            need_flush: false,
+            need_flush: need_initial_flush,
             start_index: 0,
             cache_length: 0,
             size,
@@ -54,7 +56,6 @@ impl CopyBuffer {
             let mut read_pending = false;
             let mut write_pending = false;
 
-            // If our buffer has some space, let's read up!
             while !self.read_done && self.cache_length < self.size {
                 let unused_start_index = (self.start_index + self.cache_length) % self.size;
                 let unused_end_index_exclusive = if unused_start_index < self.start_index {
@@ -77,8 +78,6 @@ impl CopyBuffer {
                         }
                     }
                     Poll::Pending => {
-                        // Try flushing when the reader has no progress to avoid deadlock
-                        // when the reader depends on buffered writer.
                         read_pending = true;
                         break;
                     }
@@ -128,8 +127,7 @@ impl CopyBuffer {
                 self.need_flush = false;
             }
 
-            // If we've written all the data and we've seen EOF, flush out the
-            // data and finish the transfer.
+            // If we've written all the data and we've seen EOF, finish the transfer.
             if self.read_done && self.cache_length == 0 {
                 return Poll::Ready(Ok(()));
             }
@@ -191,7 +189,7 @@ where
     }
 }
 
-impl<'a, A, B> Future for CopyBidirectional<'a, A, B>
+impl<A, B> Future for CopyBidirectional<'_, A, B>
 where
     A: AsyncRead + AsyncWrite + Unpin + ?Sized,
     B: AsyncRead + AsyncWrite + Unpin + ?Sized,
@@ -213,10 +211,12 @@ where
         let b_to_a = transfer_one_direction(cx, b_to_a, &mut *b_buf, &mut *b, &mut *a);
 
         if a_to_b.is_ready() {
-            a_to_b
-        } else {
-            b_to_a
+            return a_to_b;
+        } else if b_to_a.is_ready() {
+            return b_to_a;
         }
+
+        Poll::Pending
     }
 }
 
@@ -250,8 +250,36 @@ where
 pub async fn copy_bidirectional<A, B>(
     a: &mut A,
     b: &mut B,
-    buffer_size: usize,
-) -> Result<(), std::io::Error>
+    a_need_initial_flush: bool,
+    b_need_initial_flush: bool,
+) -> io::Result<()>
+where
+    A: AsyncRead + AsyncWrite + Unpin + ?Sized,
+    B: AsyncRead + AsyncWrite + Unpin + ?Sized,
+{
+    copy_bidirectional_with_sizes(
+        a,
+        b,
+        a_need_initial_flush,
+        b_need_initial_flush,
+        DEFAULT_BUF_SIZE,
+        DEFAULT_BUF_SIZE,
+    )
+    .await
+}
+
+/// Copies data in both directions between `a` and `b` using buffers of the specified size.
+///
+/// This method is the same as the [`copy_bidirectional()`], except that it allows you to set the
+/// size of the internal buffers used when copying data.
+pub async fn copy_bidirectional_with_sizes<A, B>(
+    a: &mut A,
+    b: &mut B,
+    a_need_initial_flush: bool,
+    b_need_initial_flush: bool,
+    a_to_b_buf_size: usize,
+    b_to_a_buf_size: usize,
+) -> io::Result<()>
 where
     A: AsyncRead + AsyncWrite + Unpin + ?Sized,
     B: AsyncRead + AsyncWrite + Unpin + ?Sized,
@@ -259,8 +287,11 @@ where
     CopyBidirectional {
         a,
         b,
-        a_buf: CopyBuffer::new(buffer_size),
-        b_buf: CopyBuffer::new(buffer_size),
+        // this is correctly reversed - CopyBuffer will copy from a (reader) to b (writer) using
+        // a_buf, which means that the need_flush signal is for the writer (b), and vice versa for
+        // b_buf.
+        a_buf: CopyBuffer::new(a_to_b_buf_size, b_need_initial_flush),
+        b_buf: CopyBuffer::new(b_to_a_buf_size, a_need_initial_flush),
         a_to_b: TransferState::Running,
         b_to_a: TransferState::Running,
     }
