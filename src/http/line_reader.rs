@@ -1,7 +1,7 @@
 use memchr::memchr;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-use super::util::allocate_vec;
+use crate::util::allocate_vec;
 
 const BUFFER_SIZE: usize = 32768;
 
@@ -33,17 +33,22 @@ impl LineReader {
     where
         T: AsyncRead + Unpin,
     {
+        let mut search_start_offset = self.start_offset;
         loop {
-            match memchr(b'\n', &self.buf[self.start_offset..self.end_offset]) {
+            let search_end_offset = self.end_offset;
+            match memchr(b'\n', &self.buf[search_start_offset..search_end_offset]) {
                 Some(pos) => {
-                    let newline_pos = self.start_offset + pos;
-                    let line = if newline_pos > 0 && self.buf[newline_pos - 1] == b'\r' {
-                        &mut self.buf[self.start_offset..newline_pos - 1]
-                    } else {
-                        &mut self.buf[self.start_offset..newline_pos]
-                    };
+                    let newline_pos = search_start_offset + pos;
+                    if newline_pos == self.start_offset || self.buf[newline_pos - 1] != b'\r' {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Line is not terminated by CRLF",
+                        ));
+                    }
+                    // strip crlf
+                    let line = &mut self.buf[self.start_offset..newline_pos - 1];
                     let new_start_offset = newline_pos + 1;
-                    if new_start_offset == self.end_offset {
+                    if new_start_offset == search_end_offset {
                         self.start_offset = 0;
                         self.end_offset = 0;
                     } else {
@@ -52,7 +57,19 @@ impl LineReader {
                     return Ok(line);
                 }
                 None => {
+                    // There are no more newlines.
+                    let previous_start_offset = self.start_offset;
+
                     self.read(stream).await?;
+
+                    // Only search through new data.
+                    if previous_start_offset != self.start_offset {
+                        // this can only move to zero when reset_buf_offset is called.
+                        assert!(self.start_offset == 0);
+                        search_start_offset = search_end_offset - previous_start_offset;
+                    } else {
+                        search_start_offset = search_end_offset;
+                    }
                 }
             }
         }
