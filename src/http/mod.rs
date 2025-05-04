@@ -664,13 +664,5 @@ where
             .await?;
     }
 
-    if let Some(ref mut to_stream) = maybe_to_stream {
-        let mut suffix = String::new();
-        chunk_transfer
-            .trailer_headers()
-            .append_headers_to_string(&mut suffix);
-        suffix.push_str("\r\n");
-        to_stream.write_all(&suffix.into_bytes()).await?;
-    }
     Ok(())
 }
