@@ -658,22 +658,37 @@ pub struct UdpTargetConfig {
     pub association_timeout_secs: Option<u32>,
 }
 
-fn deserialize_configs(mut config_str: String) -> std::io::Result<Vec<Config>> {
-    let trimmed_str = config_str.trim();
-    let is_json = if trimmed_str.starts_with("//") {
-        // if we detect a single-line comment as previously allowed in the
-        // JSON config.
-        true
-    } else if trimmed_str.starts_with("{") && trimmed_str.ends_with("}") {
-        // previously, a single config object was supported, convert into an array.
-        config_str = format!("[\n{}\n]\n", config_str);
-        true
-    } else if trimmed_str.starts_with("-") {
-        // yaml item in array
-        false
-    } else {
-        warn!("Could not detect config format, assuming YAML.");
-        false
+fn deserialize_configs(mut config_str: String, filename: &str) -> std::io::Result<Vec<Config>> {
+    let path = std::path::Path::new(filename);
+    let extension = path.extension().and_then(std::ffi::OsStr::to_str);
+
+    let is_json = match extension {
+        Some("json") => {
+            let trimmed_str = config_str.trim();
+            if trimmed_str.starts_with('{') && trimmed_str.ends_with('}') {
+                config_str = format!("[\n{}\n]\n", config_str);
+            }
+            true
+        }
+        Some("yaml") | Some("yml") => false,
+        _ => {
+            let trimmed_str = config_str.trim();
+            if trimmed_str.starts_with("//") {
+                // if we detect a single-line comment as previously allowed in the
+                // JSON config.
+                true
+            } else if trimmed_str.starts_with('{') && trimmed_str.ends_with('}') {
+                // previously, a single config object was supported, convert into an array.
+                config_str = format!("[\n{}\n]\n", config_str);
+                true
+            } else if trimmed_str.starts_with('-') {
+                // yaml item in array
+                false
+            } else {
+                warn!("Could not detect config format, assuming YAML.");
+                false
+            }
+        }
     };
 
     if is_json {
@@ -728,7 +743,7 @@ pub async fn load_server_configs(
 
     for config_path in config_paths {
         let config_str = tokio::fs::read_to_string(&config_path).await?;
-        let configs = deserialize_configs(config_str)?;
+        let configs = deserialize_configs(config_str, &config_path)?;
         for config in configs {
             match config {
                 Config::ServerConfig(server_config) => {
