@@ -9,6 +9,7 @@ mod tokio_util;
 mod udp;
 mod util;
 
+use std::io::Write;
 use std::path::Path;
 
 use log::{debug, error};
@@ -135,7 +136,31 @@ enum QuickAction {
 }
 
 fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .format(|buf, record| {
+            let timestamp = buf.timestamp();
+            let level_style = buf.default_level_style(record.level());
+            let sanitized_args = format!("{}", record.args())
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_graphic() || c == ' ' {
+                        c
+                    } else {
+                        '?'
+                    }
+                })
+                .collect::<String>();
+
+            writeln!(
+                buf,
+                "[{} {level_style}{}{level_style:#} {}] {}",
+                timestamp,
+                record.level(),
+                record.target(),
+                sanitized_args
+            )
+        })
+        .init();
 
     let mut config_paths = vec![];
     let mut config_urls = vec![];
