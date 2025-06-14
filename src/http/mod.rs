@@ -47,6 +47,11 @@ pub async fn handle_http_stream(
     loop {
         iteration = iteration.wrapping_add(1);
 
+        if iteration > 1 {
+            // A response was written to `stream`, make sure to flush it.
+            stream.flush().await?;
+        }
+
         let request_id = format!("{}#{}", stream_id, iteration);
 
         // TODO: add a read timeout
@@ -423,9 +428,9 @@ pub async fn handle_http_stream(
                 let request_websocket_upgrade = request_data.headers().websocket_upgrade();
 
                 forward_message(&mut stream, Some(&mut target_stream), request_data).await?;
-                target_stream.flush().await?;
 
-                // Entire request should have been sent, now read the response
+                // Flush the request, and then read the response.
+                target_stream.flush().await?;
 
                 // TODO: add a read timeout
                 let mut response_data =
@@ -471,7 +476,6 @@ pub async fn handle_http_stream(
 
                 if verb != "HEAD" {
                     forward_message(&mut target_stream, Some(&mut stream), response_data).await?;
-                    stream.flush().await?;
                 }
 
                 info!("[{}] {} {} [forward]", LOG_PREFIX, &verb, &request_path);
@@ -489,11 +493,14 @@ pub async fn handle_http_stream(
         }
     }
 
+    // Flush any remaining response data.
+    stream.flush().await?;
+    let _ = stream.try_shutdown().await;
+
     if let Some(mut t) = cached_target.take() {
         let _ = t.stream.try_shutdown().await;
     }
 
-    let _ = stream.try_shutdown().await;
     Ok(())
 }
 
@@ -577,7 +584,9 @@ where
 
     let reader = http_data.into_reader();
     if let Some(len) = content_length {
-        forward_content_with_length(from_stream, maybe_to_stream, reader, len).await?;
+        if len > 0 {
+            forward_content_with_length(from_stream, maybe_to_stream, reader, len).await?;
+        }
     } else if chunked {
         forward_chunked_content(from_stream, maybe_to_stream, reader).await?;
     } else if !reader.unparsed_data().is_empty() {
