@@ -851,4 +851,40 @@ mod tests {
         assert_eq!(written_data.unwrap(), expected_forward);
         assert!(transfer.trailer_headers().is_empty());
     }
+
+    #[tokio::test]
+    async fn test_hang_on_final_chunk_in_single_buffer() {
+        let mut transfer = ChunkTransfer::new();
+        let mut writer = MockWriter::new();
+        let mut opt_writer_ref = Some(&mut writer as &mut (dyn AsyncWrite + Unpin));
+
+        let final_chunk_and_termination = b"0\r\n\r\n";
+
+        let processing_result = timeout(
+            Duration::from_millis(100), // A short timeout is enough to detect a hang.
+            transfer.run(final_chunk_and_termination, &mut opt_writer_ref),
+        )
+        .await;
+
+        assert!(
+            processing_result.is_ok(),
+            "The 'run' method timed out, indicating a hang."
+        );
+
+        let inner_result =
+            processing_result.expect("Test timed out, which should not happen with fixed code");
+        assert!(
+            inner_result.is_ok(),
+            "The 'run' method returned an I/O error: {:?}",
+            inner_result
+        );
+
+        assert!(
+            transfer.is_done(),
+            "The transfer did not reach the 'Done' state."
+        );
+
+        let written_data = writer.get_written_data().await;
+        assert_eq!(written_data, final_chunk_and_termination);
+    }
 }
