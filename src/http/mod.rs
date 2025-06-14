@@ -423,6 +423,7 @@ pub async fn handle_http_stream(
                 let request_websocket_upgrade = request_data.headers().websocket_upgrade();
 
                 forward_message(&mut stream, Some(&mut target_stream), request_data).await?;
+                target_stream.flush().await?;
 
                 // Entire request should have been sent, now read the response
 
@@ -470,6 +471,7 @@ pub async fn handle_http_stream(
 
                 if verb != "HEAD" {
                     forward_message(&mut target_stream, Some(&mut stream), response_data).await?;
+                    stream.flush().await?;
                 }
 
                 info!("[{}] {} {} [forward]", LOG_PREFIX, &verb, &request_path);
