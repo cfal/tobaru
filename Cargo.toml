@@ -1,13 +1,13 @@
 [package]
 name = "tobaru"
-version = "0.9.2"
+version = "0.9.3"
 edition = "2021"
 license = "MIT"
 description = "Port forwarding CLI utility written in Rust with allowlists, TLS SNI and ALPN routing, HTTP forwarding, load balancing, IP-to-destination mapping, and iptables support."
 homepage = "https://github.com/cfal/tobaru/"
 repository = "https://github.com/cfal/tobaru/"
 readme = "README.md"
-keywords = ["tunnel", "proxy", "tcp", "forward", "port", "http"]
+keywords = ["tunnel", "proxy", "forward", "port", "http"]
 categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]
