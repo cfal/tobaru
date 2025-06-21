@@ -11,28 +11,28 @@ keywords = ["tunnel", "proxy", "forward", "port", "http"]
 categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]
-async-trait = "*"
-env_logger = "*"
-futures = "*"
-ipnet = "*"
-log = "*"
-parking_lot = "*"
-percent-encoding = "*"
-rustls = { version = "*", features = ["dangerous_configuration"] }
-rustls-pemfile = { version = "*" }
-serde = { version = "*", features = ["derive", "std"] }
-serde_json = "*"
-serde_yaml = "*"
-tokio = { version = "*", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
-tokio-rustls = { version = "*", features = ["dangerous_configuration"] }
-ip_network_table-deps-treebitmap = "*"
-url = "*"
-webpki-roots = { version = "*" }
-notify = "*"
-radix_trie = { version = "*", features = ["serde"] }
-rand = "*"
-memchr = "*"
-mime_guess = "*"
+async-trait = "0.1.88"
+env_logger = "0.11.8"
+futures = "0.3.31"
+ipnet = "2.11.0"
+log = "0.4.27"
+parking_lot = "0.12.3"
+percent-encoding = "2.3.1"
+rustls = { version = "0.21.12", features = ["dangerous_configuration"] }
+rustls-pemfile = "2.2.0"
+serde = { version = "1.0.219", features = ["derive", "std"] }
+serde_json = "1.0.140"
+serde_yaml = "0.9.34+deprecated"
+tokio = { version = "1.44.2", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+tokio-rustls = { version = "0.24.1", features = ["dangerous_configuration"] }
+ip_network_table-deps-treebitmap = "0.5.0"
+url = "2.5.4"
+webpki-roots = "0.26.10"
+notify = "8.0.0"
+radix_trie = { version = "0.2.1", features = ["serde"] }
+rand = "0.9.1"
+memchr = "2.7.4"
+mime_guess = "2.0.5"
 
 [profile.release]
 opt-level = 3
