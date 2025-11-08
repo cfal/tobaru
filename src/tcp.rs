@@ -18,7 +18,7 @@ use tokio_rustls::LazyConfigAcceptor;
 
 use crate::async_stream::AsyncStream;
 use crate::config::{
-    ClientTlsConfig, HttpForwardConfig, HttpHeaderPatch, HttpPathAction, HttpServeDirectoryConfig,
+    HttpForwardConfig, HttpHeaderPatch, HttpPathAction, HttpServeDirectoryConfig,
     HttpServeMessageConfig, HttpTcpActionConfig, HttpValueMatch, IpMask, IpMaskSelection, Location,
     NetLocation, RawTcpActionConfig, ServerTlsConfig, TcpAction, TcpTargetConfig,
     TcpTargetLocation, TlsOption,
@@ -27,7 +27,7 @@ use crate::copy_bidirectional::copy_bidirectional;
 use crate::http::handle_http_stream;
 use crate::iptables_util::{configure_iptables, Protocol};
 use crate::rustls_util::{
-    create_connector, create_server_config, get_dummy_server_name, load_certs, load_private_key,
+    create_server_config, get_dummy_server_name, load_certs, load_private_key,
 };
 use crate::tokio_util::resolve_host;
 
@@ -39,12 +39,33 @@ pub struct TargetLocationData {
 impl From<TcpTargetLocation> for TargetLocationData {
     fn from(tcp_target_location: TcpTargetLocation) -> Self {
         let (location, client_tls) = tcp_target_location.into_components();
+
+        // Load client certificate if specified
+        let client_cert = if client_tls.has_client_cert() {
+            let key_path = client_tls.key().unwrap();
+            let cert_path = client_tls.cert().unwrap();
+
+            // Read cert and key files synchronously during initialization
+            // This is OK since we're in the setup phase
+            let cert_bytes = std::fs::read(cert_path)
+                .unwrap_or_else(|e| panic!("Failed to read client cert {}: {}", cert_path, e));
+            let key_bytes = std::fs::read(key_path)
+                .unwrap_or_else(|e| panic!("Failed to read client key {}: {}", key_path, e));
+
+            Some((cert_bytes, key_bytes))
+        } else {
+            None
+        };
+
         Self {
             location,
-            tls_connector: match client_tls {
-                ClientTlsConfig::Enabled => Some(create_connector(true)),
-                ClientTlsConfig::EnabledWithoutVerify => Some(create_connector(false)),
-                ClientTlsConfig::Disabled => None,
+            tls_connector: if client_tls.is_enabled() {
+                Some(crate::rustls_util::create_client_config_with_cert(
+                    client_tls.should_verify(),
+                    client_cert,
+                ).into())
+            } else {
+                None
             },
         }
     }
@@ -233,6 +254,7 @@ pub async fn run_tcp_server(
                 cert,
                 key,
                 optional,
+                client_fingerprints,
             }) => {
                 let mut cert_file = File::open(&cert).await?;
                 let mut cert_bytes = vec![];
@@ -271,16 +293,22 @@ pub async fn run_tcp_server(
                     }
                 }
 
+                let client_fingerprint_vec: Vec<String> = client_fingerprints.into_vec();
                 let (alpn_tls_config, no_alpn_tls_config) = if alpn_protocol_hashes.is_empty() {
                     let tls_config = Arc::new(create_server_config(
                         certs,
                         &private_key,
                         alpn_protocol_bytes,
+                        &client_fingerprint_vec,
                     ));
                     (tls_config.clone(), tls_config)
                 } else {
-                    let alpn_tls_config =
-                        create_server_config(certs, &private_key, alpn_protocol_bytes);
+                    let alpn_tls_config = create_server_config(
+                        certs,
+                        &private_key,
+                        alpn_protocol_bytes,
+                        &client_fingerprint_vec,
+                    );
                     let mut no_alpn_tls_config = alpn_tls_config.clone();
                     no_alpn_tls_config.alpn_protocols = vec![];
                     (Arc::new(alpn_tls_config), Arc::new(no_alpn_tls_config))
@@ -689,8 +717,8 @@ pub async fn setup_target_stream(
 
             if let Some(ref connector) = target_location.tls_connector {
                 // TODO: allow specifying or disabling SNI
-                let server_name = match rustls::ServerName::try_from(address.as_str()) {
-                    Ok(s) => s,
+                let server_name = match rustls::pki_types::ServerName::try_from(address.as_str()) {
+                    Ok(s) => s.to_owned(),
                     Err(_) => get_dummy_server_name(),
                 };
                 let tls_stream = connector

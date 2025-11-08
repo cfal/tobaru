@@ -592,14 +592,29 @@ pub struct ServerTlsConfig {
 
     #[serde(default)]
     pub optional: bool,
+
+    // sha256 fingerprints of allowed client certificates
+    // Get the certificate's SHA256 fingerprint:
+    //    openssl x509 -in client.crt -noout -fingerprint -sha256
+    // Multiple fingerprints can be specified to allow multiple client certificates
+    #[serde(default, alias = "client_fingerprint")]
+    pub client_fingerprints: NoneOrSome<String>,
 }
 
-#[derive(Default, Debug, Clone)]
+#[derive(Debug, Clone)]
 pub enum ClientTlsConfig {
-    Enabled,
-    EnabledWithoutVerify,
-    #[default]
     Disabled,
+    Enabled {
+        verify: bool,
+        key: Option<String>,
+        cert: Option<String>,
+    },
+}
+
+impl Default for ClientTlsConfig {
+    fn default() -> Self {
+        ClientTlsConfig::Disabled
+    }
 }
 
 impl<'de> Deserialize<'de> for ClientTlsConfig {
@@ -608,24 +623,44 @@ impl<'de> Deserialize<'de> for ClientTlsConfig {
         D: serde::de::Deserializer<'de>,
     {
         struct ClientTlsConfigVisitor;
-        impl serde::de::Visitor<'_> for ClientTlsConfigVisitor {
+        impl<'de> serde::de::Visitor<'de> for ClientTlsConfigVisitor {
             type Value = ClientTlsConfig;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("a boolean or the string 'no-verify'")
+                formatter.write_str("a boolean, the string 'no-verify', or a client TLS config object")
+            }
+
+            fn visit_bool<E>(self, v: bool) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if v {
+                    Ok(ClientTlsConfig::Enabled {
+                        verify: true,
+                        key: None,
+                        cert: None,
+                    })
+                } else {
+                    Err(serde::de::Error::custom("client_tls cannot be false; omit the field or use an object"))
+                }
             }
 
             fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
             where
                 E: serde::de::Error,
             {
-                if value != "no-verify" {
-                    return Err(serde::de::Error::invalid_value(
-                        serde::de::Unexpected::Other("invalid client tls string value"),
-                        &"invalid client tls string value, only supported string value is no-verify",
-                    ));
+                if value == "no-verify" {
+                    Ok(ClientTlsConfig::Enabled {
+                        verify: false,
+                        key: None,
+                        cert: None,
+                    })
+                } else {
+                    Err(serde::de::Error::invalid_value(
+                        serde::de::Unexpected::Str(value),
+                        &"'no-verify' or a client TLS config object",
+                    ))
                 }
-                Ok(ClientTlsConfig::EnabledWithoutVerify)
             }
 
             fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
@@ -635,18 +670,84 @@ impl<'de> Deserialize<'de> for ClientTlsConfig {
                 self.visit_str(&value)
             }
 
-            fn visit_bool<E>(self, v: bool) -> Result<Self::Value, E>
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
             where
-                E: serde::de::Error,
+                M: serde::de::MapAccess<'de>,
             {
-                match v {
-                    true => Ok(ClientTlsConfig::Enabled),
-                    false => Ok(ClientTlsConfig::Disabled),
+                let mut verify = None;
+                let mut key = None;
+                let mut cert = None;
+
+                while let Some(field_key) = map.next_key::<String>()? {
+                    match field_key.as_str() {
+                        "verify" => {
+                            if verify.is_some() {
+                                return Err(serde::de::Error::duplicate_field("verify"));
+                            }
+                            verify = Some(map.next_value()?);
+                        }
+                        "key" => {
+                            if key.is_some() {
+                                return Err(serde::de::Error::duplicate_field("key"));
+                            }
+                            key = Some(map.next_value()?);
+                        }
+                        "cert" => {
+                            if cert.is_some() {
+                                return Err(serde::de::Error::duplicate_field("cert"));
+                            }
+                            cert = Some(map.next_value()?);
+                        }
+                        _ => {
+                            // Ignore unknown fields
+                            let _: serde::de::IgnoredAny = map.next_value()?;
+                        }
+                    }
                 }
+
+                Ok(ClientTlsConfig::Enabled {
+                    verify: verify.unwrap_or(true),
+                    key,
+                    cert,
+                })
             }
         }
 
         deserializer.deserialize_any(ClientTlsConfigVisitor)
+    }
+}
+
+impl ClientTlsConfig {
+    pub fn is_enabled(&self) -> bool {
+        matches!(self, ClientTlsConfig::Enabled { .. })
+    }
+
+    pub fn should_verify(&self) -> bool {
+        match self {
+            ClientTlsConfig::Enabled { verify, .. } => *verify,
+            ClientTlsConfig::Disabled => false,
+        }
+    }
+
+    pub fn has_client_cert(&self) -> bool {
+        match self {
+            ClientTlsConfig::Enabled { key: Some(_), cert: Some(_), .. } => true,
+            _ => false,
+        }
+    }
+
+    pub fn key(&self) -> Option<&String> {
+        match self {
+            ClientTlsConfig::Enabled { key, .. } => key.as_ref(),
+            ClientTlsConfig::Disabled => None,
+        }
+    }
+
+    pub fn cert(&self) -> Option<&String> {
+        match self {
+            ClientTlsConfig::Enabled { cert, .. } => cert.as_ref(),
+            ClientTlsConfig::Disabled => None,
+        }
     }
 }
 

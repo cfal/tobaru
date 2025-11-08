@@ -158,6 +158,11 @@ Configuration files are in the YAML or JSON file format. tobaru expects to read 
   - `alpn_protocols` (_optional_: default: `any, none`): An accepted ALPN protocol, or an array of supported ALPN protocols, with special keywords:
     - `any`: Accept any provided ALPN protocol.
     - `none`: Accept handshakes without ALPN protocol selection.
+  - `client_fingerprints` (_optional_, default: empty): SHA256 fingerprints of allowed client certificates. When specified, only clients presenting certificates with matching fingerprints will be accepted. Multiple fingerprints can be provided as an array. Fingerprints can be specified with or without colons separating hex bytes.
+    - To generate a client certificate and get its fingerprint:
+      1. Generate private key: `openssl ecparam -genkey -name prime256v1 -out client.key`
+      2. Create self-signed certificate: `openssl req -new -x509 -nodes -key client.key -out client.crt -days 365 -subj "/CN=Client"`
+      3. Get the SHA256 fingerprint: `openssl x509 -in client.crt -noout -fingerprint -sha256`
 
 #### TCP location configuration
 
@@ -177,6 +182,16 @@ A TCP location can be specified as:
     - `true`: Enables client TLS handling, with certificate verification.
     - `no-verify`: Enables client TLS handling, without certificate verification.
     - `false`: Disables client TLS handling.
+    - An object with the following keys:
+      - `verify` (_optional_, default: `true`): Whether to verify the server certificate.
+      - `key` (_optional_): Path to client private key file for client certificate authentication.
+      - `cert` (_optional_): Path to client certificate file for client certificate authentication.
+        - Both `key` and `cert` must be specified together for client certificate authentication.
+      - `sni_hostname` (or `sni`) (_optional_): SNI hostname to send during TLS handshake.
+        - If omitted: SNI is derived from the address hostname (default behavior).
+        - To disable SNI: Set to YAML `null` (case-insensitive: null, Null, NULL, or ~). No SNI extension will be sent.
+        - Any other string: Use this specific SNI hostname.
+      - `alpn_protocols` (or `alpn` or `alpn_protocol`) (_optional_): ALPN protocols to negotiate. Can be a single protocol string or an array of protocol strings (e.g., `["h2", "http/1.1"]`).
 
 #### Target object configuration (UDP transport)
 
@@ -330,6 +345,52 @@ Connections from addresses that are not specified in `allowlist` will either be 
       }
     }
 ]
+```
+
+### Client certificate authentication with fingerprints
+
+Client certificate fingerprints can be used to authenticate connecting clients without needing a full CA infrastructure.
+
+```yaml
+- address: 0.0.0.0:8443
+  transport: tcp
+  targets:
+    - allowlist: 0.0.0.0/0
+      server_tls:
+        cert: server.crt
+        key: server.key
+        # Only allow clients with these certificate fingerprints
+        client_fingerprints:
+          - "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99"
+          - "1122334455667788990011223344556677889900112233445566778899001122"
+      locations:
+        - 127.0.0.1:8080
+```
+
+### Outgoing client certificate authentication
+
+Tobaru can present a client certificate when connecting to upstream TLS servers:
+
+```yaml
+- address: 0.0.0.0:8080
+  transport: tcp
+  targets:
+    - allowlist: 0.0.0.0/0
+      locations:
+        - address: upstream-server.example.com:443
+          client_tls:
+            verify: true
+            # Present a client certificate for authentication
+            key: client.key
+            cert: client.crt
+            # Optionally specify SNI hostname (default: derive from address)
+            sni_hostname: custom.example.com
+            # Or disable SNI entirely with YAML null:
+            # sni_hostname: null
+            # Optionally specify ALPN protocols
+            alpn_protocols:
+              - h2
+              - http/1.1
 ```
 
 ### iptables support
