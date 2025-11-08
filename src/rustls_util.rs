@@ -72,8 +72,11 @@ fn get_client_config(verify: bool) -> Arc<rustls::ClientConfig> {
 pub fn create_client_config_with_cert(
     verify: bool,
     client_cert: Option<(Vec<u8>, Vec<u8>)>,
+    alpn_protocols: Vec<Vec<u8>>,
 ) -> Arc<rustls::ClientConfig> {
-    Arc::new(create_client_config(verify, client_cert))
+    let mut config = create_client_config(verify, client_cert);
+    config.alpn_protocols = alpn_protocols;
+    Arc::new(config)
 }
 
 #[derive(Debug)]

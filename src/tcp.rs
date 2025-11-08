@@ -20,7 +20,7 @@ use crate::async_stream::AsyncStream;
 use crate::config::{
     HttpForwardConfig, HttpHeaderPatch, HttpPathAction, HttpServeDirectoryConfig,
     HttpServeMessageConfig, HttpTcpActionConfig, HttpValueMatch, IpMask, IpMaskSelection, Location,
-    NetLocation, RawTcpActionConfig, ServerTlsConfig, TcpAction, TcpTargetConfig,
+    NetLocation, NoneOrOne, RawTcpActionConfig, ServerTlsConfig, TcpAction, TcpTargetConfig,
     TcpTargetLocation, TlsOption,
 };
 use crate::copy_bidirectional::copy_bidirectional;
@@ -34,6 +34,7 @@ use crate::tokio_util::resolve_host;
 pub struct TargetLocationData {
     pub location: Location,
     pub tls_connector: Option<tokio_rustls::TlsConnector>,
+    pub sni_hostname: NoneOrOne<String>,
 }
 
 impl From<TcpTargetLocation> for TargetLocationData {
@@ -57,16 +58,26 @@ impl From<TcpTargetLocation> for TargetLocationData {
             None
         };
 
+        // Extract SNI hostname
+        let sni_hostname = client_tls.sni_hostname().clone();
+
+        // Extract and convert ALPN protocols to bytes
+        let alpn_protocols: Vec<Vec<u8>> = client_tls.alpn_protocols().clone().into_vec().into_iter()
+            .map(|s| s.into_bytes())
+            .collect();
+
         Self {
             location,
             tls_connector: if client_tls.is_enabled() {
                 Some(crate::rustls_util::create_client_config_with_cert(
                     client_tls.should_verify(),
                     client_cert,
+                    alpn_protocols,
                 ).into())
             } else {
                 None
             },
+            sni_hostname,
         }
     }
 }
@@ -716,10 +727,29 @@ pub async fn setup_target_stream(
             );
 
             if let Some(ref connector) = target_location.tls_connector {
-                // TODO: allow specifying or disabling SNI
-                let server_name = match rustls::pki_types::ServerName::try_from(address.as_str()) {
-                    Ok(s) => s.to_owned(),
-                    Err(_) => get_dummy_server_name(),
+                // Use SNI from config if specified, otherwise try to parse from address
+                let server_name = match &target_location.sni_hostname {
+                    NoneOrOne::One(sni) => {
+                        rustls::pki_types::ServerName::try_from(sni.as_str())
+                            .map(|s| s.to_owned())
+                            .unwrap_or_else(|_| {
+                                warn!("Invalid SNI hostname in config: {}, using address", sni);
+                                rustls::pki_types::ServerName::try_from(address.as_str())
+                                    .map(|s| s.to_owned())
+                                    .unwrap_or_else(|_| get_dummy_server_name())
+                            })
+                    }
+                    NoneOrOne::None => {
+                        // Explicitly disabled SNI - use dummy name
+                        get_dummy_server_name()
+                    }
+                    NoneOrOne::Unspecified => {
+                        // No config, try to use address
+                        let addr_str = address.clone();
+                        rustls::pki_types::ServerName::try_from(addr_str.as_str())
+                            .map(|s| s.to_owned())
+                            .unwrap_or_else(|_| get_dummy_server_name())
+                    }
                 };
                 let tls_stream = connector
                     .connect_with(server_name, tcp_stream, |server_conn| {

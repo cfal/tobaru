@@ -14,7 +14,7 @@ use url::Url;
 
 pub use ip_mask::IpMask;
 pub use location::{Location, NetLocation};
-pub use option_util::{NoneOrSome, OneOrSome};
+pub use option_util::{NoneOrOne, NoneOrSome, OneOrSome};
 pub use tls_option::TlsOption;
 
 fn default_true() -> bool {
@@ -608,6 +608,9 @@ pub enum ClientTlsConfig {
         verify: bool,
         key: Option<String>,
         cert: Option<String>,
+        sni_hostname: NoneOrOne<String>,
+        #[serde(default, alias = "alpn_protocol")]
+        alpn_protocols: NoneOrSome<String>,
     },
 }
 
@@ -627,7 +630,8 @@ impl<'de> Deserialize<'de> for ClientTlsConfig {
             type Value = ClientTlsConfig;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("a boolean, the string 'no-verify', or a client TLS config object")
+                formatter
+                    .write_str("a boolean, the string 'no-verify', or a client TLS config object")
             }
 
             fn visit_bool<E>(self, v: bool) -> Result<Self::Value, E>
@@ -639,9 +643,13 @@ impl<'de> Deserialize<'de> for ClientTlsConfig {
                         verify: true,
                         key: None,
                         cert: None,
+                        sni_hostname: NoneOrOne::default(),
+                        alpn_protocols: NoneOrSome::default(),
                     })
                 } else {
-                    Err(serde::de::Error::custom("client_tls cannot be false; omit the field or use an object"))
+                    Err(serde::de::Error::custom(
+                        "client_tls cannot be false; omit the field or use an object",
+                    ))
                 }
             }
 
@@ -654,6 +662,8 @@ impl<'de> Deserialize<'de> for ClientTlsConfig {
                         verify: false,
                         key: None,
                         cert: None,
+                        sni_hostname: NoneOrOne::default(),
+                        alpn_protocols: NoneOrSome::default(),
                     })
                 } else {
                     Err(serde::de::Error::invalid_value(
@@ -677,6 +687,8 @@ impl<'de> Deserialize<'de> for ClientTlsConfig {
                 let mut verify = None;
                 let mut key = None;
                 let mut cert = None;
+                let mut sni_hostname = None;
+                let mut alpn_protocols = None;
 
                 while let Some(field_key) = map.next_key::<String>()? {
                     match field_key.as_str() {
@@ -698,6 +710,18 @@ impl<'de> Deserialize<'de> for ClientTlsConfig {
                             }
                             cert = Some(map.next_value()?);
                         }
+                        "sni_hostname" | "sni" => {
+                            if sni_hostname.is_some() {
+                                return Err(serde::de::Error::duplicate_field("sni_hostname"));
+                            }
+                            sni_hostname = Some(map.next_value()?);
+                        }
+                        "alpn_protocols" | "alpn_protocol" | "alpn" => {
+                            if alpn_protocols.is_some() {
+                                return Err(serde::de::Error::duplicate_field("alpn_protocols"));
+                            }
+                            alpn_protocols = Some(map.next_value()?);
+                        }
                         _ => {
                             // Ignore unknown fields
                             let _: serde::de::IgnoredAny = map.next_value()?;
@@ -709,6 +733,8 @@ impl<'de> Deserialize<'de> for ClientTlsConfig {
                     verify: verify.unwrap_or(true),
                     key,
                     cert,
+                    sni_hostname: sni_hostname.unwrap_or_default(),
+                    alpn_protocols: alpn_protocols.unwrap_or_default(),
                 })
             }
         }
@@ -731,7 +757,11 @@ impl ClientTlsConfig {
 
     pub fn has_client_cert(&self) -> bool {
         match self {
-            ClientTlsConfig::Enabled { key: Some(_), cert: Some(_), .. } => true,
+            ClientTlsConfig::Enabled {
+                key: Some(_),
+                cert: Some(_),
+                ..
+            } => true,
             _ => false,
         }
     }
@@ -747,6 +777,20 @@ impl ClientTlsConfig {
         match self {
             ClientTlsConfig::Enabled { cert, .. } => cert.as_ref(),
             ClientTlsConfig::Disabled => None,
+        }
+    }
+
+    pub fn sni_hostname(&self) -> &NoneOrOne<String> {
+        match self {
+            ClientTlsConfig::Enabled { sni_hostname, .. } => sni_hostname,
+            ClientTlsConfig::Disabled => &NoneOrOne::Unspecified,
+        }
+    }
+
+    pub fn alpn_protocols(&self) -> &NoneOrSome<String> {
+        match self {
+            ClientTlsConfig::Enabled { alpn_protocols, .. } => alpn_protocols,
+            ClientTlsConfig::Disabled => &NoneOrSome::Unspecified,
         }
     }
 }
