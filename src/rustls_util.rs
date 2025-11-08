@@ -73,9 +73,11 @@ pub fn create_client_config_with_cert(
     verify: bool,
     client_cert: Option<(Vec<u8>, Vec<u8>)>,
     alpn_protocols: Vec<Vec<u8>>,
+    enable_sni: bool,
 ) -> Arc<rustls::ClientConfig> {
     let mut config = create_client_config(verify, client_cert);
     config.alpn_protocols = alpn_protocols;
+    config.enable_sni = enable_sni;
     Arc::new(config)
 }
 

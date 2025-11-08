@@ -66,6 +66,10 @@ impl From<TcpTargetLocation> for TargetLocationData {
             .map(|s| s.into_bytes())
             .collect();
 
+        // Determine if SNI should be enabled
+        // Only disable SNI when explicitly set to None (via YAML null)
+        let enable_sni = !matches!(sni_hostname, NoneOrOne::None);
+
         Self {
             location,
             tls_connector: if client_tls.is_enabled() {
@@ -73,6 +77,7 @@ impl From<TcpTargetLocation> for TargetLocationData {
                     client_tls.should_verify(),
                     client_cert,
                     alpn_protocols,
+                    enable_sni,
                 ).into())
             } else {
                 None
@@ -728,8 +733,10 @@ pub async fn setup_target_stream(
 
             if let Some(ref connector) = target_location.tls_connector {
                 // Use SNI from config if specified, otherwise try to parse from address
+                // Note: If enable_sni=false in the config, the SNI won't be sent regardless
                 let server_name = match &target_location.sni_hostname {
                     NoneOrOne::One(sni) => {
+                        // Use explicitly configured SNI
                         rustls::pki_types::ServerName::try_from(sni.as_str())
                             .map(|s| s.to_owned())
                             .unwrap_or_else(|_| {
@@ -739,14 +746,11 @@ pub async fn setup_target_stream(
                                     .unwrap_or_else(|_| get_dummy_server_name())
                             })
                     }
-                    NoneOrOne::None => {
-                        // Explicitly disabled SNI - use dummy name
-                        get_dummy_server_name()
-                    }
-                    NoneOrOne::Unspecified => {
-                        // No config, try to use address
-                        let addr_str = address.clone();
-                        rustls::pki_types::ServerName::try_from(addr_str.as_str())
+                    NoneOrOne::None | NoneOrOne::Unspecified => {
+                        // Either explicitly disabled (None) or not configured (Unspecified)
+                        // For None: dummy name is fine since enable_sni=false
+                        // For Unspecified: try to parse from address
+                        rustls::pki_types::ServerName::try_from(address.as_str())
                             .map(|s| s.to_owned())
                             .unwrap_or_else(|_| get_dummy_server_name())
                     }
@@ -770,8 +774,22 @@ pub async fn setup_target_stream(
             );
 
             if let Some(ref connector) = target_location.tls_connector {
-                // TODO: allow specifying or disabling SNI
-                let server_name = get_dummy_server_name();
+                // For unix sockets, SNI behavior is controlled by the config's enable_sni setting
+                // Use configured SNI if specified, otherwise use dummy (won't be sent if enable_sni=false)
+                let server_name = match &target_location.sni_hostname {
+                    NoneOrOne::One(sni) => {
+                        rustls::pki_types::ServerName::try_from(sni.as_str())
+                            .map(|s| s.to_owned())
+                            .unwrap_or_else(|_| {
+                                warn!("Invalid SNI hostname in config: {}, using dummy", sni);
+                                get_dummy_server_name()
+                            })
+                    }
+                    NoneOrOne::None | NoneOrOne::Unspecified => {
+                        // Use dummy name (won't be sent if enable_sni=false)
+                        get_dummy_server_name()
+                    }
+                };
                 let tls_stream = connector
                     .connect_with(server_name, unix_stream, |server_conn| {
                         server_conn.set_buffer_limit(Some(32768));
