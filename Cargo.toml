@@ -12,20 +12,20 @@ categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]
 async-trait = "*"
-aws-lc-rs = "*"
+aws-lc-rs = { version = "*", default-features = false }
 env_logger = "*"
 futures = "*"
 ipnet = "*"
 log = "*"
 parking_lot = "*"
 percent-encoding = "*"
-rustls = { version = "*", default-features = false, features = ["ring", "std"] }
+rustls = { version = "*", default-features = false, features = ["aws_lc_rs", "std", "logging", "tls12"] }
 rustls-pemfile = { version = "*" }
 serde = { version = "*", features = ["derive", "std"] }
 serde_json = "*"
 serde_yaml = "*"
 tokio = { version = "*", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
-tokio-rustls = { version = "*" }
+tokio-rustls = { version = "*", default-features = false, features = ["logging", "tls12", "aws_lc_rs"] }
 ip_network_table-deps-treebitmap = "*"
 url = "*"
 webpki-roots = { version = "*" }
