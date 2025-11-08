@@ -510,7 +510,7 @@ pub async fn run_tcp_server(
         } else {
             tokio::spawn(async move {
                 if let Err(e) =
-                    run_stream_action(Box::new(stream), &addr, non_tls_data.unwrap()).await
+                    run_stream_action(Box::new(stream), &addr, non_tls_data.unwrap(), None).await
                 {
                     error!("{} finished with error: {:?}", addr, e);
                 } else {
@@ -737,12 +737,13 @@ async fn process_tls_stream(
         Ok(Ok(parsed)) => parsed,
         Ok(Err(e)) if non_tls_data.is_some() => {
             // Not TLS (or malformed TLS) - try non-TLS target
-            // Get buffered data and replay it for the non-TLS handler
+            // Pass buffered data to be written first (passthrough approach)
             debug!("Failed to parse TLS ClientHello from {}: {}, trying non-TLS target", addr, e);
             let (mut buf, _pos, end) = reader.into_inner();
             buf.truncate(end);
-            let replay_stream = ReplayTcpStream::new(stream, buf);
-            return run_stream_action(Box::new(replay_stream), addr, non_tls_data.unwrap()).await;
+
+            let initial_data = if buf.is_empty() { None } else { Some(buf) };
+            return run_stream_action(Box::new(stream), addr, non_tls_data.unwrap(), initial_data).await;
         }
         Ok(Err(e)) => {
             // No non-TLS target and can't parse TLS
@@ -750,12 +751,13 @@ async fn process_tls_stream(
         }
         Err(_) if non_tls_data.is_some() => {
             // Timeout while parsing - assume non-TLS
-            // Get buffered data and replay it for the non-TLS handler
+            // Pass buffered data to be written first (passthrough approach)
             warn!("TLS ClientHello parse timed out for {}, assuming non-TLS connection", addr);
             let (mut buf, _pos, end) = reader.into_inner();
             buf.truncate(end);
-            let replay_stream = ReplayTcpStream::new(stream, buf);
-            return run_stream_action(Box::new(replay_stream), addr, non_tls_data.unwrap()).await;
+
+            let initial_data = if buf.is_empty() { None } else { Some(buf) };
+            return run_stream_action(Box::new(stream), addr, non_tls_data.unwrap(), initial_data).await;
         }
         Err(elapsed) => {
             return Err(std::io::Error::new(
@@ -783,7 +785,7 @@ async fn process_tls_stream(
     if let Some((target, tls_config)) = find_matching_terminate_target(&parsed, ip, &sni_lookup_map) {
         let (tls_stream, target_data) =
             handle_terminate_with_parsed(stream, addr, buf, target, tls_config).await?;
-        return run_stream_action(tls_stream, addr, target_data).await;
+        return run_stream_action(tls_stream, addr, target_data, None).await;
     }
 
     // No matching target found
@@ -800,6 +802,7 @@ async fn run_stream_action(
     mut source_stream: Box<dyn AsyncStream>,
     addr: &std::net::SocketAddr,
     target_data: Arc<TargetData>,
+    initial_data: Option<Vec<u8>>,
 ) -> std::io::Result<()> {
     match &target_data.action_data {
         TargetActionData::Raw {
@@ -822,10 +825,21 @@ async fn run_stream_action(
                     }
                 };
 
+            // Write initial data if present (passthrough-style approach)
+            if let Some(ref data) = initial_data {
+                crate::util::write_all(&mut target_stream, data).await?;
+                debug!(
+                    "Forwarded initial data ({} bytes) from {} to {}",
+                    data.len(),
+                    addr,
+                    &target_location.location,
+                );
+            }
+
             debug!("Copying: {} to {}", addr, &target_location.location,);
 
             let copy_result =
-                copy_bidirectional(&mut source_stream, &mut target_stream, false, false).await;
+                copy_bidirectional(&mut source_stream, &mut target_stream, false, initial_data.is_some()).await;
 
             debug!("Shutdown: {} to {}", addr, &target_location.location,);
 
@@ -841,6 +855,22 @@ async fn run_stream_action(
             path_configs,
             default_http_action,
         } => {
+            // TODO: Refactor handle_http_stream to accept initial_data directly
+            // instead of using ReplayTcpStream wrapper. This would eliminate the
+            // wrapper overhead for HTTP actions with buffered data from failed TLS parse.
+
+            // For now, we require that HTTP actions with initial_data are only called
+            // from the non-TLS fallback path where source_stream is a raw TcpStream
+            if initial_data.is_some() {
+                // This should only happen from non-TLS fallback (lines 746, 760)
+                // where source_stream is guaranteed to be Box<TcpStream>
+                // We need to downcast and wrap with ReplayTcpStream
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "HTTP actions with initial_data not yet supported - would require ReplayTcpStream wrapping",
+                ));
+            }
+
             handle_http_stream(
                 target_data.tcp_nodelay,
                 path_configs,
