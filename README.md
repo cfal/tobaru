@@ -192,6 +192,7 @@ A TCP location can be specified as:
         - To disable SNI: Set to YAML `null` (case-insensitive: null, Null, NULL, or ~). No SNI extension will be sent.
         - Any other string: Use this specific SNI hostname.
       - `alpn_protocols` (or `alpn` or `alpn_protocol`) (_optional_): ALPN protocols to negotiate. Can be a single protocol string or an array of protocol strings (e.g., `["h2", "http/1.1"]`).
+      - `server_fingerprints` (or `server_fingerprint`) (_optional_): SHA256 fingerprints of allowed server certificates. When specified, tobaru will only connect to servers presenting certificates with matching fingerprints. Multiple fingerprints can be provided as an array. Fingerprints can be specified with or without colons separating hex bytes. Can be combined with `verify: true` for additional WebPKI verification.
 
 #### Target object configuration (UDP transport)
 
@@ -391,6 +392,18 @@ Tobaru can present a client certificate when connecting to upstream TLS servers:
             alpn_protocols:
               - h2
               - http/1.1
+            # Optionally verify server by fingerprint (with or without colons)
+            server_fingerprints:
+              - "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99"
+              - "1122334455667788990011223344556677889900112233445566778899001122"
+```
+
+To get a server's certificate fingerprint:
+```bash
+# Connect and get the certificate
+openssl s_client -connect example.com:443 < /dev/null 2>/dev/null | openssl x509 -outform PEM > server.crt
+# Get the SHA256 fingerprint
+openssl x509 -in server.crt -noout -fingerprint -sha256
 ```
 
 ### iptables support

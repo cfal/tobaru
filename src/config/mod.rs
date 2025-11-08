@@ -609,8 +609,8 @@ pub enum ClientTlsConfig {
         key: Option<String>,
         cert: Option<String>,
         sni_hostname: NoneOrOne<String>,
-        #[serde(default, alias = "alpn_protocol")]
         alpn_protocols: NoneOrSome<String>,
+        server_fingerprints: NoneOrSome<String>,
     },
 }
 
@@ -645,6 +645,7 @@ impl<'de> Deserialize<'de> for ClientTlsConfig {
                         cert: None,
                         sni_hostname: NoneOrOne::default(),
                         alpn_protocols: NoneOrSome::default(),
+                        server_fingerprints: NoneOrSome::default(),
                     })
                 } else {
                     Err(serde::de::Error::custom(
@@ -664,6 +665,7 @@ impl<'de> Deserialize<'de> for ClientTlsConfig {
                         cert: None,
                         sni_hostname: NoneOrOne::default(),
                         alpn_protocols: NoneOrSome::default(),
+                        server_fingerprints: NoneOrSome::default(),
                     })
                 } else {
                     Err(serde::de::Error::invalid_value(
@@ -689,6 +691,7 @@ impl<'de> Deserialize<'de> for ClientTlsConfig {
                 let mut cert = None;
                 let mut sni_hostname = None;
                 let mut alpn_protocols = None;
+                let mut server_fingerprints = None;
 
                 while let Some(field_key) = map.next_key::<String>()? {
                     match field_key.as_str() {
@@ -722,6 +725,12 @@ impl<'de> Deserialize<'de> for ClientTlsConfig {
                             }
                             alpn_protocols = Some(map.next_value()?);
                         }
+                        "server_fingerprints" | "server_fingerprint" => {
+                            if server_fingerprints.is_some() {
+                                return Err(serde::de::Error::duplicate_field("server_fingerprints"));
+                            }
+                            server_fingerprints = Some(map.next_value()?);
+                        }
                         _ => {
                             // Ignore unknown fields
                             let _: serde::de::IgnoredAny = map.next_value()?;
@@ -735,6 +744,7 @@ impl<'de> Deserialize<'de> for ClientTlsConfig {
                     cert,
                     sni_hostname: sni_hostname.unwrap_or_default(),
                     alpn_protocols: alpn_protocols.unwrap_or_default(),
+                    server_fingerprints: server_fingerprints.unwrap_or_default(),
                 })
             }
         }
@@ -790,6 +800,13 @@ impl ClientTlsConfig {
     pub fn alpn_protocols(&self) -> &NoneOrSome<String> {
         match self {
             ClientTlsConfig::Enabled { alpn_protocols, .. } => alpn_protocols,
+            ClientTlsConfig::Disabled => &NoneOrSome::Unspecified,
+        }
+    }
+
+    pub fn server_fingerprints(&self) -> &NoneOrSome<String> {
+        match self {
+            ClientTlsConfig::Enabled { server_fingerprints, .. } => server_fingerprints,
             ClientTlsConfig::Disabled => &NoneOrSome::Unspecified,
         }
     }

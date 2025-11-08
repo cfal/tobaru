@@ -26,10 +26,11 @@ impl<T> NoneOrOne<T> {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Default, Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum NoneOrSome<T> {
     #[serde(skip_deserializing)]
+    #[default]
     Unspecified,
     None,
     One(T),
@@ -141,12 +142,6 @@ impl<T> NoneOrSome<T> {
                 }
             }
         }
-    }
-}
-
-impl<T> Default for NoneOrSome<T> {
-    fn default() -> Self {
-        NoneOrSome::Unspecified
     }
 }
 

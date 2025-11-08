@@ -66,6 +66,9 @@ impl From<TcpTargetLocation> for TargetLocationData {
             .map(|s| s.into_bytes())
             .collect();
 
+        // Extract server fingerprints
+        let server_fingerprints: Vec<String> = client_tls.server_fingerprints().clone().into_vec();
+
         // Determine if SNI should be enabled
         // Only disable SNI when explicitly set to None (via YAML null)
         let enable_sni = !matches!(sni_hostname, NoneOrOne::None);
@@ -78,6 +81,7 @@ impl From<TcpTargetLocation> for TargetLocationData {
                     client_cert,
                     alpn_protocols,
                     enable_sni,
+                    server_fingerprints,
                 ).into())
             } else {
                 None
