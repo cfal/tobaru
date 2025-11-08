@@ -13,19 +13,19 @@ use radix_trie::Trie;
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream, UnixStream};
-use tokio::time::{sleep, timeout, Duration};
-use tokio_rustls::LazyConfigAcceptor;
+use tokio::time::{timeout, Duration};
 
 use crate::async_stream::AsyncStream;
 use crate::config::{
     HttpForwardConfig, HttpHeaderPatch, HttpPathAction, HttpServeDirectoryConfig,
     HttpServeMessageConfig, HttpTcpActionConfig, HttpValueMatch, IpMask, IpMaskSelection, Location,
-    NetLocation, NoneOrOne, RawTcpActionConfig, ServerTlsConfig, TcpAction, TcpTargetConfig,
+    NetLocation, NoneOrOne, RawTcpActionConfig, TcpAction, TcpTargetConfig,
     TcpTargetLocation, TlsOption,
 };
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::http::handle_http_stream;
 use crate::iptables_util::{configure_iptables, Protocol};
+use crate::replay_stream::ReplayTcpStream;
 use crate::rustls_util::{
     create_server_config, get_dummy_server_name, load_certs, load_private_key,
 };
@@ -190,19 +190,90 @@ impl From<HttpPathAction> for TargetHttpActionData {
     }
 }
 
+enum TlsMode {
+    Terminate {
+        alpn_tls_config: Arc<rustls::ServerConfig>,
+        no_alpn_tls_config: Arc<rustls::ServerConfig>,
+    },
+    Passthrough,
+}
+
 struct TlsTargetData {
     pub allow_no_alpn: bool,
     pub allow_any_alpn: bool,
     pub alpn_protocol_hashes: HashSet<u64>,
     pub ip_lookup_table: IpLookupTable<Ipv6Addr, bool>,
-    pub alpn_tls_config: Arc<rustls::ServerConfig>,
-    pub no_alpn_tls_config: Arc<rustls::ServerConfig>,
+    pub tls_mode: TlsMode,
     pub target_data: Arc<TargetData>,
 }
 
 fn hash_alpn<T: Hash>(x: T) -> u64 {
     static ALPN_HASHER: OnceLock<RandomState> = OnceLock::new();
     ALPN_HASHER.get_or_init(RandomState::new).hash_one(x)
+}
+
+/// Parse ALPN configuration into flags and hashes (common for both modes)
+fn parse_alpn_config(
+    alpn_protocols: &crate::config::NoneOrSome<TlsOption>
+) -> (bool, bool, HashSet<u64>) {
+    let mut allow_no_alpn = false;
+    let mut allow_any_alpn = false;
+    let mut alpn_protocol_hashes = HashSet::new();
+
+    let alpn_list = if alpn_protocols.is_empty() {
+        vec![TlsOption::Any, TlsOption::None]
+    } else {
+        alpn_protocols.clone().into_vec()
+    };
+
+    for alpn_protocol in alpn_list {
+        match alpn_protocol {
+            TlsOption::None => allow_no_alpn = true,
+            TlsOption::Any => allow_any_alpn = true,
+            TlsOption::Specified(s) => {
+                alpn_protocol_hashes.insert(hash_alpn(s.as_bytes()));
+            }
+        }
+    }
+
+    (allow_no_alpn, allow_any_alpn, alpn_protocol_hashes)
+}
+
+/// Build rustls configs for terminate mode
+fn build_rustls_configs(
+    certs: Vec<rustls::pki_types::CertificateDer<'static>>,
+    private_key: &rustls::pki_types::PrivateKeyDer<'static>,
+    alpn_protocols: &crate::config::NoneOrSome<TlsOption>,
+    client_fingerprints: &crate::config::NoneOrSome<String>,
+) -> (Arc<rustls::ServerConfig>, Arc<rustls::ServerConfig>) {
+    let mut alpn_protocol_bytes = vec![];
+    for proto in alpn_protocols.iter() {
+        if let TlsOption::Specified(s) = proto {
+            alpn_protocol_bytes.push(s.as_bytes().to_vec());
+        }
+    }
+
+    let client_fingerprint_vec: Vec<String> = client_fingerprints.clone().into_vec();
+
+    if alpn_protocol_bytes.is_empty() {
+        let tls_config = Arc::new(create_server_config(
+            certs,
+            private_key,
+            alpn_protocol_bytes,
+            &client_fingerprint_vec,
+        ));
+        (tls_config.clone(), tls_config)
+    } else {
+        let alpn_tls_config = create_server_config(
+            certs,
+            private_key,
+            alpn_protocol_bytes.clone(),
+            &client_fingerprint_vec,
+        );
+        let mut no_alpn_tls_config = alpn_tls_config.clone();
+        no_alpn_tls_config.alpn_protocols = vec![];
+        (Arc::new(alpn_tls_config), Arc::new(no_alpn_tls_config))
+    }
 }
 
 pub async fn run_tcp_server(
@@ -231,6 +302,13 @@ pub async fn run_tcp_server(
             .into_iter()
             .map(IpMaskSelection::unwrap_literal)
             .collect::<Vec<_>>();
+
+        // Validate passthrough + client_tls combination BEFORE moving action
+        if let Some(ref tls_config) = server_tls {
+            if let Err(e) = tls_config.validate_with_action(&action) {
+                panic!("Invalid TLS configuration: {}", e);
+            }
+        }
 
         let action_data = match action {
             TcpAction::Raw(RawTcpActionConfig { locations }) => TargetActionData::Raw {
@@ -262,78 +340,58 @@ pub async fn run_tcp_server(
             }
         };
 
+        // Create target_data (needed for both TLS and non-TLS targets)
         let target_data = Arc::new(TargetData {
             tcp_nodelay,
             action_data,
         });
 
         let is_non_tls_target = match server_tls {
-            Some(ServerTlsConfig {
-                sni_hostnames,
-                alpn_protocols,
-                cert,
-                key,
-                optional,
-                client_fingerprints,
-            }) => {
-                let mut cert_file = File::open(&cert).await?;
-                let mut cert_bytes = vec![];
-                cert_file.read_to_end(&mut cert_bytes).await?;
-                let certs = load_certs(&cert_bytes);
-
-                let mut key_file = File::open(&key).await?;
-                let mut key_bytes = vec![];
-                key_file.read_to_end(&mut key_bytes).await?;
-                let private_key = load_private_key(&key_bytes);
-
-                let mut allow_no_alpn = false;
-                let mut allow_any_alpn = false;
-                let mut alpn_protocol_hashes = HashSet::new();
-                let mut alpn_protocol_bytes = vec![];
-
-                let alpn_protocols = if alpn_protocols.is_empty() {
-                    vec![TlsOption::Any, TlsOption::None]
-                } else {
-                    alpn_protocols.into_vec()
-                };
-
-                for alpn_protocol in alpn_protocols.into_iter() {
-                    match alpn_protocol {
-                        TlsOption::None => {
-                            allow_no_alpn = true;
-                        }
-                        TlsOption::Any => {
-                            allow_any_alpn = true;
-                        }
-                        TlsOption::Specified(s) => {
-                            let alpn_bytes = s.into_bytes();
-                            alpn_protocol_hashes.insert(hash_alpn(&alpn_bytes));
-                            alpn_protocol_bytes.push(alpn_bytes);
-                        }
-                    }
+            Some(ref tls_config) => {
+                // Validate the config
+                if let Err(e) = tls_config.validate() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("Invalid server_tls config: {}", e),
+                    ));
                 }
 
-                let client_fingerprint_vec: Vec<String> = client_fingerprints.into_vec();
-                let (alpn_tls_config, no_alpn_tls_config) = if alpn_protocol_hashes.is_empty() {
-                    let tls_config = Arc::new(create_server_config(
-                        certs,
-                        &private_key,
-                        alpn_protocol_bytes,
-                        &client_fingerprint_vec,
-                    ));
-                    (tls_config.clone(), tls_config)
+                // Parse ALPN configuration (common for both modes)
+                let (allow_no_alpn, allow_any_alpn, alpn_protocol_hashes) =
+                    parse_alpn_config(&tls_config.alpn_protocols);
+
+                // Build mode-specific TLS configuration
+                let tls_mode = if tls_config.is_passthrough() {
+                    TlsMode::Passthrough
                 } else {
-                    let alpn_tls_config = create_server_config(
+                    // Terminate mode: load certs and build rustls configs
+                    let cert = tls_config.cert.as_ref().unwrap();
+                    let key = tls_config.key.as_ref().unwrap();
+
+                    let mut cert_file = File::open(cert).await?;
+                    let mut cert_bytes = vec![];
+                    cert_file.read_to_end(&mut cert_bytes).await?;
+                    let certs = load_certs(&cert_bytes);
+
+                    let mut key_file = File::open(key).await?;
+                    let mut key_bytes = vec![];
+                    key_file.read_to_end(&mut key_bytes).await?;
+                    let private_key = load_private_key(&key_bytes);
+
+                    let (alpn_tls_config, no_alpn_tls_config) = build_rustls_configs(
                         certs,
                         &private_key,
-                        alpn_protocol_bytes,
-                        &client_fingerprint_vec,
+                        &tls_config.alpn_protocols,
+                        &tls_config.client_fingerprints,
                     );
-                    let mut no_alpn_tls_config = alpn_tls_config.clone();
-                    no_alpn_tls_config.alpn_protocols = vec![];
-                    (Arc::new(alpn_tls_config), Arc::new(no_alpn_tls_config))
+
+                    TlsMode::Terminate {
+                        alpn_tls_config,
+                        no_alpn_tls_config,
+                    }
                 };
 
+                // Build IP lookup table (common for both modes)
                 let mut config_lookup_table = IpLookupTable::new();
                 for IpMask(addr, masklen) in allowlist.iter() {
                     // addresses can be the same across different TLS configs
@@ -348,20 +406,21 @@ pub async fn run_tcp_server(
                     }
                 }
 
+                // Create unified TlsTargetData
                 let tls_target_data = Arc::new(TlsTargetData {
                     allow_no_alpn,
                     allow_any_alpn,
                     alpn_protocol_hashes,
                     ip_lookup_table: config_lookup_table,
-                    alpn_tls_config,
-                    no_alpn_tls_config,
+                    tls_mode,
                     target_data: target_data.clone(),
                 });
 
-                let sni_hostnames = if sni_hostnames.is_empty() {
+                // Register SNI hostnames (common for both modes)
+                let sni_hostnames = if tls_config.sni_hostnames.is_empty() {
                     vec![TlsOption::Any, TlsOption::None]
                 } else {
-                    sni_hostnames.into_vec()
+                    tls_config.sni_hostnames.clone().into_vec()
                 };
 
                 for sni_hostname in sni_hostnames.into_iter() {
@@ -375,7 +434,7 @@ pub async fn run_tcp_server(
                     }
                 }
 
-                optional
+                tls_config.optional
             }
             None => true,
         };
@@ -462,141 +521,277 @@ pub async fn run_tcp_server(
     }
 }
 
-async fn process_tls_stream(
+/// Find matching terminate target based on SNI and ALPN from parsed ClientHello
+fn find_matching_terminate_target(
+    parsed: &crate::tls_parser::ParsedClientHello,
+    ip: Ipv6Addr,
+    sni_lookup_map: &HashMap<TlsOption, Vec<Arc<TlsTargetData>>>,
+) -> Option<(Arc<TlsTargetData>, Arc<rustls::ServerConfig>)> {
+    // Match SNI hostname
+    let sni_option = parsed.server_name.as_ref()
+        .map(|s| TlsOption::Specified(s.clone()))
+        .unwrap_or(TlsOption::None);
+
+    let candidates = sni_lookup_map.get(&sni_option)
+        .or_else(|| sni_lookup_map.get(&TlsOption::Any))?;
+
+    // Match ALPN
+    let alpn_hashes: HashSet<u64> = parsed.alpn_protocols.iter()
+        .map(|s| hash_alpn(s.as_bytes()))
+        .collect();
+
+    for candidate in candidates {
+        // Only consider terminate targets
+        let (alpn_tls_config, no_alpn_tls_config) = match &candidate.tls_mode {
+            TlsMode::Terminate { alpn_tls_config, no_alpn_tls_config } => {
+                (alpn_tls_config, no_alpn_tls_config)
+            }
+            TlsMode::Passthrough => continue,
+        };
+
+        // Check IP allowlist
+        if candidate.ip_lookup_table.longest_match(ip).is_none() {
+            continue;
+        }
+
+        // Check ALPN matching and determine which config to use
+        if alpn_hashes.is_empty() {
+            if candidate.allow_no_alpn {
+                return Some((candidate.clone(), no_alpn_tls_config.clone()));
+            }
+        } else if !alpn_hashes.is_disjoint(&candidate.alpn_protocol_hashes) {
+            // Specific protocol match - use ALPN config
+            return Some((candidate.clone(), alpn_tls_config.clone()));
+        } else if candidate.allow_any_alpn {
+            // Any ALPN allowed but no specific match - use no-ALPN config
+            return Some((candidate.clone(), no_alpn_tls_config.clone()));
+        }
+    }
+
+    None
+}
+
+/// Handle terminate mode with parsed ClientHello - use LazyConfigAcceptor with replay wrapper
+async fn handle_terminate_with_parsed(
     stream: TcpStream,
+    addr: &std::net::SocketAddr,
+    client_hello_frame: Vec<u8>,
+    target_data: Arc<TlsTargetData>,
+    tls_config: Arc<rustls::ServerConfig>,
+) -> std::io::Result<(Box<dyn AsyncStream>, Arc<TargetData>)> {
+    use tokio_rustls::LazyConfigAcceptor;
+
+    debug!("Terminate TLS for {}", addr);
+
+    // Wrap the TcpStream with a replay wrapper so LazyConfigAcceptor can read the ClientHello
+    // that we've already parsed for routing
+    let replay_stream = ReplayTcpStream::new(stream, client_hello_frame);
+
+    // Use LazyConfigAcceptor with the replay stream
+    let acceptor = LazyConfigAcceptor::new(rustls::server::Acceptor::default(), replay_stream);
+    let start_handshake = acceptor.await?;
+
+    // Complete the handshake with our pre-selected config
+    let tls_stream = start_handshake
+        .into_stream_with(tls_config, |server_conn| {
+            server_conn.set_buffer_limit(Some(32768));
+        })
+        .await?;
+
+    debug!("Completed TLS handshake for {}", addr);
+
+    Ok((Box::new(tls_stream), target_data.target_data.clone()))
+}
+
+/// Find matching TLS target based on SNI and ALPN
+fn find_matching_passthrough_target(
+    parsed: &crate::tls_parser::ParsedClientHello,
+    ip: Ipv6Addr,
+    sni_lookup_map: &HashMap<TlsOption, Vec<Arc<TlsTargetData>>>,
+) -> Option<Arc<TlsTargetData>> {
+    // Match SNI hostname
+    let sni_option = parsed.server_name.as_ref()
+        .map(|s| TlsOption::Specified(s.clone()))
+        .unwrap_or(TlsOption::None);
+
+    let candidates = sni_lookup_map.get(&sni_option)
+        .or_else(|| sni_lookup_map.get(&TlsOption::Any))?;
+
+    // Match ALPN
+    let alpn_hashes: HashSet<u64> = parsed.alpn_protocols.iter()
+        .map(|s| hash_alpn(s.as_bytes()))
+        .collect();
+
+    for candidate in candidates {
+        // Skip non-passthrough targets
+        if !matches!(candidate.tls_mode, TlsMode::Passthrough) {
+            continue;
+        }
+
+        // Check IP allowlist
+        if candidate.ip_lookup_table.longest_match(ip).is_none() {
+            continue;
+        }
+
+        // Check ALPN matching
+        if alpn_hashes.is_empty() {
+            if candidate.allow_no_alpn {
+                return Some(candidate.clone());
+            }
+        } else if !alpn_hashes.is_disjoint(&candidate.alpn_protocol_hashes) {
+            return Some(candidate.clone());
+        } else if candidate.allow_any_alpn {
+            return Some(candidate.clone());
+        }
+    }
+
+    None
+}
+
+/// Handle passthrough stream - forward ClientHello + remaining data without decryption
+async fn handle_passthrough_stream(
+    stream: TcpStream,
+    addr: &std::net::SocketAddr,
+    client_hello_frame: Vec<u8>,
+    target_data: Arc<TlsTargetData>,
+) -> std::io::Result<()> {
+    debug!("Passthrough TLS for {}", addr);
+
+    // Get target location
+    let target_location = match &target_data.target_data.action_data {
+        TargetActionData::Raw { location_data, next_address_index } => {
+            if location_data.len() > 1 {
+                let idx = next_address_index.fetch_add(1, Ordering::Relaxed);
+                &location_data[idx % location_data.len()]
+            } else {
+                &location_data[0]
+            }
+        }
+        TargetActionData::Http { .. } => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "HTTP action not supported with TLS passthrough mode",
+            ));
+        }
+    };
+
+    // Passthrough mode cannot use client_tls (would cause TLS-in-TLS)
+    // This should be caught during config validation
+    debug_assert!(
+        target_location.tls_connector.is_none(),
+        "client_tls should not be configured in passthrough mode - this should have been caught during validation"
+    );
+
+    // Connect to target
+    let mut target_stream = setup_target_stream(
+        addr,
+        target_location,
+        target_data.target_data.tcp_nodelay,
+    ).await?;
+
+    // Forward the buffered ClientHello first (using cancellable write_all)
+    crate::util::write_all(&mut target_stream, &client_hello_frame).await?;
+
+    debug!(
+        "Forwarded ClientHello ({} bytes) from {} to {}",
+        client_hello_frame.len(),
+        addr,
+        &target_location.location,
+    );
+
+    // Bidirectional copy for the rest of the connection
+    // Set b_need_initial_flush=true to flush the ClientHello before copying
+    let copy_result = copy_bidirectional(
+        &mut (Box::new(stream) as Box<dyn crate::async_stream::AsyncStream>),
+        &mut target_stream,
+        false,
+        true,  // Flush target_stream before starting bidirectional copy
+    ).await;
+
+    debug!("Passthrough finished: {} to {}", addr, &target_location.location);
+
+    copy_result?;
+    Ok(())
+}
+
+async fn process_tls_stream(
+    mut stream: TcpStream,
     addr: &std::net::SocketAddr,
     ip: Ipv6Addr,
     non_tls_data: Option<Arc<TargetData>>,
     sni_lookup_map: Arc<HashMap<TlsOption, Vec<Arc<TlsTargetData>>>>,
 ) -> std::io::Result<()> {
-    if non_tls_data.is_some() {
-        let peek_client_hello_timeout =
-            timeout(Duration::from_secs(5), peek_tls_client_hello(&stream));
-        match peek_client_hello_timeout.await {
-            Ok(peek_result) => {
-                let is_tls_client_hello = peek_result?;
-                if !is_tls_client_hello {
-                    return run_stream_action(Box::new(stream), addr, non_tls_data.unwrap()).await;
-                }
-            }
-            Err(_) => {
-                warn!("TLS client hello read timed out, assuming non-TLS connection.");
-                return run_stream_action(Box::new(stream), addr, non_tls_data.unwrap()).await;
-            }
-        }
-    }
+    // UNIFIED APPROACH: Always parse ClientHello first
+    // This allows us to route to either passthrough or terminate targets
 
-    let tls_handshake_timeout = timeout(
+    // Create TlsReader for parsing
+    let mut reader = crate::tls_reader::TlsReader::new();
+
+    // Try to parse ClientHello with timeout
+    let parse_timeout = timeout(
         Duration::from_secs(5),
-        handle_tls_handshake(stream, addr, ip, sni_lookup_map),
+        crate::tls_parser::parse_client_hello(&mut reader, &mut stream),
     );
 
-    let (tls_stream, target_data) = match tls_handshake_timeout.await {
-        Ok(handshake_result) => handshake_result?,
+    let parsed = match parse_timeout.await {
+        Ok(Ok(parsed)) => parsed,
+        Ok(Err(e)) if non_tls_data.is_some() => {
+            // Not TLS (or malformed TLS) - try non-TLS target
+            // Get buffered data and replay it for the non-TLS handler
+            debug!("Failed to parse TLS ClientHello from {}: {}, trying non-TLS target", addr, e);
+            let (mut buf, _pos, end) = reader.into_inner();
+            buf.truncate(end);
+            let replay_stream = ReplayTcpStream::new(stream, buf);
+            return run_stream_action(Box::new(replay_stream), addr, non_tls_data.unwrap()).await;
+        }
+        Ok(Err(e)) => {
+            // No non-TLS target and can't parse TLS
+            return Err(e);
+        }
+        Err(_) if non_tls_data.is_some() => {
+            // Timeout while parsing - assume non-TLS
+            // Get buffered data and replay it for the non-TLS handler
+            warn!("TLS ClientHello parse timed out for {}, assuming non-TLS connection", addr);
+            let (mut buf, _pos, end) = reader.into_inner();
+            buf.truncate(end);
+            let replay_stream = ReplayTcpStream::new(stream, buf);
+            return run_stream_action(Box::new(replay_stream), addr, non_tls_data.unwrap()).await;
+        }
         Err(elapsed) => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
-                format!("tls handshake timed out: {}", elapsed),
+                format!("TLS ClientHello parse timed out: {}", elapsed),
             ));
         }
     };
 
-    run_stream_action(tls_stream, addr, target_data).await
-}
+    debug!(
+        "Parsed ClientHello from {} - SNI: {:?}, ALPN: {:?}",
+        addr, parsed.server_name, parsed.alpn_protocols
+    );
 
-async fn handle_tls_handshake(
-    stream: TcpStream,
-    addr: &std::net::SocketAddr,
-    ip: Ipv6Addr,
-    sni_lookup_map: Arc<HashMap<TlsOption, Vec<Arc<TlsTargetData>>>>,
-) -> std::io::Result<(Box<dyn AsyncStream>, Arc<TargetData>)> {
-    let acceptor = LazyConfigAcceptor::new(rustls::server::Acceptor::default(), stream);
-    let start_handshake = acceptor.await?;
-    let client_hello = start_handshake.client_hello();
-    let sni_hostname = client_hello
-        .server_name()
-        .map(|s| TlsOption::Specified(s.to_string()))
-        .unwrap_or(TlsOption::None);
+    // Get the buffered ClientHello data for replay and truncate to actual data
+    let (mut buf, _pos, end) = reader.into_inner();
+    buf.truncate(end);
 
-    let sni_data_vec = match sni_lookup_map.get(&sni_hostname) {
-        Some(v) => {
-            debug!("matched requested SNI from {}: {:?}", addr, sni_hostname);
-            v
-        }
-        None => {
-            if !sni_hostname.is_specified() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("no SNI hostname unspecified by {}", addr),
-                ));
-            }
-            match sni_lookup_map.get(&TlsOption::Any) {
-                Some(v) => v,
-                None => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!(
-                            "no matching SNI hostname from {}: {}",
-                            addr,
-                            sni_hostname.unwrap_specified()
-                        ),
-                    ));
-                }
-            }
-        }
-    };
-
-    let alpn_protocol_hashes: HashSet<u64> = client_hello
-        .alpn()
-        .map(|alpn_iter| alpn_iter.map(hash_alpn).collect())
-        .unwrap_or_else(HashSet::new);
-
-    for sni_data in sni_data_vec {
-        if sni_data.ip_lookup_table.longest_match(ip).is_some() {
-            let tls_config = if alpn_protocol_hashes.is_empty() {
-                if !sni_data.allow_no_alpn {
-                    continue;
-                }
-                sni_data.no_alpn_tls_config.clone()
-            } else if !alpn_protocol_hashes.is_disjoint(&sni_data.alpn_protocol_hashes) {
-                sni_data.alpn_tls_config.clone()
-            } else if sni_data.allow_any_alpn {
-                // allow any ALPN - don't do ALPN negotiation since the requested ALPNs don't
-                // match any of the specified ones.
-                sni_data.no_alpn_tls_config.clone()
-            } else {
-                continue;
-            };
-
-            let tls_stream = start_handshake
-                .into_stream_with(tls_config, |server_conn| {
-                    server_conn.set_buffer_limit(Some(32768));
-                })
-                .await?;
-
-            return Ok((Box::new(tls_stream), sni_data.target_data.clone()));
-        }
+    // Try to match passthrough targets first (higher priority)
+    if let Some(target) = find_matching_passthrough_target(&parsed, ip, &sni_lookup_map) {
+        return handle_passthrough_stream(stream, addr, buf, target).await;
     }
 
+    // Try to match terminate targets
+    if let Some((target, tls_config)) = find_matching_terminate_target(&parsed, ip, &sni_lookup_map) {
+        let (tls_stream, target_data) =
+            handle_terminate_with_parsed(stream, addr, buf, target, tls_config).await?;
+        return run_stream_action(tls_stream, addr, target_data).await;
+    }
+
+    // No matching target found
     Err(std::io::Error::new(
         std::io::ErrorKind::Other,
         format!(
-            "no matching alpn from {} ({})",
-            addr,
-            client_hello
-                .alpn()
-                .map(|alpn_iter| {
-                    alpn_iter
-                        .map(|alpn_bytes| {
-                            std::str::from_utf8(alpn_bytes)
-                                .map(String::from)
-                                .unwrap_or(format!("{:?}", alpn_bytes))
-                        })
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                })
-                .as_deref()
-                .unwrap_or("not negotiated")
+            "No matching TLS target for {} with SNI: {:?}, ALPN: {:?}",
+            addr, parsed.server_name, parsed.alpn_protocols
         ),
     ))
 }
@@ -656,63 +851,6 @@ async fn run_stream_action(
             .await
         }
     }
-}
-
-async fn peek_tls_client_hello(stream: &TcpStream) -> std::io::Result<bool> {
-    // Logic was taken from boost docs:
-    // https://www.boost.org/doc/libs/1_70_0/libs/beast/doc/html/beast/using_io/writing_composed_operations/detect_ssl.html
-
-    let mut buf = [0u8; 9];
-    for _ in 0..3 {
-        let count = stream.peek(&mut buf).await?;
-
-        if count >= 1 {
-            // Require the first byte to be 0x16, indicating a TLS handshake record
-            if buf[0] != 0x16 {
-                return Ok(false);
-            }
-
-            if count >= 5 {
-                // Calculate the record payload size
-                let length: u32 = ((buf[3] as u32) << 8) + (buf[4] as u32);
-
-                // A ClientHello message payload is at least 34 bytes.
-                // There can be multiple handshake messages in the same record.
-                if length < 34 {
-                    return Ok(false);
-                }
-
-                if count >= 6 {
-                    // The handshake_type must be 0x01 == client_hello
-                    if buf[5] != 0x01 {
-                        return Ok(false);
-                    }
-
-                    if count >= 9 {
-                        // Calculate the message payload size
-                        let size: u32 =
-                            ((buf[6] as u32) << 16) + ((buf[7] as u32) << 8) + (buf[8] as u32);
-
-                        // The message payload can't be bigger than the enclosing record
-                        if size + 4 > length {
-                            return Ok(false);
-                        }
-
-                        // This can only be a TLS client_hello message
-                        return Ok(true);
-                    }
-                }
-            }
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
-
-    debug!("Unable to fetch all bytes to determine TLS.");
-
-    // If we get here, then we didn't have enough bytes after several iterations
-    // of the for loop. It could be possible that the client expects a server response
-    // first before sending more bytes, so just assume it's not a TLS connection.
-    Ok(false)
 }
 
 pub async fn setup_target_stream(

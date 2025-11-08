@@ -578,27 +578,117 @@ impl TcpTargetLocation {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TlsMode {
+    Terminate,   // Decrypt TLS and terminate (default, current behavior)
+    Passthrough, // Parse SNI but don't decrypt (transparent forwarding)
+}
+
+impl Default for TlsMode {
+    fn default() -> Self {
+        TlsMode::Terminate
+    }
+}
+
+impl<'de> Deserialize<'de> for TlsMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::de::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.to_lowercase().as_str() {
+            "terminate" => Ok(TlsMode::Terminate),
+            "passthrough" => Ok(TlsMode::Passthrough),
+            _ => Err(serde::de::Error::unknown_variant(
+                &s,
+                &["terminate", "passthrough"],
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerTlsConfig {
+    #[serde(default)]
+    pub mode: TlsMode,
+
     #[serde(default, alias = "sni_hostname")]
     pub sni_hostnames: NoneOrSome<TlsOption>,
 
-    // the alpn protocols to show in the serverhello response
+    // the alpn protocols to show in the serverhello response (terminate mode)
+    // or to match against (passthrough mode)
     #[serde(default, alias = "alpn_protocol")]
     pub alpn_protocols: NoneOrSome<TlsOption>,
 
-    pub cert: String,
-    pub key: String,
+    // Required for terminate mode, ignored for passthrough mode
+    #[serde(default)]
+    pub cert: Option<String>,
+    #[serde(default)]
+    pub key: Option<String>,
 
+    // When true, also accept non-TLS connections (only valid with terminate mode for backward compat)
     #[serde(default)]
     pub optional: bool,
 
-    // sha256 fingerprints of allowed client certificates
+    // sha256 fingerprints of allowed client certificates (terminate mode only)
     // Get the certificate's SHA256 fingerprint:
     //    openssl x509 -in client.crt -noout -fingerprint -sha256
     // Multiple fingerprints can be specified to allow multiple client certificates
     #[serde(default, alias = "client_fingerprint")]
     pub client_fingerprints: NoneOrSome<String>,
+}
+
+impl ServerTlsConfig {
+    pub fn is_passthrough(&self) -> bool {
+        self.mode == TlsMode::Passthrough
+    }
+
+    pub fn is_terminate(&self) -> bool {
+        self.mode == TlsMode::Terminate
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        // Note: optional flag is now handled by auto-expansion in load_server_configs
+        // so we don't validate it here
+
+        if self.is_terminate() {
+            if self.cert.is_none() || self.key.is_none() {
+                return Err(
+                    "cert and key are required for terminate mode".to_string()
+                );
+            }
+        } else if self.is_passthrough() {
+            if !self.client_fingerprints.is_empty() {
+                return Err(
+                    "client_fingerprints is not valid for passthrough mode".to_string()
+                );
+            }
+            // NOTE: client_fingerprints cannot be supported in passthrough mode.
+            // In TLS 1.3, client certificates are sent AFTER encryption starts (inside the
+            // encrypted tunnel). To validate the client certificate, we would need to complete
+            // our own TLS handshake and decrypt the connection, which defeats the purpose of
+            // passthrough mode. Use terminate mode if client certificate validation is needed.
+        }
+        Ok(())
+    }
+
+    /// Validate that client_tls is not enabled in passthrough mode
+    /// This must be called after action_data is available
+    pub fn validate_with_action(&self, action: &TcpAction) -> Result<(), String> {
+        if self.is_passthrough() {
+            if let TcpAction::Raw(RawTcpActionConfig { locations }) = action {
+                for location in locations.iter() {
+                    let (_, client_tls) = location.clone().into_components();
+                    if client_tls.is_enabled() {
+                        return Err(
+                            "client_tls cannot be enabled in TLS passthrough mode (would cause TLS-in-TLS). Use terminate mode or disable client_tls.".to_string()
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -937,11 +1027,46 @@ pub async fn load_server_configs(
         }
     }
 
+    // Expand targets with optional: true into two separate targets
+    // and replace IP groups
     for server_config in server_configs.iter_mut() {
         match server_config.target_configs {
             TargetConfigs::Tcp {
                 ref mut targets, ..
             } => {
+                // First, expand optional: true targets
+                let mut expanded_targets = Vec::new();
+                for target in targets.iter() {
+                    if let Some(ref server_tls) = target.server_tls {
+                        if server_tls.optional {
+                            warn!(
+                                "Auto-migrating 'optional: true' at {} - creating two explicit targets",
+                                server_config.address
+                            );
+
+                            // Create TLS target (without optional flag)
+                            let mut tls_target = target.clone();
+                            if let Some(ref mut tls_config) = tls_target.server_tls {
+                                tls_config.optional = false;
+                            }
+                            expanded_targets.push(tls_target);
+
+                            // Create non-TLS target
+                            let mut non_tls_target = target.clone();
+                            non_tls_target.server_tls = None;
+                            expanded_targets.push(non_tls_target);
+                        } else {
+                            expanded_targets.push(target.clone());
+                        }
+                    } else {
+                        expanded_targets.push(target.clone());
+                    }
+                }
+
+                // Replace targets with expanded version
+                *targets = OneOrSome::Some(expanded_targets);
+
+                // Then replace IP groups
                 for target in targets.iter_mut() {
                     IpMaskSelection::replace_groups(&mut target.allowlist, &groups)?;
                 }
