@@ -855,28 +855,13 @@ async fn run_stream_action(
             path_configs,
             default_http_action,
         } => {
-            // TODO: Refactor handle_http_stream to accept initial_data directly
-            // instead of using ReplayTcpStream wrapper. This would eliminate the
-            // wrapper overhead for HTTP actions with buffered data from failed TLS parse.
-
-            // For now, we require that HTTP actions with initial_data are only called
-            // from the non-TLS fallback path where source_stream is a raw TcpStream
-            if initial_data.is_some() {
-                // This should only happen from non-TLS fallback (lines 746, 760)
-                // where source_stream is guaranteed to be Box<TcpStream>
-                // We need to downcast and wrap with ReplayTcpStream
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "HTTP actions with initial_data not yet supported - would require ReplayTcpStream wrapping",
-                ));
-            }
-
             handle_http_stream(
                 target_data.tcp_nodelay,
                 path_configs,
                 default_http_action,
                 source_stream,
                 addr,
+                initial_data,
             )
             .await
         }

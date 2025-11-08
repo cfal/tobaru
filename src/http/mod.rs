@@ -30,6 +30,7 @@ pub async fn handle_http_stream(
     default_action: &TargetHttpActionData,
     mut stream: Box<dyn AsyncStream>,
     addr: &std::net::SocketAddr,
+    mut initial_data: Option<Vec<u8>>,
 ) -> std::io::Result<()> {
     const LOG_PREFIX: &str = "http";
 
@@ -55,7 +56,9 @@ pub async fn handle_http_stream(
         let request_id = format!("{}#{}", stream_id, iteration);
 
         // TODO: add a read timeout
-        let mut request_data = http_parser::ParsedHttpData::parse(&mut stream).await?;
+        // Use initial_data only on the first iteration (take() consumes it)
+        let initial = if iteration == 1 { initial_data.take() } else { None };
+        let mut request_data = http_parser::ParsedHttpData::parse(&mut stream, initial).await?;
 
         let mut first_line = request_data.first_line().to_string();
 
@@ -433,8 +436,9 @@ pub async fn handle_http_stream(
                 target_stream.flush().await?;
 
                 // TODO: add a read timeout
+                // Responses from target server never have initial_data
                 let mut response_data =
-                    http_parser::ParsedHttpData::parse(&mut target_stream).await?;
+                    http_parser::ParsedHttpData::parse(&mut target_stream, None).await?;
 
                 response_data
                     .headers_mut()

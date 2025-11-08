@@ -20,6 +20,33 @@ impl LineReader {
         }
     }
 
+    /// Create a LineReader pre-populated with initial data.
+    /// This is used when we've already buffered some data (e.g., from a failed TLS parse)
+    /// and need to parse it as HTTP. The data buffer is consumed directly without cloning.
+    /// If the data is smaller than BUFFER_SIZE, it will be extended to BUFFER_SIZE to allow
+    /// reading additional data from the stream. If larger, the data buffer itself is used
+    /// as-is (allowing larger initial buffers when needed).
+    pub fn new_with_data(mut data: Vec<u8>) -> Self {
+        let data_len = data.len();
+
+        if data_len < BUFFER_SIZE {
+            // Extend the buffer to BUFFER_SIZE to allow reading more data
+            data.resize(BUFFER_SIZE, 0);
+            Self {
+                buf: data.into_boxed_slice(),
+                start_offset: 0,
+                end_offset: data_len,
+            }
+        } else {
+            // Use the data buffer directly (larger than standard size)
+            Self {
+                buf: data.into_boxed_slice(),
+                start_offset: 0,
+                end_offset: data_len,
+            }
+        }
+    }
+
     fn reset_buf_offset(&mut self) {
         if self.start_offset == 0 {
             return;

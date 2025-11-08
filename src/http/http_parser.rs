@@ -11,11 +11,18 @@ pub struct ParsedHttpData {
 }
 
 impl ParsedHttpData {
-    pub async fn parse<T>(stream: &mut T) -> std::io::Result<Self>
+    pub async fn parse<T>(
+        stream: &mut T,
+        initial_data: Option<Vec<u8>>,
+    ) -> std::io::Result<Self>
     where
         T: AsyncRead + Unpin,
     {
-        let mut line_reader = LineReader::new();
+        let mut line_reader = if let Some(data) = initial_data {
+            LineReader::new_with_data(data)
+        } else {
+            LineReader::new()
+        };
         let mut first_line: Option<String> = None;
         let mut headers: HashMap<String, String> = HashMap::new();
 
