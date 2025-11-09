@@ -14,8 +14,7 @@ impl TryFrom<&str> for NetLocation {
     fn try_from(value: &str) -> std::io::Result<Self> {
         let tokens = value.splitn(2, ':').collect::<Vec<_>>();
         if tokens.len() != 2 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(std::io::Error::other(
                 "Invalid net address",
             ));
         }

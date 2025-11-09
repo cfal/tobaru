@@ -578,16 +578,11 @@ impl TcpTargetLocation {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum TlsMode {
-    Terminate,   // Decrypt TLS and terminate (default, current behavior)
+    #[default]
+    Terminate, // Decrypt TLS and terminate (default, current behavior)
     Passthrough, // Parse SNI but don't decrypt (transparent forwarding)
-}
-
-impl Default for TlsMode {
-    fn default() -> Self {
-        TlsMode::Terminate
-    }
 }
 
 impl<'de> Deserialize<'de> for TlsMode {
@@ -653,21 +648,15 @@ impl ServerTlsConfig {
 
         if self.is_terminate() {
             if self.cert.is_none() || self.key.is_none() {
-                return Err(
-                    "cert and key are required for terminate mode".to_string()
-                );
+                return Err("cert and key are required for TLS terminate mode".to_string());
             }
-        } else if self.is_passthrough() {
-            if !self.client_fingerprints.is_empty() {
-                return Err(
-                    "client_fingerprints is not valid for passthrough mode".to_string()
-                );
-            }
+        } else if self.is_passthrough() && !self.client_fingerprints.is_empty() {
             // NOTE: client_fingerprints cannot be supported in passthrough mode.
             // In TLS 1.3, client certificates are sent AFTER encryption starts (inside the
             // encrypted tunnel). To validate the client certificate, we would need to complete
             // our own TLS handshake and decrypt the connection, which defeats the purpose of
             // passthrough mode. Use terminate mode if client certificate validation is needed.
+            return Err("client_fingerprints is not valid for TLS passthrough mode".to_string());
         }
         Ok(())
     }
@@ -691,8 +680,9 @@ impl ServerTlsConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum ClientTlsConfig {
+    #[default]
     Disabled,
     Enabled {
         verify: bool,
@@ -702,12 +692,6 @@ pub enum ClientTlsConfig {
         alpn_protocols: NoneOrSome<String>,
         server_fingerprints: NoneOrSome<String>,
     },
-}
-
-impl Default for ClientTlsConfig {
-    fn default() -> Self {
-        ClientTlsConfig::Disabled
-    }
 }
 
 impl<'de> Deserialize<'de> for ClientTlsConfig {
@@ -817,7 +801,9 @@ impl<'de> Deserialize<'de> for ClientTlsConfig {
                         }
                         "server_fingerprints" | "server_fingerprint" => {
                             if server_fingerprints.is_some() {
-                                return Err(serde::de::Error::duplicate_field("server_fingerprints"));
+                                return Err(serde::de::Error::duplicate_field(
+                                    "server_fingerprints",
+                                ));
                             }
                             server_fingerprints = Some(map.next_value()?);
                         }
@@ -896,7 +882,10 @@ impl ClientTlsConfig {
 
     pub fn server_fingerprints(&self) -> &NoneOrSome<String> {
         match self {
-            ClientTlsConfig::Enabled { server_fingerprints, .. } => server_fingerprints,
+            ClientTlsConfig::Enabled {
+                server_fingerprints,
+                ..
+            } => server_fingerprints,
             ClientTlsConfig::Disabled => &NoneOrSome::Unspecified,
         }
     }

@@ -1,17 +1,16 @@
-/// Cancellation-safe buffered reader for TLS parsing.
+/// Buffered reader for TLS parsing.
 ///
 /// This reader uses `stream.read()` instead of `read_exact()` to ensure
 /// cancellation safety. It maintains a buffer that can be retrieved even
 /// if parsing fails, allowing the data to be replayed for other purposes.
-
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
+
+use crate::util::allocate_vec;
 
 /// Maximum TLS frame size (5 byte header + 65535 byte payload)
 const TLS_FRAME_MAX_LEN: usize = 5 + 65535;
 
-/// Cancellation-safe buffered reader for TLS parsing
-/// Uses stream.read() instead of read_exact() for cancellation safety
 pub struct TlsReader {
     buf: Vec<u8>,
     pos: usize,
@@ -21,20 +20,23 @@ pub struct TlsReader {
 impl TlsReader {
     pub fn new() -> Self {
         Self {
-            buf: vec![0u8; TLS_FRAME_MAX_LEN],
+            buf: allocate_vec(TLS_FRAME_MAX_LEN),
             pos: 0,
             end: 0,
         }
     }
 
-    /// Ensure at least `len` more bytes are buffered (cancellation-safe)
-    /// Uses stream.read() instead of read_exact() for cancellation safety
-    pub async fn ensure_bytes(&mut self, stream: &mut TcpStream, len: usize) -> std::io::Result<()> {
+    /// Ensure at least `len` more bytes are buffered
+    pub async fn ensure_bytes(
+        &mut self,
+        stream: &mut TcpStream,
+        len: usize,
+    ) -> std::io::Result<()> {
         let needed = self.pos + len;
         if needed > self.buf.len() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                format!("Requested data exceeds buffer size"),
+                "Requested data exceeds buffer size".to_string(),
             ));
         }
 
@@ -61,7 +63,6 @@ impl TlsReader {
                 self.pos = 0;
             }
 
-            // Cancellation-safe read (not read_exact!)
             loop {
                 match stream.read(&mut self.buf[self.end..]).await {
                     Ok(0) => {
@@ -119,7 +120,12 @@ impl TlsReader {
                 "buffer underflow",
             ));
         }
-        let val = u32::from_be_bytes([0, self.buf[self.pos], self.buf[self.pos + 1], self.buf[self.pos + 2]]);
+        let val = u32::from_be_bytes([
+            0,
+            self.buf[self.pos],
+            self.buf[self.pos + 1],
+            self.buf[self.pos + 2],
+        ]);
         self.pos += 3;
         Ok(val)
     }
@@ -168,11 +174,6 @@ impl TlsReader {
     /// Check if all data has been consumed
     pub fn is_consumed(&self) -> bool {
         self.pos >= self.end
-    }
-
-    /// Get all buffered data (for forwarding/replaying)
-    pub fn buffered_data(&self) -> &[u8] {
-        &self.buf[0..self.end]
     }
 
     /// Consume the reader and return the internal buffer and positions

@@ -1,14 +1,12 @@
 /// TLS ClientHello parser for transparent SNI routing.
 ///
 /// This module parses the TLS ClientHello message to extract SNI and ALPN
-/// without terminating the TLS connection. Adapted from the shoes project's
-/// shadow_tls_server_handler.rs with simplifications for passthrough routing.
+/// without terminating the TLS connection.
 ///
 /// References:
 /// - https://datatracker.ietf.org/doc/html/rfc8446 (TLS 1.3)
 /// - https://datatracker.ietf.org/doc/html/rfc5246 (TLS 1.2)
 /// - https://datatracker.ietf.org/doc/html/rfc6066 (SNI Extension)
-
 use crate::tls_reader::TlsReader;
 use tokio::net::TcpStream;
 
@@ -39,7 +37,7 @@ pub async fn parse_client_hello(
     reader: &mut TlsReader,
     stream: &mut TcpStream,
 ) -> std::io::Result<ParsedClientHello> {
-    // Read TLS record header (5 bytes) - cancellation-safe!
+    // Read TLS record header (5 bytes)
     reader.ensure_bytes(stream, TLS_HEADER_LEN).await?;
 
     let content_type = reader.read_u8()?;
@@ -66,16 +64,8 @@ pub async fn parse_client_hello(
     }
 
     let payload_len = reader.read_u16_be()? as usize;
-    // Maximum TLS payload is 65535 (fits in u16)
-    const TLS_MAX_PAYLOAD: usize = 65535;
-    if payload_len > TLS_MAX_PAYLOAD {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("payload too large: {}", payload_len),
-        ));
-    }
 
-    // Read the payload - cancellation-safe!
+    // Read the payload
     reader.ensure_bytes(stream, payload_len).await?;
 
     // Parse handshake message

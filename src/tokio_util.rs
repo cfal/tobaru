@@ -7,5 +7,5 @@ where
     lookup_host(host)
         .await?
         .next()
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "Unable to resolve host"))
+        .ok_or_else(|| std::io::Error::other("Unable to resolve host"))
 }

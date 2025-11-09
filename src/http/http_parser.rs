@@ -11,10 +11,7 @@ pub struct ParsedHttpData {
 }
 
 impl ParsedHttpData {
-    pub async fn parse<T>(
-        stream: &mut T,
-        initial_data: Option<Vec<u8>>,
-    ) -> std::io::Result<Self>
+    pub async fn parse<T>(stream: &mut T, initial_data: Option<Vec<u8>>) -> std::io::Result<Self>
     where
         T: AsyncRead + Unpin,
     {
@@ -34,8 +31,7 @@ impl ParsedHttpData {
             }
 
             if line.len() >= 4096 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                return Err(std::io::Error::other(
                     "http request line is too long",
                 ));
             }
@@ -45,8 +41,7 @@ impl ParsedHttpData {
             } else {
                 let tokens: Vec<&str> = line.splitn(2, ':').collect();
                 if tokens.len() != 2 {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
+                    return Err(std::io::Error::other(
                         format!("invalid http request line: {}", line),
                     ));
                 }
@@ -57,15 +52,14 @@ impl ParsedHttpData {
 
             line_count += 1;
             if line_count >= 40 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                return Err(std::io::Error::other(
                     "http request is too long",
                 ));
             }
         }
 
         let first_line = first_line
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "empty http request"))?;
+            .ok_or_else(|| std::io::Error::other("empty http request"))?;
 
         Ok(Self {
             first_line,

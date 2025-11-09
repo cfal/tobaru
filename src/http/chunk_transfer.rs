@@ -158,8 +158,7 @@ impl ChunkTransfer {
                             // CRLF not found yet.
                             if self.read_size_buf.len() >= CHUNK_SIZE_LINE_MAX_LEN {
                                 // Buffer is full, but still no CRLF
-                                return Err(std::io::Error::new(
-                                    std::io::ErrorKind::Other,
+                                return Err(std::io::Error::other(
                                     format!(
                                         "chunk size line exceeded max length ({}) without CRLF",
                                         CHUNK_SIZE_LINE_MAX_LEN
@@ -269,8 +268,7 @@ impl ChunkTransfer {
                         None => {
                             // CRLF not found yet
                             if new_cached_len == self.trailer_header_buf.len() {
-                                return Err(std::io::Error::new(
-                                    std::io::ErrorKind::Other, // Or InvalidData?
+                                return Err(std::io::Error::other(
                                     "could not read trailer header, line exceeded max length",
                                 ));
                             }
@@ -289,8 +287,7 @@ impl ChunkTransfer {
 
                 Done => {
                     // If we are already Done, any further data is an error
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
+                    return Err(std::io::Error::other(
                         "extra data received after chunked transfer completion",
                     ));
                 }
@@ -312,7 +309,9 @@ impl ChunkTransfer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncWriteExt, BufWriter}; // Make sure tokio is a dev-dependency
+    use std::time::Duration;
+    use tokio::io::{AsyncWriteExt, BufWriter};
+    use tokio::time::timeout;
 
     // Helper struct to act as a mock AsyncWrite target
     struct MockWriter {

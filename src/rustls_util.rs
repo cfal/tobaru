@@ -184,7 +184,8 @@ impl rustls::client::danger::ServerCertVerifier for ServerFingerprintVerifier {
             )?;
         }
 
-        let fingerprint = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, end_entity.as_ref());
+        let fingerprint =
+            aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, end_entity.as_ref());
         let fingerprint_bytes = fingerprint.as_ref();
 
         if self.server_fingerprints.contains(fingerprint_bytes) {
@@ -247,7 +248,10 @@ pub fn load_private_key(key_bytes: &[u8]) -> PrivateKeyDer<'static> {
 struct AlwaysResolvesServerCert(Arc<rustls::sign::CertifiedKey>);
 
 impl rustls::server::ResolvesServerCert for AlwaysResolvesServerCert {
-    fn resolve(&self, _client_hello: rustls::server::ClientHello) -> Option<Arc<rustls::sign::CertifiedKey>> {
+    fn resolve(
+        &self,
+        _client_hello: rustls::server::ClientHello,
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
         Some(self.0.clone())
     }
 }
@@ -350,7 +354,8 @@ impl rustls::server::danger::ClientCertVerifier for ClientFingerprintVerifier {
         _intermediates: &[CertificateDer<'_>],
         _now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
-        let fingerprint = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, end_entity.as_ref());
+        let fingerprint =
+            aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, end_entity.as_ref());
         let fingerprint_bytes = fingerprint.as_ref();
 
         if self.client_fingerprints.contains(fingerprint_bytes) {

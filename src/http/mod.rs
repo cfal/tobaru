@@ -57,14 +57,17 @@ pub async fn handle_http_stream(
 
         // TODO: add a read timeout
         // Use initial_data only on the first iteration (take() consumes it)
-        let initial = if iteration == 1 { initial_data.take() } else { None };
+        let initial = if iteration == 1 {
+            initial_data.take()
+        } else {
+            None
+        };
         let mut request_data = http_parser::ParsedHttpData::parse(&mut stream, initial).await?;
 
         let mut first_line = request_data.first_line().to_string();
 
         if !first_line.ends_with(" HTTP/1.1") {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(std::io::Error::other(
                 format!("Not a http/1.1 request: {}", request_data.first_line()),
             ));
         }
@@ -75,8 +78,7 @@ pub async fn handle_http_stream(
         let space_index = match first_line.find(' ') {
             Some(i) => i,
             None => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                return Err(std::io::Error::other(
                     format!(
                         "Invalid http request directive: {}",
                         request_data.first_line()
@@ -87,8 +89,7 @@ pub async fn handle_http_stream(
 
         let request_path = first_line.split_off(space_index + 1);
         if !request_path.starts_with('/') {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(std::io::Error::other(
                 format!("Invalid http request path: {}", request_data.first_line()),
             ));
         }
@@ -186,8 +187,7 @@ pub async fn handle_http_stream(
                 }
 
                 if memmem::find(request_path.as_bytes(), b"..").is_some() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
+                    return Err(std::io::Error::other(
                         format!(
                             "Ignoring request with possible base path escape: {}",
                             request_data.first_line()
@@ -199,8 +199,7 @@ pub async fn handle_http_stream(
                     Ok(mut canonical_path) => {
                         // We filter out '..' from requests, so can this still occur?
                         if !canonical_path.starts_with(path) {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::Other,
+                            return Err(std::io::Error::other(
                                 format!(
                                     "Canonical path ({}) does not start with serve path ({})",
                                     canonical_path.display(),
@@ -325,8 +324,7 @@ pub async fn handle_http_stream(
                             "[{}] {} {} [serve file: invalid path]",
                             LOG_PREFIX, &verb, &request_path
                         );
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
+                        return Err(std::io::Error::other(
                             format!("Could not canonicalize path: {}", e),
                         ));
                     }
@@ -391,8 +389,7 @@ pub async fn handle_http_stream(
                         .await?
                         .is_empty()
                     {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
+                        return Err(std::io::Error::other(
                             "Unexpected non-empty line after reading expectation",
                         ));
                     }
@@ -404,15 +401,13 @@ pub async fn handle_http_stream(
                     let expectation_failure = expect_response.starts_with("HTTP/1.1 417");
 
                     if !expectation_success && !expectation_failure {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
+                        return Err(std::io::Error::other(
                             format!("Unexpected expectation response: {}", expect_response),
                         ));
                     }
 
                     if !target_reader.unparsed_data().is_empty() {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
+                        return Err(std::io::Error::other(
                             "Unexpected unparsed data after reading expectation",
                         ));
                     }
@@ -575,8 +570,7 @@ where
     let content_length = http_data.headers().content_length()?;
 
     if chunked && content_length.is_some() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        return Err(std::io::Error::other(
             "Chunked transfer encoding and content length both provided",
         ));
     }
@@ -594,8 +588,7 @@ where
     } else if chunked {
         forward_chunked_content(from_stream, maybe_to_stream, reader).await?;
     } else if !reader.unparsed_data().is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        return Err(std::io::Error::other(
             format!(
                 "Unexpected request data with len {}",
                 reader.unparsed_data().len()
@@ -618,8 +611,7 @@ where
 {
     let unparsed_data = reader.unparsed_data();
     if unparsed_data.len() > content_length {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        return Err(std::io::Error::other(
             format!(
                 "Unexpected content length ({} > {})",
                 unparsed_data.len(),
@@ -640,8 +632,7 @@ where
         let max_len = std::cmp::min(remaining, buf.len());
         let read_len = from_stream.read(&mut buf[0..max_len]).await?;
         if read_len == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(std::io::Error::other(
                 format!(
                     "Got EOF while reading content with length, {} bytes were remaining",
                     remaining
@@ -674,8 +665,7 @@ where
     while !chunk_transfer.is_done() {
         let read_len = from_stream.read(&mut buf).await?;
         if read_len == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(std::io::Error::other(
                 "Got EOF during chunk transfer",
             ));
         }

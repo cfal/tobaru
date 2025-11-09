@@ -172,7 +172,7 @@ async fn clear_iptables(comment: &str) {
         .into_iter()
         .rev()
         {
-            if line.find(comment).is_some() {
+            if line.contains(comment) {
                 let rule_number = line.trim_start().split(' ').next().unwrap();
                 run(program, &["--wait", "5", "-D", "INPUT", rule_number]).await;
             }

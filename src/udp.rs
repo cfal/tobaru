@@ -239,7 +239,7 @@ impl Association {
     fn try_send(&self, data: Box<[u8]>) -> std::io::Result<()> {
         self.tx
             .try_send(data)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+            .map_err(std::io::Error::other)
     }
 }
 
