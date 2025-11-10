@@ -3,7 +3,6 @@ mod config;
 mod copy_bidirectional;
 mod http;
 mod iptables_util;
-mod replay_stream;
 mod rustls_util;
 mod tcp;
 mod tls_parser;

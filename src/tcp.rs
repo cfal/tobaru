@@ -25,7 +25,6 @@ use crate::config::{
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::http::handle_http_stream;
 use crate::iptables_util::{configure_iptables, Protocol};
-use crate::replay_stream::ReplayTcpStream;
 use crate::rustls_util::{
     create_server_config, get_dummy_server_name, load_certs, load_private_key,
 };
@@ -584,7 +583,28 @@ fn find_matching_terminate_target(
     None
 }
 
-/// Handle terminate mode with parsed ClientHello - use LazyConfigAcceptor with replay wrapper
+/// Feed data into rustls ServerConnection
+fn feed_server_connection(
+    server_conn: &mut rustls::ServerConnection,
+    data: &[u8],
+) -> std::io::Result<()> {
+    use std::io::Cursor;
+
+    let mut cursor = Cursor::new(data);
+    let mut i = 0;
+    while i < data.len() {
+        let n = server_conn.read_tls(&mut cursor).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Failed to feed server connection: {e}"),
+            )
+        })?;
+        i += n;
+    }
+    Ok(())
+}
+
+/// Handle terminate mode with parsed ClientHello - use TlsAcceptor directly
 async fn handle_terminate_with_parsed(
     stream: TcpStream,
     addr: &std::net::SocketAddr,
@@ -592,28 +612,48 @@ async fn handle_terminate_with_parsed(
     target_data: Arc<TlsTargetData>,
     tls_config: Arc<rustls::ServerConfig>,
 ) -> std::io::Result<(Box<dyn AsyncStream>, Arc<TargetData>)> {
-    use tokio_rustls::LazyConfigAcceptor;
+    use tokio_rustls::TlsAcceptor;
 
     debug!("Terminate TLS for {}", addr);
 
-    // Wrap the TcpStream with a replay wrapper so LazyConfigAcceptor can read the ClientHello
-    // that we've already parsed for routing
-    let replay_stream = ReplayTcpStream::new(stream, client_hello_frame);
+    // Use TlsAcceptor directly - no need for LazyConfigAcceptor since we've already
+    // parsed the ClientHello and selected the correct config
+    let tls_acceptor = TlsAcceptor::from(tls_config);
 
-    // Use LazyConfigAcceptor with the replay stream
-    let acceptor = LazyConfigAcceptor::new(rustls::server::Acceptor::default(), replay_stream);
-    let start_handshake = acceptor.await?;
+    let accept_future = {
+        let mut accept_error: Option<std::io::Error> = None;
 
-    // Complete the handshake with our pre-selected config
-    let tls_stream = start_handshake
-        .into_stream_with(tls_config, |server_conn| {
+        let accept_future = tls_acceptor.accept_with(stream, |server_conn| {
             server_conn.set_buffer_limit(Some(32768));
-        })
-        .await?;
+
+            // Feed the ClientHello we already parsed for routing
+            if let Err(e) = feed_server_connection(server_conn, &client_hello_frame) {
+                let _ = accept_error.insert(std::io::Error::other(format!(
+                    "Failed to feed ClientHello to server connection: {e}"
+                )));
+                return;
+            }
+
+            // Process the fed data
+            if let Err(e) = server_conn.process_new_packets() {
+                let _ = accept_error.insert(std::io::Error::other(format!(
+                    "Failed to process new packets: {e}"
+                )));
+            }
+        });
+
+        if let Some(e) = accept_error {
+            return Err(e);
+        }
+
+        accept_future
+    };
+
+    let tls_stream = Box::new(accept_future.await?);
 
     debug!("Completed TLS handshake for {}", addr);
 
-    Ok((Box::new(tls_stream), target_data.target_data.clone()))
+    Ok((tls_stream, target_data.target_data.clone()))
 }
 
 /// Find matching TLS target based on SNI and ALPN
