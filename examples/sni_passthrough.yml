@@ -1,0 +1,136 @@
+# Example: Transparent TLS SNI Routing with Passthrough Mode
+#
+# This example demonstrates routing TLS traffic based on SNI hostname
+# WITHOUT decrypting the traffic. The entire TLS stream is forwarded
+# transparently to the backend.
+#
+# Use case: Load balancing or routing TLS traffic without needing
+# the private keys on the forwarding server.
+
+# Example 1: Simple SNI-based routing
+- address: 0.0.0.0:8443
+  transport: tcp
+  targets:
+    # Route api.example.com to backend-api server (passthrough)
+    - location: 192.168.1.10:443
+      allowlist: 0.0.0.0/0
+      server_tls:
+        mode: passthrough
+        sni_hostnames: api.example.com
+        # Optional: also match ALPN protocols
+        alpn_protocols:
+          - h2
+          - http/1.1
+
+    # Route www.example.com to backend-web server (passthrough)
+    - location: 192.168.1.11:443
+      allowlist: 0.0.0.0/0
+      server_tls:
+        mode: passthrough
+        sni_hostnames: www.example.com
+
+# Example 2: Multiple SNI hostnames to same backend
+- address: 0.0.0.0:9443
+  transport: tcp
+  targets:
+    - location: cdn-backend:443
+      allowlist: 0.0.0.0/0
+      server_tls:
+        mode: passthrough
+        sni_hostnames:
+          - cdn1.example.com
+          - cdn2.example.com
+          - cdn3.example.com
+
+# Example 3: Mixed passthrough and terminate modes on same port
+- address: 0.0.0.0:443
+  transport: tcp
+  targets:
+    # Public API - passthrough (don't need to decrypt)
+    - location: api-backend.internal:443
+      allowlist: 0.0.0.0/0
+      server_tls:
+        mode: passthrough
+        sni_hostnames: api.example.com
+
+    # Admin panel - terminate and decrypt (need to inspect/log)
+    - location: 127.0.0.1:8080
+      allowlist:
+        - 10.0.0.0/8      # Internal network only
+        - 172.16.0.0/12   # VPN range
+      server_tls:
+        mode: terminate   # Decrypt TLS
+        cert: /path/to/admin-cert.pem
+        key: /path/to/admin-key.pem
+        sni_hostnames: admin.example.com
+
+# Example 4: Wildcard/catchall routing with passthrough
+- address: 0.0.0.0:10443
+  transport: tcp
+  targets:
+    # Specific hostnames
+    - location: special-backend:443
+      allowlist: 0.0.0.0/0
+      server_tls:
+        mode: passthrough
+        sni_hostnames: special.example.com
+
+    # Catch-all for any other SNI (or no SNI)
+    - location: default-backend:443
+      allowlist: 0.0.0.0/0
+      server_tls:
+        mode: passthrough
+        sni_hostnames:
+          - any   # Accept any SNI
+          - none  # Accept connections without SNI
+
+# Example 5: ALPN-based routing with passthrough
+- address: 0.0.0.0:11443
+  transport: tcp
+  targets:
+    # HTTP/2 traffic goes to specialized backend
+    - location: h2-backend:443
+      allowlist: 0.0.0.0/0
+      server_tls:
+        mode: passthrough
+        sni_hostnames: app.example.com
+        alpn_protocols: h2
+
+    # HTTP/1.1 traffic goes to legacy backend
+    - location: h1-backend:443
+      allowlist: 0.0.0.0/0
+      server_tls:
+        mode: passthrough
+        sni_hostnames: app.example.com
+        alpn_protocols: http/1.1
+
+# Example 6: IP-based routing with passthrough
+- address: 0.0.0.0:12443
+  transport: tcp
+  targets:
+    # Premium customers get dedicated backend
+    - location: premium-backend:443
+      allowlist:
+        - 203.0.113.0/24  # Premium customer IPs
+      server_tls:
+        mode: passthrough
+        sni_hostnames: app.example.com
+
+    # Everyone else gets shared backend
+    - location: shared-backend:443
+      allowlist: 0.0.0.0/0
+      server_tls:
+        mode: passthrough
+        sni_hostnames: app.example.com
+
+# Testing commands:
+#
+# Test SNI routing with openssl:
+#   openssl s_client -connect localhost:8443 -servername api.example.com
+#
+# Test with curl (will follow the SNI routing):
+#   curl --resolve api.example.com:8443:127.0.0.1 https://api.example.com:8443/
+#
+# Verify traffic is NOT decrypted (use tcpdump):
+#   sudo tcpdump -i any -A 'tcp port 8443' | grep -i "GET\|POST"
+#   (Should NOT see plaintext HTTP since it's passthrough)
