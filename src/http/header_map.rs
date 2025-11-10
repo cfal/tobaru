@@ -25,9 +25,10 @@ impl HeaderMap for HashMap<String, String> {
         match self.get("content-length") {
             Some(value) => match value.parse::<usize>() {
                 Ok(len) => Ok(Some(len)),
-                Err(e) => Err(std::io::Error::other(
-                    format!("Could not parse content length: {}", e),
-                )),
+                Err(e) => Err(std::io::Error::other(format!(
+                    "Could not parse content length: {}",
+                    e
+                ))),
             },
             None => Ok(None),
         }
@@ -45,9 +46,10 @@ impl HeaderMap for HashMap<String, String> {
                 // 100-continue is the only supported value.
                 // ref: https://datatracker.ietf.org/doc/html/rfc7231#section-5.1.1
                 if s != "100-continue" {
-                    return Err(std::io::Error::other(
-                        format!("Invalid expect value: {}", s),
-                    ));
+                    return Err(std::io::Error::other(format!(
+                        "Invalid expect value: {}",
+                        s
+                    )));
                 }
                 Ok(true)
             }

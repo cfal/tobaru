@@ -158,12 +158,10 @@ impl ChunkTransfer {
                             // CRLF not found yet.
                             if self.read_size_buf.len() >= CHUNK_SIZE_LINE_MAX_LEN {
                                 // Buffer is full, but still no CRLF
-                                return Err(std::io::Error::other(
-                                    format!(
-                                        "chunk size line exceeded max length ({}) without CRLF",
-                                        CHUNK_SIZE_LINE_MAX_LEN
-                                    ),
-                                ));
+                                return Err(std::io::Error::other(format!(
+                                    "chunk size line exceeded max length ({}) without CRLF",
+                                    CHUNK_SIZE_LINE_MAX_LEN
+                                )));
                             }
 
                             self.state = ChunkTransferState::ReadSize {
