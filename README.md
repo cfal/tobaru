@@ -1,59 +1,61 @@
 # tobaru
 
-Port forwarding tool written in Rust with advanced features, such as:
+Advanced port forwarding tool written in Rust with powerful routing and TLS features:
 
-- **Multiple target addresses**: Forwards to different target addresses based on IP and TLS SNI/ALPN
-  - **IPv4/IPv6 allowlists**: Only forwards connections from known IP ranges
-  - **TLS support**:
-    - Allow both TLS and non-TLS clients on a single port
-    - Connect to TLS and non-TLS endpoints
-- **Hot reloading**: Updated configs are automatically reloaded
-- **iptables support**: Automatically configures iptables to drop packets from unallowed ranges
-- **IP groups**: named groups of IPs that can be reused amongst different server configurations
+## Key Features
 
-Here's a quick example:
+- **🔀 Multiple routing strategies**: Route connections based on IP address, TLS SNI, ALPN protocol, or HTTP path
+- **🔒 Flexible TLS handling**:
+  - **Passthrough mode**: Route TLS by SNI/ALPN without decryption (zero overhead, no private keys needed)
+  - **Terminate mode**: Decrypt TLS and route based on SNI/ALPN or HTTP content
+  - Mix both modes on the same port
+  - Client certificate pinning (SHA256 fingerprint validation)
+  - Server certificate pinning (SHA256 fingerprint validation)
+- **🌐 HTTP proxy features**:
+  - Path-based routing with prefix matching
+  - Serve static files from directories
+  - Serve custom responses with configurable status codes
+  - Header manipulation (add/remove/modify headers)
+  - WebSocket support with automatic upgrade handling
+  - Connection keep-alive support
+- **🔥 Hot reloading**: Config changes are automatically detected and applied
+- **🛡️ iptables integration**: Automatically configure firewall rules for IP allowlists
+- **📦 IP groups**: Reusable named groups of IP ranges
+- **⚡ High performance**: Async I/O with Tokio, minimal allocations
+
+## Quick Example
 
 ```yaml
+# Simple TLS passthrough routing by SNI
 - address: 0.0.0.0:443
   transport: tcp
   targets:
-
-    # target 1: non-TLS clients from any IP will be forwarded to 127.0.0.1:2999.
-    - location: 127.0.0.1:2999
+    # Route api.example.com without decryption
+    - location: api-backend:443
       allowlist: 0.0.0.0/0
-
-    # target 2: TLS clients from specified IP masks asking for SNI example.com and
-    # ALPN protocol http/1.1 will be forwarded to a listening UNIX domain socket.
-    - location: /run/service.sock
       server_tls:
-        cert: cert.pem
-        key: key.pem
-        sni_hostnames: example.com
-        alpn_protocols: http/1.1
-      allowlist:
-        - 1.2.3.4
-        - 2.3.0.0/16
+        mode: passthrough
+        sni_hostnames: api.example.com
 
-    # target 3: TLS clients from ip 1.2.3.4 asking for SNI example.com or test.com,
-    # and any other ALPN protocol, or no ALPN negotiation, will be forwarded here.
-    - location: 127.0.0.1:3001
+    # Route www.example.com to different backend
+    - location: web-backend:443
+      allowlist: 0.0.0.0/0
       server_tls:
-        cert: cert.pem
-        key: key.pem
-        sni_hostnames:
-          - example.com
-          - test.com
-        alpn_protocols:
-          - any
-          - none
-      allowlist: 1.2.3.4
+        mode: passthrough
+        sni_hostnames: www.example.com
 ```
 
 ## Installation
 
-Precompiled binaries for x86_64 and Apple aarch64 are available on [Github Releases](https://github.com/cfal/tobaru/releases).
+### Pre-compiled Binaries
 
-Else, if you have a fairly recent Rust and cargo installation on your system, tobaru can be installed with `cargo`.
+Download from [GitHub Releases](https://github.com/cfal/tobaru/releases) for:
+- Linux x86_64
+- macOS Apple Silicon (aarch64)
+
+### Build from Source
+
+Requires Rust 1.70+ and cargo:
 
 ```bash
 cargo install tobaru
@@ -63,314 +65,178 @@ cargo install tobaru
 
 ```
 USAGE:
-
     tobaru [OPTIONS] <CONFIG PATH or CONFIG URL> [CONFIG PATH or CONFIG URL] [..]
 
 OPTIONS:
-
-    -t, --threads NUM
-        Number of worker threads, defaults to an estimated amount of parallelism.
-
-    --clear-iptables-all
-        Clear all tobaru-created rules from iptables and exit immediately.
-
-    --clear-iptables-matching
-        Clear tobaru-created rules for the addresses specified in the specified
-        config files and exit immediately.
-
-    -h, --help
-        Show this help screen.
-
-IPTABLES PERMISSIONS:
-
-    To run iptable commands, this binary needs to have CAP_NET_RAW and CAP_NET_ADMIN
-    permissions, or else be invoked by root.
+    -t, --threads NUM           Number of worker threads (default: auto-detected)
+    --clear-iptables-all        Clear all tobaru iptables rules and exit
+    --clear-iptables-matching   Clear iptables rules for specified configs and exit
+    -h, --help                  Show help
 
 EXAMPLES:
+    # Run with config file
+    tobaru config.yaml
 
-    tobaru -t 1 config1.yaml config2.yaml
+    # Run with multiple configs
+    tobaru servers.yaml ip_groups.yaml
 
-        Run servers from configs in config1.yaml and config2.yaml on a single thread.
+    # Simple TCP forwarding via URL
+    tobaru tcp://127.0.0.1:8080?target=192.168.1.10:80
 
-    tobaru tcp://127.0.0.1:1000?target=127.0.0.1:2000
-
-        Run a tcp server on 127.0.0.1 port 1000, forwarding to 127.0.0.1 port 2000.
-
-    sudo tobaru --clear-iptables-matching config1.yaml
-
-        Clear iptable configs only for the config addresses in config1.yaml.
+    # Clear iptables rules
+    sudo tobaru --clear-iptables-matching config.yaml
 ```
 
-## Upgrading from 0.7.1 or lower
+## Configuration
 
-See [UPGRADING.md](UPGRADING.md).
+### TLS Passthrough Mode
 
-## URL-based configuration
-
-Simple TCP forwarding can be done using the config URL format:
-
-```
-tcp://<bind ip>:<bind port>?target=<target ip>:<target port>
-```
-
-TCP forwarding to a UNIX domain socket can be done with the `target-path` key:
-
-
-```
-tcp://<bind ip>:<bind port>?target-path=<unix domain socket path>
-```
-
-## File-based configuration
-
-Configuration files are in the YAML or JSON file format. tobaru expects to read an array of objects, where each object is a server configuration, or an IP mask group.
-
-### Server object configuration
-
-`address`: The address to listen on.
-
-`transport`: The transport protocol, a string of either `tcp` or `udp`.
-
-`use_iptables` (_optional_, default: `false`): Whether to enable iptables support.
-  - IP masks in allowlists specified in the targets would be added to iptables, and unspecified IP masks would be denied.
-
-`targets` (or `target`): An target location object or an array of target location objects that specify where to forward to.
-
-`tcp_nodelay` (_optional_, default: `true`): Specifies whether to disable Nagle's algorithm on the accepted socket.
-  - Only accepted when `transport` is `tcp`.
-
-#### Target object configuration (TCP transport)
-
-`locations` (or `location`): A single TCP location, or an array of TCP locations.
-
-  - When an array of multiple locations is provided, connections will be forwarded in a round-robin fashion.
-
-`allowlist`: A single IP mask or IP group name, or an array of IP mask or IP group names.
-
-`tcp_nodelay` (_optional_, default: `true`): Specifies whether to disable Nagle's algorithm on the target connected socket.
-
-`server_tls` (_optional_, default: `null`): A server TLS object. When non-null, only TLS connections will be accepted for this target. The object keys are:
-  - `cert`: A file path to the TLS certificate.
-  - `key`: A file path to the TLS private key.
-  - `optional` (_optional_, default: `false`): Specifies whether TLS is optional. When true, this means that non-TLS streams will also be accepted and forwarded.
-  - `sni_hostnames` (_optional_, default: `any, none`): A SNI hostname, or an array of SNI hostnames, with special keywords:
-    - `any`: Accept any provided SNI hostname.
-    - `none`: Accept handshakes without SNI negotiation.
-  - `alpn_protocols` (_optional_: default: `any, none`): An accepted ALPN protocol, or an array of supported ALPN protocols, with special keywords:
-    - `any`: Accept any provided ALPN protocol.
-    - `none`: Accept handshakes without ALPN protocol selection.
-  - `client_fingerprints` (_optional_, default: empty): SHA256 fingerprints of allowed client certificates. When specified, only clients presenting certificates with matching fingerprints will be accepted. Multiple fingerprints can be provided as an array. Fingerprints can be specified with or without colons separating hex bytes.
-    - To generate a client certificate and get its fingerprint:
-      1. Generate private key: `openssl ecparam -genkey -name prime256v1 -out client.key`
-      2. Create self-signed certificate: `openssl req -new -x509 -nodes -key client.key -out client.crt -days 365 -subj "/CN=Client"`
-      3. Get the SHA256 fingerprint: `openssl x509 -in client.crt -noout -fingerprint -sha256`
-
-#### TCP location configuration
-
-A TCP location can be specified as:
-
-- an address string. eg. `127.0.0.1:1234`
-- a UNIX domain socket path. eg. `/path/to/something.sock`
-- an object with the following keys:
-
-  `address`: an address string.
-    - only one of `address` or `path` can be specified.
-
-  `path`: a UNIX domain socket path.
-    - only one of `address` or `path` can be specified.
-
-  `client_tls` (_optional_, default: `false`): Specifies whether to handle TLS when connecting to this location. The supported values are:
-    - `true`: Enables client TLS handling, with certificate verification.
-    - `no-verify`: Enables client TLS handling, without certificate verification.
-    - `false`: Disables client TLS handling.
-    - An object with the following keys:
-      - `verify` (_optional_, default: `true`): Whether to verify the server certificate.
-      - `key` (_optional_): Path to client private key file for client certificate authentication.
-      - `cert` (_optional_): Path to client certificate file for client certificate authentication.
-        - Both `key` and `cert` must be specified together for client certificate authentication.
-      - `sni_hostname` (or `sni`) (_optional_): SNI hostname to send during TLS handshake.
-        - If omitted: SNI is derived from the address hostname (default behavior).
-        - To disable SNI: Set to YAML `null` (case-insensitive: null, Null, NULL, or ~). No SNI extension will be sent.
-        - Any other string: Use this specific SNI hostname.
-      - `alpn_protocols` (or `alpn` or `alpn_protocol`) (_optional_): ALPN protocols to negotiate. Can be a single protocol string or an array of protocol strings (e.g., `["h2", "http/1.1"]`).
-      - `server_fingerprints` (or `server_fingerprint`) (_optional_): SHA256 fingerprints of allowed server certificates. When specified, tobaru will only connect to servers presenting certificates with matching fingerprints. Multiple fingerprints can be provided as an array. Fingerprints can be specified with or without colons separating hex bytes. Can be combined with `verify: true` for additional WebPKI verification.
-
-#### Target object configuration (UDP transport)
-
-`addresses` (or `address`): A single address string, or an array of `host:port` address strings
-
-`allowlist`: A single IP mask or IP group name, or an array of IP mask or IP group names.
-
-`association_timeout_secs` (_optional_, default: `200`): Number of seconds before an inactive UDP association times out.
-
-### IP group object configuration
-
-`group`: Name of the IP group
-
-`ip_masks` (or `ip_mask`): A single IP mask or IP group name, or an array of IP mask or IP group names.
-
-A default IP group with name `all` and IP mask `0.0.0.0/0` is automatically added.
-
-## Examples
-
-### TCP to TCP forwarding, all IPs allowed
+Route TLS connections by SNI/ALPN without decryption - no private keys needed on the proxy:
 
 ```yaml
-- address: 0.0.0.0:8080
-  transport: tcp
-  target:
-    location: 192.168.8.1:80
-    allowlist: all
-```
-
-or with multiple servers and specific IP ranges:
-
-```yaml
-# Forward port 8080 to 192.168.8.1 port 80 for some IP ranges.
-- address: 0.0.0.0:8080
+- address: 0.0.0.0:443
   transport: tcp
   targets:
-    - address: 192.168.8.1:80
-      allowlist:
-        # Some local IP ranges..
-        - 192.168.9.0/24
-        - 192.168.10.0/24
+    # Route api.example.com to backend1 (passthrough - no cert/key needed!)
+    - location: backend1:443
+      allowlist: 0.0.0.0/0
+      server_tls:
+        mode: passthrough
+        sni_hostnames: api.example.com
+        alpn_protocols:
+          - h2
+          - http/1.1
 
-        # .. and some specific IPs
-        - 12.34.56.78
-        - fa71::e09d:92fa:beef:1234
+    # Route www.example.com to backend2
+    - location: backend2:443
+      allowlist: 0.0.0.0/0
+      server_tls:
+        mode: passthrough
+        sni_hostnames: www.example.com
+```
 
-    - address: 192.168.8.2:80
-      allowlist:
-        - 192.168.11.0/24
-        - 192.168.12.0/24
+**Benefits:**
+- ✅ No decryption/re-encryption overhead
+- ✅ No private keys needed on proxy (improved security)
+- ✅ Near-zero latency routing
+- ✅ Full end-to-end encryption preserved
 
-# Forward port 8081 to 192.168.8.2 port 80 for all IPs.
-- address: 0.0.0.0:8081
-  transport: udp
+### TLS Terminate Mode
+
+Decrypt TLS and route based on content:
+
+```yaml
+- address: 0.0.0.0:443
+  transport: tcp
+  targets:
+    - location: backend:8080
+      allowlist: 0.0.0.0/0
+      server_tls:
+        mode: terminate  # or omit mode (terminate is default)
+        cert: app.crt
+        key: app.key
+        sni_hostnames: app.example.com
+        alpn_protocols:
+          - h2
+          - http/1.1
+```
+
+### HTTP Proxy with Path Routing
+
+```yaml
+- address: 0.0.0.0:80
+  transport: tcp
   target:
-    - address: 192.168.8.3:80
+    allowlist: 0.0.0.0/0
+    http_paths:
+      # Serve static files
+      /static/:
+        http_action:
+          type: serve-directory
+          path: /var/www/static
+
+      # Custom redirect
+      /redirect:
+        http_action:
+          type: serve-message
+          status_code: 302
+          response_headers:
+            Location: https://example.com
+
+      # Forward to backend
+      /api/:
+        http_action:
+          type: forward
+          addresses:
+            - backend:8080
+
+    # Default for unmatched paths
+    default_http_action:
+      type: forward
+      addresses:
+        - default-backend:8080
+```
+
+### Mixed TLS Modes on Same Port
+
+```yaml
+- address: 0.0.0.0:443
+  transport: tcp
+  targets:
+    # Passthrough: public API (no keys needed)
+    - location: api-backend:443
+      allowlist: 0.0.0.0/0
+      server_tls:
+        mode: passthrough
+        sni_hostnames: api.example.com
+
+    # Terminate: admin panel (decrypt and inspect)
+    - location: admin-backend:8080
       allowlist:
-        - all
+        - 10.0.0.0/8      # Internal network only
+      server_tls:
+        mode: terminate
+        cert: admin.crt
+        key: admin.key
+        sni_hostnames: admin.example.com
 ```
 
-Connections from addresses that are not specified in `allowlist` will either be dropped (if `iptables` is set to `true`), or be immediately closed after accept.
+### Client Certificate Pinning
 
-### Round-robin forwarding
-
-```js
-{
-  // Listen on all interfaces, port 8080.
-  "bindAddress": "0.0.0.0:8080",
-  "transport": "tcp",
-  "target": {
-    // Round-robin forward to different addresses.
-    "addresses": [
-      "192.168.8.1:80",
-      "192.168.8.2:80",
-      "192.168.8.3:80",
-      "192.168.8.4:80"
-    ],
-    "allowlist": "all"
-  }
-}
-```
-
-### Multiple destinations based on IP address
-
-```js
-{
-  // Listen on port 8080
-  "bindAddress": "0.0.0.0:8080",
-  "transport": "tcp",
-  "targets": [
-    // Forward some IP ranges to 192.168.8.1 port 80.
-    {
-      "address": "192.168.8.1:80",
-      "allowlist": [
-        "192.168.1.0/24",
-        "192.168.2.0/24"
-      ]
-    },
-    // Forward other IP ranges to 192.168.8.2 port 80.
-    {
-      "address": "192.168.8.2:80",
-      "allowlist": [
-        "192.168.3.0/24",
-        "192.168.4.0/24"
-      ]
-    }
-  ]
-}
-```
-
-### TLS support
-
-```js
-[
-    // Server listening on port 443 (HTTPS).
-    {
-      "bindAddress": "192.168.0.1:443",
-      "target": {
-        // All connections need to use TLS.
-        // Enable TLS by specifying the path to the certificate and private key.
-        "serverTls": {
-          "cert": "/path/to/cert.pem",
-          "key": "/path/to/key.pem",
-          // Allow clients to connect without TLS.
-          "optional": true
-        },
-
-        // Also connect to the destination HTTPS server using TLS.
-        // '+' (plus sign) means to use TLS.
-        "address": "192.168.2.1:+443",
-        "allowlist": "all"
-      }
-    },
-
-    // Server listening on port 443 (HTTPS).
-    // Forward in a round-robin manner to various HTTP servers that do not have
-    // TLS enabled.
-    {
-      "bindAddress": "192.168.0.2:443",
-      "target": {
-        "serverTls": {
-          "cert": "/path/to/cert.pem",
-          "key": "/path/to/key.pem"
-        },
-        "addresses": [
-          "192.168.2.1:80",
-          "192.168.2.2:80",
-          "192.168.2.3:80"
-        ],
-        "allowlist": "all"
-      }
-    }
-]
-```
-
-### Client certificate authentication with fingerprints
-
-Client certificate fingerprints can be used to authenticate connecting clients without needing a full CA infrastructure.
+Authenticate clients using SHA256 certificate fingerprints (no CA needed):
 
 ```yaml
 - address: 0.0.0.0:8443
   transport: tcp
   targets:
-    - allowlist: 0.0.0.0/0
+    - location: secure-backend:8443
+      allowlist: 0.0.0.0/0
       server_tls:
+        mode: terminate
         cert: server.crt
         key: server.key
-        # Only allow clients with these certificate fingerprints
+        sni_hostnames: secure.example.com
+        # Only allow these client certificate fingerprints
         client_fingerprints:
           - "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99"
-          - "1122334455667788990011223344556677889900112233445566778899001122"
-      locations:
-        - 127.0.0.1:8080
+          - "1122334455667788990011223344556677889900112233445566778899001122" # colons optional
 ```
 
-### Outgoing client certificate authentication
+**Generate client certificate and get fingerprint:**
+```bash
+# Generate key
+openssl ecparam -genkey -name prime256v1 -out client.key
 
-Tobaru can present a client certificate when connecting to upstream TLS servers:
+# Create self-signed certificate
+openssl req -new -x509 -nodes -key client.key -out client.crt -days 365 -subj "/CN=Client"
+
+# Get SHA256 fingerprint
+openssl x509 -in client.crt -noout -fingerprint -sha256
+```
+
+### Outgoing TLS with Server Certificate Pinning
+
+Connect to upstream TLS servers and pin their certificates:
 
 ```yaml
 - address: 0.0.0.0:8080
@@ -378,95 +244,232 @@ Tobaru can present a client certificate when connecting to upstream TLS servers:
   targets:
     - allowlist: 0.0.0.0/0
       locations:
-        - address: upstream-server.example.com:443
+        - address: upstream.example.com:443
           client_tls:
+            # Verify server certificate via WebPKI (default: true)
             verify: true
-            # Present a client certificate for authentication
+
+            # Pin server certificate by SHA256 fingerprint
+            server_fingerprints:
+              - "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99"
+
+            # Present client certificate for authentication
             key: client.key
             cert: client.crt
-            # Optionally specify SNI hostname (default: derive from address)
+
+            # Custom SNI hostname (default: derive from address)
             sni_hostname: custom.example.com
-            # Or disable SNI entirely with YAML null:
-            # sni_hostname: null
-            # Optionally specify ALPN protocols
+            # Or disable SNI: sni_hostname: null
+
+            # ALPN protocols to negotiate
             alpn_protocols:
               - h2
               - http/1.1
-            # Optionally verify server by fingerprint (with or without colons)
-            server_fingerprints:
-              - "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99"
-              - "1122334455667788990011223344556677889900112233445566778899001122"
 ```
 
-To get a server's certificate fingerprint:
+**Get server certificate fingerprint:**
 ```bash
-# Connect and get the certificate
+# Fetch certificate
 openssl s_client -connect example.com:443 < /dev/null 2>/dev/null | openssl x509 -outform PEM > server.crt
-# Get the SHA256 fingerprint
+
+# Get SHA256 fingerprint
 openssl x509 -in server.crt -noout -fingerprint -sha256
 ```
 
-### iptables support
+### IP-Based Routing
 
-Note that tobaru will need root access in order to configure iptables. It might be possible to do this without root by using `setcap(8)`. Please file a pull request with instructions if you are able to do so.
+```yaml
+- address: 0.0.0.0:8080
+  transport: tcp
+  targets:
+    # Internal network → backend1
+    - location: backend1:8080
+      allowlist:
+        - 192.168.1.0/24
+        - 10.0.0.0/8
 
-```js
-{
-  "bindAddress": "0.0.0.0:8080",
-  // Enable iptables auto-configuration.
-  "iptables": true,
-  "target": {
-    "address": "192.168.8.1:80",
-    // Allow only the following IP ranges. Packets from other IPs will be dropped.
-    "allowlist": [
-      "192.168.2.2/24",
-      "192.168.2.3/24",
-      "192.168.100.50"
-    ]
-  }
-}
+    # Specific IPs → backend2
+    - location: backend2:8080
+      allowlist:
+        - 1.2.3.4
+        - 2001:db8::1
+
+    # Everyone else → backend3
+    - location: backend3:8080
+      allowlist: 0.0.0.0/0
 ```
 
-### IP groups
+### IP Groups
 
-IP groups can be used to quickly specify groups of IPs in multiple servers. Note that IP ranges can be specified in any file and can be reused across different files, for example, it could be convenient invoke tobaru with all IP groups in an individual file: `tobaru ip_groups.json http_servers.json ssh_servers.json`
+Define reusable IP groups:
 
-```js
-{
-  "ipGroups": {
-    "local": [
-      "192.168.0.0/24",
-      "192.168.1.0/24",
-      "192.168.2.0/24",
-      "192.168.3.0/24"
-    ],
-    "friends": [
-      "1.2.3.4",
-      "2.3.4.5"
-    ]
-  },
+```yaml
+# Define IP groups
+- group: internal
+  ip_masks:
+    - 192.168.0.0/16
+    - 10.0.0.0/8
 
-  "servers": [
-    {
-      "bindAddress": "0.0.0.0:8080",
-      "target": {
-        "address": "192.168.5.1:8080",
-        // Only allow IP ranges from 'local' and 'friends' to connect.
-        "allowlist": [
-          "local",
-          "friends"
-        ]
-      }
-    },
-    {
-      "bindAddress": "0.0.0.0:8081",
-      "target": {
-        "address": "192.168.5.2:8080",
-        // Only allow IP ranges from 'local'.
-        "allowlist": "@local"
-      }
-    }
-  ]
-}
+- group: trusted
+  ip_masks:
+    - 1.2.3.4
+    - 5.6.7.8
+
+# Use IP groups in servers
+- address: 0.0.0.0:8080
+  transport: tcp
+  target:
+    location: backend:8080
+    allowlist:
+      - internal
+      - trusted
 ```
 
+### Load Balancing (Round-Robin)
+
+```yaml
+- address: 0.0.0.0:8080
+  transport: tcp
+  target:
+    # Distribute across multiple backends
+    locations:
+      - backend1:8080
+      - backend2:8080
+      - backend3:8080
+      - backend4:8080
+    allowlist: 0.0.0.0/0
+```
+
+### iptables Integration
+
+Automatically configure firewall rules:
+
+```yaml
+- address: 0.0.0.0:8080
+  transport: tcp
+  use_iptables: true  # Enable iptables auto-configuration
+  target:
+    location: backend:8080
+    allowlist:
+      - 192.168.1.0/24
+      - 10.0.0.0/8
+    # Packets from other IPs will be dropped by iptables
+```
+
+**Note:** Requires root or `CAP_NET_RAW` and `CAP_NET_ADMIN` capabilities.
+
+### UDP Forwarding
+
+```yaml
+- address: 0.0.0.0:53
+  transport: udp
+  target:
+    addresses:
+      - 8.8.8.8:53
+      - 8.8.4.4:53
+    allowlist: 0.0.0.0/0
+    # Optional: association timeout in seconds (default: 200)
+    association_timeout_secs: 300
+```
+
+### UNIX Domain Sockets
+
+```yaml
+- address: 0.0.0.0:8080
+  transport: tcp
+  target:
+    # Forward to UNIX socket
+    location:
+      path: /run/app.sock
+    allowlist: 0.0.0.0/0
+```
+
+## Configuration Format
+
+Supports both **YAML** and **JSON** formats. Config is an array of objects, where each object is either:
+- A server configuration (`address` + `transport` + `target`/`targets`)
+- An IP group definition (`group` + `ip_masks`)
+
+### Server Configuration Fields
+
+**Required fields:**
+- `address`: The address to listen on (e.g., `0.0.0.0:443`)
+- `transport`: Either `tcp` or `udp`
+- `target` or `targets`: Single target or array of targets
+
+**Optional fields:**
+- `use_iptables`: Enable iptables rules (default: `false`)
+- `tcp_nodelay`: Disable Nagle's algorithm (default: `true`, TCP only)
+
+### Target Configuration Fields
+
+**For TCP targets:**
+
+**Location** (one of):
+- `location`: Single address string (e.g., `backend:8080`)
+- `locations`: Array of addresses for round-robin
+- `location` with object form:
+  - `address`: TCP address
+  - `path`: UNIX socket path
+  - `client_tls`: Outgoing TLS config (see below)
+
+**Required:**
+- `allowlist`: IP mask, IP group name, or array of either (e.g., `0.0.0.0/0`, `["internal", "1.2.3.4"]`)
+
+**Optional TLS:**
+- `server_tls`: Incoming TLS configuration
+  - `mode`: `passthrough` or `terminate` (default: `terminate`)
+  - `cert`: Path to certificate file (required for `terminate`)
+  - `key`: Path to private key file (required for `terminate`)
+  - `sni_hostnames`: Single hostname or array (or `any`, `none`)
+  - `alpn_protocols`: Single protocol or array (or `any`, `none`)
+  - `client_fingerprints`: Array of SHA256 fingerprints for client certificate pinning
+
+**Optional HTTP:**
+- `http_paths`: Map of path prefixes to HTTP actions
+- `default_http_action`: Fallback HTTP action
+
+**Client TLS configuration (`client_tls`):**
+- `verify`: Verify server certificate (default: `true`)
+- `key`: Path to client private key (for client certificate auth)
+- `cert`: Path to client certificate (for client certificate auth)
+- `sni_hostname`: SNI hostname to send (default: derive from address, or `null` to disable)
+- `alpn_protocols`: Array of ALPN protocols to negotiate
+- `server_fingerprints`: Array of SHA256 fingerprints for server certificate pinning
+
+## URL-Based Configuration
+
+For simple TCP forwarding, use URL format:
+
+```bash
+# TCP forwarding
+tobaru tcp://127.0.0.1:8080?target=192.168.1.10:80
+
+# Forward to UNIX socket
+tobaru tcp://127.0.0.1:8080?target-path=/run/app.sock
+```
+
+## Hot Reload
+
+Config files are automatically watched and reloaded when changed. No restart needed!
+
+## Advanced Examples
+
+See the [examples](examples/) directory for complete working configurations:
+- [`sni_passthrough.yml`](examples/sni_passthrough.yml) - TLS passthrough routing examples
+- [`bookmarks.yml`](examples/bookmarks.yml) - HTTP path-based routing for URL bookmarks
+
+## Performance
+
+- **Async I/O**: Built on Tokio for high concurrency
+- **Zero-copy**: Efficient buffer management with minimal allocations
+- **Passthrough mode**: Near-zero overhead TLS routing
+- **Connection pooling**: HTTP keep-alive support
+
+## Upgrading
+
+See [UPGRADING.md](UPGRADING.md) for migration guides from older versions.
+
+## License
+
+MIT
