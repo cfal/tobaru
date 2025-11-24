@@ -16,7 +16,7 @@ use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::async_stream::AsyncStream;
-use crate::config::HttpValueMatch;
+use crate::config::{HttpValueMatch, TcpKeepaliveConfig};
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::tcp::{setup_target_stream, TargetHttpActionData, TargetHttpPathData};
 use crate::util::{allocate_vec, write_all};
@@ -26,6 +26,7 @@ use header_tuple::HeaderTuple;
 
 pub async fn handle_http_stream(
     tcp_nodelay: bool,
+    tcp_keepalive: Option<TcpKeepaliveConfig>,
     path_configs: &Trie<String, Vec<TargetHttpPathData>>,
     default_action: &TargetHttpActionData,
     mut stream: Box<dyn AsyncStream>,
@@ -355,7 +356,8 @@ pub async fn handle_http_stream(
                         } else {
                             &location_data[0]
                         };
-                        setup_target_stream(addr, target_location, tcp_nodelay).await?
+                        setup_target_stream(addr, target_location, tcp_nodelay, tcp_keepalive)
+                            .await?
                     }
                 };
 

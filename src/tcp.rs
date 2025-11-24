@@ -19,8 +19,8 @@ use crate::async_stream::AsyncStream;
 use crate::config::{
     HttpForwardConfig, HttpHeaderPatch, HttpPathAction, HttpServeDirectoryConfig,
     HttpServeMessageConfig, HttpTcpActionConfig, HttpValueMatch, IpMask, IpMaskSelection, Location,
-    NetLocation, NoneOrOne, RawTcpActionConfig, TcpAction, TcpTargetConfig, TcpTargetLocation,
-    TlsOption,
+    NetLocation, NoneOrOne, RawTcpActionConfig, TcpAction, TcpKeepaliveConfig, TcpKeepaliveOption,
+    TcpTargetConfig, TcpTargetLocation, TlsOption,
 };
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::http::handle_http_stream;
@@ -99,6 +99,7 @@ impl From<TcpTargetLocation> for TargetLocationData {
 
 pub struct TargetData {
     pub tcp_nodelay: bool,
+    pub tcp_keepalive: Option<TcpKeepaliveConfig>,
     pub action_data: TargetActionData,
 }
 
@@ -286,6 +287,7 @@ pub async fn run_tcp_server(
     server_address: SocketAddr,
     use_iptables: bool,
     tcp_nodelay: bool,
+    tcp_keepalive: TcpKeepaliveOption,
     target_configs: Vec<TcpTargetConfig>,
 ) -> std::io::Result<()> {
     let mut non_tls_lookup_table: IpLookupTable<Ipv6Addr, Arc<TargetData>> = IpLookupTable::new();
@@ -300,6 +302,7 @@ pub async fn run_tcp_server(
             allowlist,
             server_tls,
             tcp_nodelay,
+            tcp_keepalive: target_tcp_keepalive,
             action,
             ..
         } = target_config;
@@ -347,8 +350,11 @@ pub async fn run_tcp_server(
         };
 
         // Create target_data (needed for both TLS and non-TLS targets)
+        // Resolve keepalive config for target-side connections
+        let resolved_keepalive = target_tcp_keepalive.resolve_for_target();
         let target_data = Arc::new(TargetData {
             tcp_nodelay,
+            tcp_keepalive: resolved_keepalive,
             action_data,
         });
 
@@ -499,6 +505,17 @@ pub async fn run_tcp_server(
         if tcp_nodelay {
             if let Err(e) = stream.set_nodelay(true) {
                 error!("Failed to set tcp_nodelay on server stream: {}", e);
+            }
+        }
+
+        // Apply TCP keepalive on server-side (client-facing) connection
+        if let Some(keepalive_config) = tcp_keepalive.resolve_for_server() {
+            if let Err(e) = crate::socket_util::set_tcp_keepalive(
+                &stream,
+                Duration::from_secs(keepalive_config.idle_secs),
+                Duration::from_secs(keepalive_config.interval_secs),
+            ) {
+                error!("Failed to set tcp_keepalive on server stream: {}", e);
             }
         }
 
@@ -744,8 +761,13 @@ async fn handle_passthrough_stream(
     );
 
     // Connect to target
-    let mut target_stream =
-        setup_target_stream(addr, target_location, target_data.target_data.tcp_nodelay).await?;
+    let mut target_stream = setup_target_stream(
+        addr,
+        target_location,
+        target_data.target_data.tcp_nodelay,
+        target_data.target_data.tcp_keepalive,
+    )
+    .await?;
 
     // Forward the buffered ClientHello first
     crate::util::write_all(&mut target_stream, &client_hello_frame).await?;
@@ -884,14 +906,20 @@ async fn run_stream_action(
             } else {
                 &location_data[0]
             };
-            let mut target_stream =
-                match setup_target_stream(addr, target_location, target_data.tcp_nodelay).await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        source_stream.try_shutdown().await?;
-                        return Err(e);
-                    }
-                };
+            let mut target_stream = match setup_target_stream(
+                addr,
+                target_location,
+                target_data.tcp_nodelay,
+                target_data.tcp_keepalive,
+            )
+            .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    source_stream.try_shutdown().await?;
+                    return Err(e);
+                }
+            };
 
             // Write initial data if present (passthrough-style approach)
             if let Some(ref data) = initial_data {
@@ -930,6 +958,7 @@ async fn run_stream_action(
         } => {
             handle_http_stream(
                 target_data.tcp_nodelay,
+                target_data.tcp_keepalive,
                 path_configs,
                 default_http_action,
                 source_stream,
@@ -945,6 +974,7 @@ pub async fn setup_target_stream(
     addr: &std::net::SocketAddr,
     target_location: &TargetLocationData,
     tcp_nodelay: bool,
+    tcp_keepalive: Option<TcpKeepaliveConfig>,
 ) -> std::io::Result<Box<dyn AsyncStream>> {
     match target_location.location {
         Location::Address(NetLocation { ref address, port }) => {
@@ -953,6 +983,16 @@ pub async fn setup_target_stream(
             if tcp_nodelay {
                 if let Err(e) = tcp_stream.set_nodelay(true) {
                     error!("Failed to set tcp_nodelay on target stream: {}", e);
+                }
+            }
+            // Apply TCP keepalive on client-side (target-facing) connection
+            if let Some(keepalive_config) = tcp_keepalive {
+                if let Err(e) = crate::socket_util::set_tcp_keepalive(
+                    &tcp_stream,
+                    Duration::from_secs(keepalive_config.idle_secs),
+                    Duration::from_secs(keepalive_config.interval_secs),
+                ) {
+                    error!("Failed to set tcp_keepalive on target stream: {}", e);
                 }
             }
             debug!(

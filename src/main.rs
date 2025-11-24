@@ -4,6 +4,7 @@ mod copy_bidirectional;
 mod http;
 mod iptables_util;
 mod rustls_util;
+mod socket_util;
 mod tcp;
 mod tls_parser;
 mod tls_reader;
@@ -60,11 +61,18 @@ async fn run(server_config: ServerConfig) {
     match target_configs {
         TargetConfigs::Tcp {
             tcp_nodelay,
+            tcp_keepalive,
             targets,
         } => {
             // TODO: restart or panic?
-            if let Err(e) =
-                run_tcp_server(address, use_iptables, tcp_nodelay, targets.into_vec()).await
+            if let Err(e) = run_tcp_server(
+                address,
+                use_iptables,
+                tcp_nodelay,
+                tcp_keepalive,
+                targets.into_vec(),
+            )
+            .await
             {
                 error!("TCP forwarder finished with error: {}", e);
             }

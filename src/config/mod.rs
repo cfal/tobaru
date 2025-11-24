@@ -21,6 +21,170 @@ fn default_true() -> bool {
     true
 }
 
+/// TCP keepalive configuration with custom values
+#[derive(Debug, Clone, Copy)]
+pub struct TcpKeepaliveConfig {
+    pub idle_secs: u64,
+    pub interval_secs: u64,
+}
+
+impl TcpKeepaliveConfig {
+    /// Default config for server-side (client-facing) connections
+    /// Uses longer timeouts since clients may be idle for longer periods
+    pub fn default_server() -> Self {
+        Self {
+            idle_secs: 300,    // 5 minutes
+            interval_secs: 60, // 60 seconds
+        }
+    }
+
+    /// Default config for client-side (target-facing) connections
+    /// Uses shorter timeouts for faster failure detection on upstream connections
+    pub fn default_target() -> Self {
+        Self {
+            idle_secs: 120,    // 2 minutes
+            interval_secs: 30, // 30 seconds
+        }
+    }
+}
+
+/// TCP keepalive option with three states:
+/// - `UseDefaults` - use context-specific defaults (server or target)
+/// - `Disabled` - explicitly disabled
+/// - `Custom` - use provided values
+///
+/// Deserialization:
+/// - `true` or not provided → `UseDefaults`
+/// - `false` or `null` → `Disabled`
+/// - `{ idle_secs: X, interval_secs: Y }` → `Custom`
+#[derive(Debug, Clone, Copy, Default)]
+pub enum TcpKeepaliveOption {
+    #[default]
+    UseDefaults,
+    Disabled,
+    Custom {
+        idle_secs: u64,
+        interval_secs: u64,
+    },
+}
+
+impl TcpKeepaliveOption {
+    /// Resolve to a concrete config for server-side (client-facing) connections
+    pub fn resolve_for_server(&self) -> Option<TcpKeepaliveConfig> {
+        match self {
+            TcpKeepaliveOption::UseDefaults => Some(TcpKeepaliveConfig::default_server()),
+            TcpKeepaliveOption::Disabled => None,
+            TcpKeepaliveOption::Custom {
+                idle_secs,
+                interval_secs,
+            } => Some(TcpKeepaliveConfig {
+                idle_secs: *idle_secs,
+                interval_secs: *interval_secs,
+            }),
+        }
+    }
+
+    /// Resolve to a concrete config for client-side (target-facing) connections
+    pub fn resolve_for_target(&self) -> Option<TcpKeepaliveConfig> {
+        match self {
+            TcpKeepaliveOption::UseDefaults => Some(TcpKeepaliveConfig::default_target()),
+            TcpKeepaliveOption::Disabled => None,
+            TcpKeepaliveOption::Custom {
+                idle_secs,
+                interval_secs,
+            } => Some(TcpKeepaliveConfig {
+                idle_secs: *idle_secs,
+                interval_secs: *interval_secs,
+            }),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for TcpKeepaliveOption {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::de::Deserializer<'de>,
+    {
+        struct TcpKeepaliveOptionVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for TcpKeepaliveOptionVisitor {
+            type Value = TcpKeepaliveOption;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter
+                    .write_str("true, false, null, or an object with idle_secs and interval_secs")
+            }
+
+            fn visit_bool<E>(self, v: bool) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if v {
+                    Ok(TcpKeepaliveOption::UseDefaults)
+                } else {
+                    Ok(TcpKeepaliveOption::Disabled)
+                }
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                // null means disabled
+                Ok(TcpKeepaliveOption::Disabled)
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(TcpKeepaliveOption::Disabled)
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: serde::de::MapAccess<'de>,
+            {
+                let mut idle_secs = None;
+                let mut interval_secs = None;
+
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "idle_secs" => {
+                            if idle_secs.is_some() {
+                                return Err(serde::de::Error::duplicate_field("idle_secs"));
+                            }
+                            idle_secs = Some(map.next_value()?);
+                        }
+                        "interval_secs" => {
+                            if interval_secs.is_some() {
+                                return Err(serde::de::Error::duplicate_field("interval_secs"));
+                            }
+                            interval_secs = Some(map.next_value()?);
+                        }
+                        _ => {
+                            let _: serde::de::IgnoredAny = map.next_value()?;
+                        }
+                    }
+                }
+
+                // Require both fields when using custom config
+                let idle_secs =
+                    idle_secs.ok_or_else(|| serde::de::Error::missing_field("idle_secs"))?;
+                let interval_secs = interval_secs
+                    .ok_or_else(|| serde::de::Error::missing_field("interval_secs"))?;
+
+                Ok(TcpKeepaliveOption::Custom {
+                    idle_secs,
+                    interval_secs,
+                })
+            }
+        }
+
+        deserializer.deserialize_any(TcpKeepaliveOptionVisitor)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Config {
     ServerConfig(ServerConfig),
@@ -184,6 +348,8 @@ pub enum TargetConfigs {
     Tcp {
         #[serde(default = "default_true")]
         tcp_nodelay: bool,
+        #[serde(default)]
+        tcp_keepalive: TcpKeepaliveOption,
         #[serde(alias = "target")]
         targets: OneOrSome<TcpTargetConfig>,
     },
@@ -200,6 +366,8 @@ pub struct TcpTargetConfig {
     pub server_tls: Option<ServerTlsConfig>,
     #[serde(default = "default_true")]
     pub tcp_nodelay: bool,
+    #[serde(default)]
+    pub tcp_keepalive: TcpKeepaliveOption,
 
     #[serde(flatten)]
     pub action: TcpAction,
@@ -1151,6 +1319,7 @@ pub async fn load_url(config_url: &str) -> std::io::Result<ServerConfig> {
                 //forward_locations: NoneOrSome::None,
                 server_tls: None,
                 tcp_nodelay: true,
+                tcp_keepalive: TcpKeepaliveOption::default(),
                 action: TcpAction::Raw(RawTcpActionConfig {
                     locations: OneOrSome::Some(locations),
                 }),
@@ -1161,6 +1330,7 @@ pub async fn load_url(config_url: &str) -> std::io::Result<ServerConfig> {
                 use_iptables: false,
                 target_configs: TargetConfigs::Tcp {
                     tcp_nodelay: true,
+                    tcp_keepalive: TcpKeepaliveOption::default(),
                     targets: OneOrSome::One(tcp_target_config),
                 },
             })
