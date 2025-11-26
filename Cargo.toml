@@ -16,7 +16,7 @@ aws-lc-rs = { version = "*", default-features = false }
 env_logger = "*"
 futures = "*"
 ipnet = "*"
-log = "*"
+log = { version = "*", features = ["release_max_level_info"] }
 parking_lot = "*"
 percent-encoding = "*"
 rustls = { version = "*", default-features = false, features = ["aws_lc_rs", "std", "logging", "tls12"] }
