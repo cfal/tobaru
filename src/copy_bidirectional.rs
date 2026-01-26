@@ -8,6 +8,7 @@
 
 use futures::ready;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::task::coop;
 
 use std::future::Future;
 use std::io;
@@ -51,6 +52,8 @@ impl CopyBuffer {
         R: AsyncRead + ?Sized,
         W: AsyncWrite + ?Sized,
     {
+        let coop = ready!(coop::poll_proceed(cx));
+
         loop {
             let mut read_pending = false;
             let mut write_pending = false;
@@ -75,6 +78,7 @@ impl CopyBuffer {
                         } else {
                             self.cache_length += n;
                         }
+                        coop.made_progress();
                     }
                     Poll::Pending => {
                         read_pending = true;
@@ -112,6 +116,7 @@ impl CopyBuffer {
                                 self.start_index = (self.start_index + written) % self.size;
                             }
                             self.need_flush = true;
+                            coop.made_progress();
                         }
                     }
                     Poll::Pending => {
@@ -124,6 +129,7 @@ impl CopyBuffer {
             if self.need_flush {
                 ready!(writer.as_mut().poll_flush(cx))?;
                 self.need_flush = false;
+                coop.made_progress();
             }
 
             // If we've written all the data and we've seen EOF, finish the transfer.
