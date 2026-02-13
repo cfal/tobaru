@@ -439,9 +439,39 @@ impl<'de> Deserialize<'de> for TcpAction {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct HttpPathConfig {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_required_headers")]
     pub required_request_headers: Option<HashMap<String, HttpValueMatch>>,
     pub http_action: HttpPathAction,
+}
+
+/// Lowercases header keys and promotes "host" values to `Hostnames` variant
+/// for wildcard and dot-shorthand matching with automatic port stripping.
+fn deserialize_required_headers<'de, D>(
+    deserializer: D,
+) -> Result<Option<HashMap<String, HttpValueMatch>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Some(raw) = Option::<HashMap<String, HttpValueMatch>>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    let result = raw
+        .into_iter()
+        .map(|(key, value)| {
+            let key = key.to_ascii_lowercase();
+            let value = if key == "host" {
+                match value {
+                    HttpValueMatch::Single(s) => HttpValueMatch::Hostnames(vec![s]),
+                    HttpValueMatch::Multiple(v) => HttpValueMatch::Hostnames(v),
+                    other => other,
+                }
+            } else {
+                value
+            };
+            (key, value)
+        })
+        .collect();
+    Ok(Some(result))
 }
 
 #[derive(Default, Debug, Clone)]
@@ -450,6 +480,9 @@ pub enum HttpValueMatch {
     Any,
     Single(String),
     Multiple(Vec<String>),
+    /// Hostname patterns with wildcard support (e.g. "*.example.com", ".example.com").
+    /// Strips port from the header value before matching.
+    Hostnames(Vec<String>),
 }
 
 impl<'de> Deserialize<'de> for HttpValueMatch {
@@ -513,25 +546,15 @@ impl<'de> Deserialize<'de> for HttpValueMatch {
 impl HttpValueMatch {
     pub fn matches(&self, value: Option<&str>) -> bool {
         match self {
-            HttpValueMatch::Single(ref allowed_value) => {
-                if value.is_none() {
-                    return false;
-                }
-                allowed_value == value.unwrap()
-            }
-            HttpValueMatch::Multiple(ref allowed_values) => {
-                if value.is_none() {
-                    return false;
-                }
-                let value = value.unwrap();
-                for v in allowed_values.iter() {
-                    if v == value {
-                        return true;
-                    }
-                }
-                false
-            }
             HttpValueMatch::Any => value.is_some(),
+            HttpValueMatch::Single(allowed) => value.is_some_and(|v| v == allowed),
+            HttpValueMatch::Multiple(allowed) => value.is_some_and(|v| allowed.iter().any(|a| a == v)),
+            HttpValueMatch::Hostnames(patterns) => value.is_some_and(|v| {
+                let hostname = crate::http::strip_host_port(v);
+                patterns
+                    .iter()
+                    .any(|p| crate::http::matches_hostname_pattern(hostname, p))
+            }),
         }
     }
 }
@@ -1382,5 +1405,163 @@ pub async fn load_url(config_url: &str) -> std::io::Result<ServerConfig> {
             std::io::ErrorKind::InvalidInput,
             format!("Unknown URL scheme: {}", unknown_scheme),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn deser_path_config(yaml: &str) -> HttpPathConfig {
+        serde_yaml::from_str(yaml).unwrap()
+    }
+
+    fn get_header<'a>(
+        config: &'a HttpPathConfig,
+        key: &str,
+    ) -> &'a HttpValueMatch {
+        config
+            .required_request_headers
+            .as_ref()
+            .unwrap()
+            .get(key)
+            .unwrap()
+    }
+
+    #[test]
+    fn host_string_becomes_hostnames() {
+        let c = deser_path_config(
+            r#"
+            required_request_headers:
+              host: example.com
+            http_action:
+              type: close
+            "#,
+        );
+        let m = get_header(&c, "host");
+        assert!(matches!(m, HttpValueMatch::Hostnames(v) if v == &["example.com"]));
+    }
+
+    #[test]
+    fn host_list_becomes_hostnames() {
+        let c = deser_path_config(
+            r#"
+            required_request_headers:
+              host:
+                - a.com
+                - "*.b.com"
+            http_action:
+              type: close
+            "#,
+        );
+        let m = get_header(&c, "host");
+        assert!(matches!(m, HttpValueMatch::Hostnames(v) if v == &["a.com", "*.b.com"]));
+    }
+
+    #[test]
+    fn host_null_stays_any() {
+        let c = deser_path_config(
+            r#"
+            required_request_headers:
+              host: ~
+            http_action:
+              type: close
+            "#,
+        );
+        let m = get_header(&c, "host");
+        assert!(matches!(m, HttpValueMatch::Any));
+    }
+
+    #[test]
+    fn host_key_is_case_insensitive() {
+        let c = deser_path_config(
+            r#"
+            required_request_headers:
+              Host: example.com
+            http_action:
+              type: close
+            "#,
+        );
+        // Key should be lowercased
+        assert!(c.required_request_headers.as_ref().unwrap().contains_key("host"));
+        assert!(!c.required_request_headers.as_ref().unwrap().contains_key("Host"));
+        let m = get_header(&c, "host");
+        assert!(matches!(m, HttpValueMatch::Hostnames(v) if v == &["example.com"]));
+    }
+
+    #[test]
+    fn non_host_key_stays_single() {
+        let c = deser_path_config(
+            r#"
+            required_request_headers:
+              x-custom: foo
+            http_action:
+              type: close
+            "#,
+        );
+        let m = get_header(&c, "x-custom");
+        assert!(matches!(m, HttpValueMatch::Single(v) if v == "foo"));
+    }
+
+    #[test]
+    fn non_host_key_stays_multiple() {
+        let c = deser_path_config(
+            r#"
+            required_request_headers:
+              x-custom:
+                - foo
+                - bar
+            http_action:
+              type: close
+            "#,
+        );
+        let m = get_header(&c, "x-custom");
+        assert!(matches!(m, HttpValueMatch::Multiple(v) if v == &["foo", "bar"]));
+    }
+
+    #[test]
+    fn all_keys_lowercased() {
+        let c = deser_path_config(
+            r#"
+            required_request_headers:
+              X-Custom: foo
+              Accept-Language: en
+            http_action:
+              type: close
+            "#,
+        );
+        let headers = c.required_request_headers.as_ref().unwrap();
+        assert!(headers.contains_key("x-custom"));
+        assert!(headers.contains_key("accept-language"));
+        assert!(!headers.contains_key("X-Custom"));
+        assert!(!headers.contains_key("Accept-Language"));
+    }
+
+    #[test]
+    fn missing_headers_is_none() {
+        let c = deser_path_config(
+            r#"
+            http_action:
+              type: close
+            "#,
+        );
+        assert!(c.required_request_headers.is_none());
+    }
+
+    #[test]
+    fn hostnames_matching_through_deserialization() {
+        let c = deser_path_config(
+            r#"
+            required_request_headers:
+              host: "*.example.com"
+            http_action:
+              type: close
+            "#,
+        );
+        let m = get_header(&c, "host");
+        assert!(m.matches(Some("foo.example.com")));
+        assert!(m.matches(Some("foo.example.com:8080")));
+        assert!(!m.matches(Some("example.com")));
+        assert!(!m.matches(Some("other.com")));
     }
 }
