@@ -1,6 +1,7 @@
 mod async_stream;
 mod config;
 mod copy_bidirectional;
+mod domain_trie;
 mod http;
 mod iptables_util;
 mod rustls_util;
