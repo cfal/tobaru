@@ -440,7 +440,7 @@ impl<'de> Deserialize<'de> for TcpAction {
 #[derive(Debug, Clone, Deserialize)]
 pub struct HttpPathConfig {
     #[serde(default, deserialize_with = "deserialize_required_headers")]
-    pub required_request_headers: Option<HashMap<String, HttpValueMatch>>,
+    pub required_request_headers: HashMap<String, HttpValueMatch>,
     pub http_action: HttpPathAction,
 }
 
@@ -448,13 +448,11 @@ pub struct HttpPathConfig {
 /// for wildcard and dot-shorthand matching with automatic port stripping.
 fn deserialize_required_headers<'de, D>(
     deserializer: D,
-) -> Result<Option<HashMap<String, HttpValueMatch>>, D::Error>
+) -> Result<HashMap<String, HttpValueMatch>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let Some(raw) = Option::<HashMap<String, HttpValueMatch>>::deserialize(deserializer)? else {
-        return Ok(None);
-    };
+    let raw = HashMap::<String, HttpValueMatch>::deserialize(deserializer)?;
     let result = raw
         .into_iter()
         .map(|(key, value)| {
@@ -471,7 +469,7 @@ where
             (key, value)
         })
         .collect();
-    Ok(Some(result))
+    Ok(result)
 }
 
 #[derive(Default, Debug, Clone)]
@@ -1422,8 +1420,6 @@ mod tests {
     ) -> &'a HttpValueMatch {
         config
             .required_request_headers
-            .as_ref()
-            .unwrap()
             .get(key)
             .unwrap()
     }
@@ -1483,8 +1479,8 @@ mod tests {
             "#,
         );
         // Key should be lowercased
-        assert!(c.required_request_headers.as_ref().unwrap().contains_key("host"));
-        assert!(!c.required_request_headers.as_ref().unwrap().contains_key("Host"));
+        assert!(c.required_request_headers.contains_key("host"));
+        assert!(!c.required_request_headers.contains_key("Host"));
         let m = get_header(&c, "host");
         assert!(matches!(m, HttpValueMatch::Hostnames(v) if v == &["example.com"]));
     }
@@ -1530,22 +1526,21 @@ mod tests {
               type: close
             "#,
         );
-        let headers = c.required_request_headers.as_ref().unwrap();
-        assert!(headers.contains_key("x-custom"));
-        assert!(headers.contains_key("accept-language"));
-        assert!(!headers.contains_key("X-Custom"));
-        assert!(!headers.contains_key("Accept-Language"));
+        assert!(c.required_request_headers.contains_key("x-custom"));
+        assert!(c.required_request_headers.contains_key("accept-language"));
+        assert!(!c.required_request_headers.contains_key("X-Custom"));
+        assert!(!c.required_request_headers.contains_key("Accept-Language"));
     }
 
     #[test]
-    fn missing_headers_is_none() {
+    fn missing_headers_is_empty() {
         let c = deser_path_config(
             r#"
             http_action:
               type: close
             "#,
         );
-        assert!(c.required_request_headers.is_none());
+        assert!(c.required_request_headers.is_empty());
     }
 
     #[test]

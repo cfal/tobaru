@@ -520,10 +520,8 @@ fn find_matching_action<'a>(
 
     if let Some(t) = matching_configs {
         for path_config in t.value().unwrap().iter() {
-            if let Some(ref required_headers) = path_config.required_request_headers {
-                if !has_required_headers(request_data.headers(), required_headers) {
-                    continue;
-                }
+            if !has_required_headers(request_data.headers(), &path_config.required_request_headers) {
+                continue;
             }
             return (t.key().unwrap(), &path_config.http_action);
         }

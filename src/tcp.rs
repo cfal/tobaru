@@ -116,7 +116,7 @@ pub enum TargetActionData {
 }
 
 pub struct TargetHttpPathData {
-    pub required_request_headers: Option<HashMap<String, HttpValueMatch>>,
+    pub required_request_headers: HashMap<String, HttpValueMatch>,
     pub http_action: TargetHttpActionData,
 }
 
