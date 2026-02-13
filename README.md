@@ -4,7 +4,7 @@ Advanced port forwarding tool written in Rust with powerful routing and TLS feat
 
 ## Key Features
 
-- **🔀 Multiple routing strategies**: Route connections based on IP address, TLS SNI, ALPN protocol, or HTTP path
+- **🔀 Multiple routing strategies**: Route connections based on IP address, TLS SNI (with wildcard support), ALPN protocol, or HTTP path
 - **🔒 Flexible TLS handling**:
   - **Passthrough mode**: Route TLS by SNI/ALPN without decryption (zero overhead, no private keys needed)
   - **Terminate mode**: Decrypt TLS and route based on SNI/ALPN or HTTP content
@@ -200,6 +200,39 @@ Decrypt TLS and route based on content:
         key: admin.key
         sni_hostnames: admin.example.com
 ```
+
+### Wildcard SNI Matching
+
+Route all subdomains of a domain to a single backend:
+
+```yaml
+- address: 0.0.0.0:443
+  transport: tcp
+  targets:
+    # *.example.com matches foo.example.com, bar.example.com, etc.
+    # but NOT example.com itself
+    - location: wildcard-backend:443
+      allowlist: 0.0.0.0/0
+      server_tls:
+        mode: passthrough
+        sni_hostnames: "*.example.com"
+
+    # .example.com matches example.com AND all subdomains
+    - location: dot-backend:443
+      allowlist: 0.0.0.0/0
+      server_tls:
+        mode: passthrough
+        sni_hostnames: ".other.com"
+
+    # Exact match takes priority over wildcards
+    - location: api-backend:443
+      allowlist: 0.0.0.0/0
+      server_tls:
+        mode: passthrough
+        sni_hostnames: api.example.com
+```
+
+Matching priority: exact match > deepest wildcard > shallower wildcard > no match.
 
 ### Client Certificate Pinning
 
@@ -421,7 +454,10 @@ Supports both **YAML** and **JSON** formats. Config is an array of objects, wher
   - `mode`: `passthrough` or `terminate` (default: `terminate`)
   - `cert`: Path to certificate file (required for `terminate`)
   - `key`: Path to private key file (required for `terminate`)
-  - `sni_hostnames`: Single hostname or array (or `any`, `none`)
+  - `sni_hostnames`: Single hostname, wildcard pattern, or array (or `any`, `none`)
+    - `example.com` -- exact match only
+    - `*.example.com` -- matches any subdomain, but not `example.com` itself
+    - `.example.com` -- matches both `example.com` and any subdomain
   - `alpn_protocols`: Single protocol or array (or `any`, `none`)
   - `client_fingerprints`: Array of SHA256 fingerprints for client certificate pinning
 
@@ -457,6 +493,7 @@ Config files are automatically watched and reloaded when changed. No restart nee
 
 See the [examples](examples/) directory for complete working configurations:
 - [`sni_passthrough.yml`](examples/sni_passthrough.yml) - TLS passthrough routing examples
+- [`wildcard_sni.yml`](examples/wildcard_sni.yml) - Wildcard SNI hostname matching
 - [`bookmarks.yml`](examples/bookmarks.yml) - HTTP path-based routing for URL bookmarks
 
 ## Performance
