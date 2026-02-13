@@ -1,0 +1,115 @@
+# Example: Wildcard SNI Hostname Matching
+#
+# tobaru supports wildcard patterns in sni_hostnames for routing TLS
+# connections to backends based on domain patterns.
+#
+# Supported patterns:
+#   "example.com"     -- exact match only
+#   "*.example.com"   -- matches any subdomain, but NOT example.com itself
+#   ".example.com"    -- matches both example.com and any subdomain
+#   "*"               -- catch-all, matches everything (same as "any")
+#
+# Matching priority: exact > deepest wildcard > shallower wildcard > no match
+#
+# Works with both passthrough and terminate modes.
+
+# Example 1: Wildcard subdomain routing
+#
+# *.example.com matches foo.example.com, bar.example.com, a.b.example.com
+# but does NOT match example.com itself.
+- address: 0.0.0.0:443
+  transport: tcp
+  targets:
+    - location: wildcard-backend:443
+      allowlist: 0.0.0.0/0
+      server_tls:
+        mode: passthrough
+        sni_hostnames: "*.example.com"
+
+# Example 2: Dot-shorthand (matches base domain + all subdomains)
+#
+# .example.com matches example.com, www.example.com, a.b.c.example.com
+- address: 0.0.0.0:8443
+  transport: tcp
+  targets:
+    - location: all-example-backend:443
+      allowlist: 0.0.0.0/0
+      server_tls:
+        mode: passthrough
+        sni_hostnames: ".example.com"
+
+# Example 3: Exact match takes priority over wildcards
+#
+# api.example.com -> api-backend (exact match wins)
+# anything-else.example.com -> wildcard-backend (wildcard fallback)
+- address: 0.0.0.0:9443
+  transport: tcp
+  targets:
+    - location: api-backend:443
+      allowlist: 0.0.0.0/0
+      server_tls:
+        mode: passthrough
+        sni_hostnames: api.example.com
+
+    - location: wildcard-backend:443
+      allowlist: 0.0.0.0/0
+      server_tls:
+        mode: passthrough
+        sni_hostnames: "*.example.com"
+
+# Example 4: Deeper wildcard wins over shallower
+#
+# v1.api.example.com -> api-wildcard-backend (deeper *.api.example.com wins)
+# foo.example.com    -> general-backend      (shallower *.example.com)
+- address: 0.0.0.0:10443
+  transport: tcp
+  targets:
+    - location: general-backend:443
+      allowlist: 0.0.0.0/0
+      server_tls:
+        mode: passthrough
+        sni_hostnames: "*.example.com"
+
+    - location: api-wildcard-backend:443
+      allowlist: 0.0.0.0/0
+      server_tls:
+        mode: passthrough
+        sni_hostnames: "*.api.example.com"
+
+# Example 5: Wildcard with terminate mode
+#
+# All subdomains of secure.example.com are terminated with the same cert.
+- address: 0.0.0.0:11443
+  transport: tcp
+  targets:
+    - location: 127.0.0.1:8080
+      allowlist: 0.0.0.0/0
+      server_tls:
+        mode: terminate
+        cert: /path/to/wildcard-cert.pem
+        key: /path/to/wildcard-key.pem
+        sni_hostnames: "*.secure.example.com"
+
+# Example 6: Catch-all wildcard with specific overrides
+#
+# special.com -> special-backend (exact match)
+# everything else -> default-backend (catch-all)
+- address: 0.0.0.0:12443
+  transport: tcp
+  targets:
+    - location: special-backend:443
+      allowlist: 0.0.0.0/0
+      server_tls:
+        mode: passthrough
+        sni_hostnames: special.com
+
+    - location: default-backend:443
+      allowlist: 0.0.0.0/0
+      server_tls:
+        mode: passthrough
+        sni_hostnames: "*"
+
+# Testing:
+#   openssl s_client -connect localhost:443 -servername foo.example.com
+#   openssl s_client -connect localhost:9443 -servername api.example.com
+#   curl --resolve foo.example.com:443:127.0.0.1 https://foo.example.com/
