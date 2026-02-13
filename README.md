@@ -234,6 +234,42 @@ Route all subdomains of a domain to a single backend:
 
 Matching priority: exact match > deepest wildcard > shallower wildcard > no match.
 
+### Host Header Routing
+
+Route HTTP requests by the `Host` header, with the same wildcard pattern support as SNI matching. When the `host` key is used in `required_request_headers`, values are automatically treated as hostname patterns:
+
+```yaml
+- address: 0.0.0.0:80
+  transport: tcp
+  target:
+    allowlist: 0.0.0.0/0
+    http_paths:
+      /:
+        # Route app.example.com to the app backend
+        - required_request_headers:
+            host: app.example.com
+          http_action:
+            type: forward
+            addresses:
+              - app-backend:8080
+
+        # Route all *.api.example.com subdomains to the API backend
+        - required_request_headers:
+            host: "*.api.example.com"
+          http_action:
+            type: forward
+            addresses:
+              - api-backend:8080
+
+    default_http_action:
+      type: serve-message
+      status_code: 404
+```
+
+The same patterns are supported: `example.com` (exact), `*.example.com` (subdomains only), `.example.com` (base domain + subdomains), and `*` (catch-all). Port suffixes in the `Host` header (e.g. `example.com:8080`) are stripped before matching.
+
+**Note:** When possible, prefer routing by SNI (`sni_hostnames`) over `Host` header matching. SNI routing operates at the TLS layer before any HTTP parsing, making it more efficient. Host header routing is useful for plain HTTP, or when multiple virtual hosts share the same TLS certificate.
+
 ### Client Certificate Pinning
 
 Authenticate clients using SHA256 certificate fingerprints (no CA needed):
@@ -463,6 +499,9 @@ Supports both **YAML** and **JSON** formats. Config is an array of objects, wher
 
 **Optional HTTP:**
 - `http_paths`: Map of path prefixes to HTTP actions
+  - Each path can have one or more configs with `required_request_headers` and `http_action`
+  - `required_request_headers`: Map of header names to expected values (keys are case-insensitive)
+    - The `host` key supports wildcard patterns: `*.example.com`, `.example.com`, `*`
 - `default_http_action`: Fallback HTTP action
 
 **Client TLS configuration (`client_tls`):**
@@ -494,6 +533,7 @@ Config files are automatically watched and reloaded when changed. No restart nee
 See the [examples](examples/) directory for complete working configurations:
 - [`sni_passthrough.yml`](examples/sni_passthrough.yml) - TLS passthrough routing examples
 - [`wildcard_sni.yml`](examples/wildcard_sni.yml) - Wildcard SNI hostname matching
+- [`host_header_routing.yml`](examples/host_header_routing.yml) - HTTP Host header virtual hosting
 - [`bookmarks.yml`](examples/bookmarks.yml) - HTTP path-based routing for URL bookmarks
 
 ## Performance
