@@ -545,6 +545,54 @@ fn has_required_headers(
     true
 }
 
+/// Strips the port suffix from a Host header value.
+/// Handles bracketed IPv6 (e.g. "[::1]:8080" -> "[::1]").
+pub fn strip_host_port(host: &str) -> &str {
+    if let Some(bracket_end) = host.rfind(']') {
+        // Bracketed IPv6: only strip port after the closing bracket
+        match host[bracket_end + 1..].find(':') {
+            Some(offset) => &host[..bracket_end + 1 + offset],
+            None => host,
+        }
+    } else if let Some(colon) = host.rfind(':') {
+        if host[colon + 1..].bytes().all(|b| b.is_ascii_digit()) {
+            &host[..colon]
+        } else {
+            host
+        }
+    } else {
+        host
+    }
+}
+
+/// Matches a hostname against a domain pattern.
+///
+/// Supported patterns:
+///   `"example.com"`    -- exact match only
+///   `"*.example.com"`  -- any subdomain, but not `example.com` itself
+///   `".example.com"`   -- `example.com` and any subdomain
+///   `"*"`              -- catch-all
+pub fn matches_hostname_pattern(hostname: &str, pattern: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    if let Some(suffix) = pattern.strip_prefix("*.") {
+        is_subdomain_of(hostname, suffix)
+    } else if let Some(suffix) = pattern.strip_prefix('.') {
+        hostname == suffix || is_subdomain_of(hostname, suffix)
+    } else {
+        hostname == pattern
+    }
+}
+
+/// Returns true if `hostname` is a proper subdomain of `domain`
+/// (i.e. has at least one additional label separated by a dot).
+fn is_subdomain_of(hostname: &str, domain: &str) -> bool {
+    hostname.len() > domain.len() + 1
+        && hostname.ends_with(domain)
+        && hostname.as_bytes()[hostname.len() - domain.len() - 1] == b'.'
+}
+
 //async fn connect_location(location: &Location) -> std::io::Result<Box<dyn TargetStream>> {
 //match location {
 //Location::Net(address) => TcpStream::connect(address).await.map(|stream| {
@@ -667,4 +715,170 @@ where
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    mod strip_host_port_tests {
+        use super::*;
+
+        #[test]
+        fn plain_hostname() {
+            assert_eq!(strip_host_port("example.com"), "example.com");
+        }
+
+        #[test]
+        fn hostname_with_port() {
+            assert_eq!(strip_host_port("example.com:8080"), "example.com");
+        }
+
+        #[test]
+        fn hostname_with_default_port() {
+            assert_eq!(strip_host_port("example.com:443"), "example.com");
+        }
+
+        #[test]
+        fn ipv4_with_port() {
+            assert_eq!(strip_host_port("192.168.1.1:80"), "192.168.1.1");
+        }
+
+        #[test]
+        fn ipv4_without_port() {
+            assert_eq!(strip_host_port("192.168.1.1"), "192.168.1.1");
+        }
+
+        #[test]
+        fn bracketed_ipv6_with_port() {
+            assert_eq!(strip_host_port("[::1]:8080"), "[::1]");
+        }
+
+        #[test]
+        fn bracketed_ipv6_without_port() {
+            assert_eq!(strip_host_port("[::1]"), "[::1]");
+        }
+
+        #[test]
+        fn empty_string() {
+            assert_eq!(strip_host_port(""), "");
+        }
+    }
+
+    mod matches_hostname_pattern_tests {
+        use super::*;
+
+        #[test]
+        fn exact_match() {
+            assert!(matches_hostname_pattern("example.com", "example.com"));
+        }
+
+        #[test]
+        fn exact_mismatch() {
+            assert!(!matches_hostname_pattern("other.com", "example.com"));
+        }
+
+        #[test]
+        fn wildcard_matches_subdomain() {
+            assert!(matches_hostname_pattern(
+                "foo.example.com",
+                "*.example.com"
+            ));
+        }
+
+        #[test]
+        fn wildcard_matches_deep_subdomain() {
+            assert!(matches_hostname_pattern(
+                "a.b.c.example.com",
+                "*.example.com"
+            ));
+        }
+
+        #[test]
+        fn wildcard_does_not_match_base() {
+            assert!(!matches_hostname_pattern("example.com", "*.example.com"));
+        }
+
+        #[test]
+        fn wildcard_no_partial_label_match() {
+            assert!(!matches_hostname_pattern(
+                "fooexample.com",
+                "*.example.com"
+            ));
+        }
+
+        #[test]
+        fn dot_shorthand_matches_base() {
+            assert!(matches_hostname_pattern("example.com", ".example.com"));
+        }
+
+        #[test]
+        fn dot_shorthand_matches_subdomain() {
+            assert!(matches_hostname_pattern(
+                "foo.example.com",
+                ".example.com"
+            ));
+        }
+
+        #[test]
+        fn dot_shorthand_matches_deep() {
+            assert!(matches_hostname_pattern(
+                "a.b.c.example.com",
+                ".example.com"
+            ));
+        }
+
+        #[test]
+        fn dot_shorthand_no_partial_label_match() {
+            assert!(!matches_hostname_pattern("fooexample.com", ".example.com"));
+        }
+
+        #[test]
+        fn catch_all() {
+            assert!(matches_hostname_pattern("anything.example.com", "*"));
+            assert!(matches_hostname_pattern("localhost", "*"));
+        }
+
+        #[test]
+        fn unrelated_domain() {
+            assert!(!matches_hostname_pattern("other.net", "*.example.com"));
+        }
+    }
+
+    mod hostnames_match_tests {
+        use crate::config::HttpValueMatch;
+
+        #[test]
+        fn single_exact_pattern() {
+            let m = HttpValueMatch::Hostnames(vec!["example.com".into()]);
+            assert!(m.matches(Some("example.com")));
+            assert!(m.matches(Some("example.com:8080")));
+            assert!(!m.matches(Some("other.com")));
+        }
+
+        #[test]
+        fn wildcard_pattern() {
+            let m = HttpValueMatch::Hostnames(vec!["*.example.com".into()]);
+            assert!(m.matches(Some("foo.example.com")));
+            assert!(m.matches(Some("foo.example.com:443")));
+            assert!(!m.matches(Some("example.com")));
+        }
+
+        #[test]
+        fn multiple_patterns() {
+            let m = HttpValueMatch::Hostnames(vec![
+                "api.example.com".into(),
+                "*.internal.example.com".into(),
+            ]);
+            assert!(m.matches(Some("api.example.com")));
+            assert!(m.matches(Some("foo.internal.example.com")));
+            assert!(!m.matches(Some("other.example.com")));
+        }
+
+        #[test]
+        fn none_value() {
+            let m = HttpValueMatch::Hostnames(vec!["example.com".into()]);
+            assert!(!m.matches(None));
+        }
+    }
 }
