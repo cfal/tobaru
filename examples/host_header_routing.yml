@@ -1,0 +1,139 @@
+# Example: HTTP Host Header Routing
+#
+# Routes HTTP requests to different backends based on the Host header.
+# The "host" key in required_request_headers supports the same wildcard
+# patterns as sni_hostnames:
+#
+#   "example.com"     -- exact match only
+#   "*.example.com"   -- matches any subdomain, but NOT example.com itself
+#   ".example.com"    -- matches both example.com and any subdomain
+#   "*"               -- catch-all
+#
+# Port suffixes in the Host header (e.g. "example.com:8080") are stripped
+# before matching.
+#
+# When possible, prefer SNI-level routing (sni_hostnames) over Host header
+# matching. SNI routing operates at the TLS layer before HTTP parsing,
+# avoiding the overhead of decryption and request parsing. Host header
+# routing is useful for plain HTTP, or when multiple virtual hosts share
+# the same TLS certificate.
+
+# Example 1: Simple virtual hosting on plain HTTP
+#
+# curl -H "Host: app.example.com" http://localhost:8080/
+# curl -H "Host: blog.example.com" http://localhost:8080/
+- address: 0.0.0.0:8080
+  transport: tcp
+  target:
+    allowlist: 0.0.0.0/0
+    http_paths:
+      /:
+        - required_request_headers:
+            host: app.example.com
+          http_action:
+            type: forward
+            addresses:
+              - app-backend:8080
+
+        - required_request_headers:
+            host: blog.example.com
+          http_action:
+            type: forward
+            addresses:
+              - blog-backend:8080
+
+    default_http_action:
+      type: serve-message
+      status_code: 404
+
+# Example 2: Wildcard host matching
+#
+# Matches any subdomain of api.example.com (v1.api.example.com, etc.)
+- address: 0.0.0.0:8081
+  transport: tcp
+  target:
+    allowlist: 0.0.0.0/0
+    http_paths:
+      /:
+        - required_request_headers:
+            host: "*.api.example.com"
+          http_action:
+            type: forward
+            addresses:
+              - api-backend:8080
+
+        - required_request_headers:
+            host: ".example.com"
+          http_action:
+            type: forward
+            addresses:
+              - default-backend:8080
+
+    default_http_action:
+      type: serve-message
+      status_code: 404
+
+# Example 3: Virtual hosting behind TLS termination
+#
+# When multiple virtual hosts share a single wildcard certificate,
+# SNI alone cannot distinguish them. Use Host header routing after
+# TLS termination.
+- address: 0.0.0.0:443
+  transport: tcp
+  targets:
+    - allowlist: 0.0.0.0/0
+      server_tls:
+        cert: /path/to/wildcard-cert.pem
+        key: /path/to/wildcard-key.pem
+        sni_hostnames: ".example.com"
+      http_paths:
+        /:
+          - required_request_headers:
+              host: app.example.com
+            http_action:
+              type: forward
+              addresses:
+                - app-backend:8080
+
+          - required_request_headers:
+              host: api.example.com
+            http_action:
+              type: forward
+              addresses:
+                - api-backend:8080
+
+      default_http_action:
+        type: serve-message
+        status_code: 404
+
+# Example 4: Combining host and path routing
+#
+# Different hosts get different path trees.
+- address: 0.0.0.0:8082
+  transport: tcp
+  target:
+    allowlist: 0.0.0.0/0
+    http_paths:
+      /api/:
+        - required_request_headers:
+            host: app.example.com
+          http_action:
+            type: forward
+            addresses:
+              - app-api-backend:8080
+
+        - required_request_headers:
+            host: admin.example.com
+          http_action:
+            type: forward
+            addresses:
+              - admin-api-backend:8080
+
+      /static/:
+        http_action:
+          type: serve-directory
+          path: /var/www/static
+
+    default_http_action:
+      type: serve-message
+      status_code: 404
