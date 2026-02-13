@@ -1,4 +1,4 @@
-use std::collections::hash_map::{Entry, RandomState};
+use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, Hash};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
@@ -22,6 +22,7 @@ use crate::config::{
     NetLocation, NoneOrOne, RawTcpActionConfig, TcpAction, TcpKeepaliveConfig, TcpKeepaliveOption,
     TcpTargetConfig, TcpTargetLocation, TlsOption,
 };
+use crate::domain_trie::DomainTrie;
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::http::handle_http_stream;
 use crate::iptables_util::{configure_iptables, Protocol};
@@ -293,7 +294,8 @@ pub async fn run_tcp_server(
     let mut non_tls_lookup_table: IpLookupTable<Ipv6Addr, Arc<TargetData>> = IpLookupTable::new();
 
     let mut tls_lookup_table: IpLookupTable<Ipv6Addr, bool> = IpLookupTable::new();
-    let mut sni_lookup_map: HashMap<TlsOption, Vec<Arc<TlsTargetData>>> = HashMap::new();
+    let mut sni_trie: DomainTrie<Vec<Arc<TlsTargetData>>> = DomainTrie::new();
+    let mut no_sni_targets: Vec<Arc<TlsTargetData>> = Vec::new();
 
     let mut iptable_masks = vec![];
 
@@ -436,12 +438,15 @@ pub async fn run_tcp_server(
                 };
 
                 for sni_hostname in sni_hostnames.into_iter() {
-                    match sni_lookup_map.entry(sni_hostname) {
-                        Entry::Occupied(mut o) => {
-                            o.get_mut().push(tls_target_data.clone());
+                    match sni_hostname {
+                        TlsOption::None => {
+                            no_sni_targets.push(tls_target_data.clone());
                         }
-                        Entry::Vacant(v) => {
-                            v.insert(vec![tls_target_data.clone()]);
+                        TlsOption::Any => {
+                            sni_trie.entry_or_default("*").push(tls_target_data.clone());
+                        }
+                        TlsOption::Specified(pattern) => {
+                            sni_trie.entry_or_default(&pattern).push(tls_target_data.clone());
                         }
                     }
                 }
@@ -472,8 +477,8 @@ pub async fn run_tcp_server(
         configure_iptables(Protocol::Tcp, server_address, &iptable_masks).await;
     }
 
-    // TODO: check that there is only a single item under TlsOption::None and TlsOption::Any
-    let sni_lookup_map = Arc::new(sni_lookup_map);
+    let sni_trie = Arc::new(sni_trie);
+    let no_sni_targets = Arc::new(no_sni_targets);
 
     let listener = TcpListener::bind(server_address).await.unwrap();
     println!("Listening (TCP): {}", listener.local_addr().unwrap());
@@ -520,10 +525,11 @@ pub async fn run_tcp_server(
         }
 
         if has_tls_data {
-            let cloned_sni_map = sni_lookup_map.clone();
+            let cloned_sni_trie = sni_trie.clone();
+            let cloned_no_sni = no_sni_targets.clone();
             tokio::spawn(async move {
                 if let Err(e) =
-                    process_tls_stream(stream, &addr, ip, non_tls_data, cloned_sni_map).await
+                    process_tls_stream(stream, &addr, ip, non_tls_data, cloned_sni_trie, cloned_no_sni).await
                 {
                     error!("{} finished with error: {:?}", addr, e);
                 } else {
@@ -548,18 +554,18 @@ pub async fn run_tcp_server(
 fn find_matching_terminate_target(
     parsed: &crate::tls_parser::ParsedClientHello,
     ip: Ipv6Addr,
-    sni_lookup_map: &HashMap<TlsOption, Vec<Arc<TlsTargetData>>>,
+    sni_trie: &DomainTrie<Vec<Arc<TlsTargetData>>>,
+    no_sni_targets: &[Arc<TlsTargetData>],
 ) -> Option<(Arc<TlsTargetData>, Arc<rustls::ServerConfig>)> {
-    // Match SNI hostname
-    let sni_option = parsed
-        .server_name
-        .as_ref()
-        .map(|s| TlsOption::Specified(s.clone()))
-        .unwrap_or(TlsOption::None);
-
-    let candidates = sni_lookup_map
-        .get(&sni_option)
-        .or_else(|| sni_lookup_map.get(&TlsOption::Any))?;
+    let candidates = match &parsed.server_name {
+        Some(hostname) => sni_trie.lookup(hostname)?,
+        None => {
+            if no_sni_targets.is_empty() {
+                return None;
+            }
+            no_sni_targets
+        }
+    };
 
     // Match ALPN
     let alpn_hashes: HashSet<u64> = parsed
@@ -677,18 +683,18 @@ async fn handle_terminate_with_parsed(
 fn find_matching_passthrough_target(
     parsed: &crate::tls_parser::ParsedClientHello,
     ip: Ipv6Addr,
-    sni_lookup_map: &HashMap<TlsOption, Vec<Arc<TlsTargetData>>>,
+    sni_trie: &DomainTrie<Vec<Arc<TlsTargetData>>>,
+    no_sni_targets: &[Arc<TlsTargetData>],
 ) -> Option<Arc<TlsTargetData>> {
-    // Match SNI hostname
-    let sni_option = parsed
-        .server_name
-        .as_ref()
-        .map(|s| TlsOption::Specified(s.clone()))
-        .unwrap_or(TlsOption::None);
-
-    let candidates = sni_lookup_map
-        .get(&sni_option)
-        .or_else(|| sni_lookup_map.get(&TlsOption::Any))?;
+    let candidates = match &parsed.server_name {
+        Some(hostname) => sni_trie.lookup(hostname)?,
+        None => {
+            if no_sni_targets.is_empty() {
+                return None;
+            }
+            no_sni_targets
+        }
+    };
 
     // Match ALPN
     let alpn_hashes: HashSet<u64> = parsed
@@ -803,7 +809,8 @@ async fn process_tls_stream(
     addr: &std::net::SocketAddr,
     ip: Ipv6Addr,
     non_tls_data: Option<Arc<TargetData>>,
-    sni_lookup_map: Arc<HashMap<TlsOption, Vec<Arc<TlsTargetData>>>>,
+    sni_trie: Arc<DomainTrie<Vec<Arc<TlsTargetData>>>>,
+    no_sni_targets: Arc<Vec<Arc<TlsTargetData>>>,
 ) -> std::io::Result<()> {
     // UNIFIED APPROACH: Always parse ClientHello first
     // This allows us to route to either passthrough or terminate targets
@@ -869,12 +876,12 @@ async fn process_tls_stream(
     buf.truncate(end);
 
     // Try to match passthrough targets first (higher priority)
-    if let Some(target) = find_matching_passthrough_target(&parsed, ip, &sni_lookup_map) {
+    if let Some(target) = find_matching_passthrough_target(&parsed, ip, &sni_trie, &no_sni_targets) {
         return handle_passthrough_stream(stream, addr, buf, target).await;
     }
 
     // Try to match terminate targets
-    if let Some((target, tls_config)) = find_matching_terminate_target(&parsed, ip, &sni_lookup_map)
+    if let Some((target, tls_config)) = find_matching_terminate_target(&parsed, ip, &sni_trie, &no_sni_targets)
     {
         let (tls_stream, target_data) =
             handle_terminate_with_parsed(stream, addr, buf, target, tls_config).await?;

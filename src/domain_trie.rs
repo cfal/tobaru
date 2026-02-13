@@ -64,6 +64,26 @@ impl<V> DomainTrie<V> {
         }
     }
 
+    /// Returns a mutable reference to the value for a pattern, inserting
+    /// `V::default()` if absent. Supports the same patterns as `insert`
+    /// except `.`-shorthand (which sets two slots).
+    pub fn entry_or_default(&mut self, pattern: &str) -> &mut V
+    where
+        V: Default,
+    {
+        if let Some(suffix) = pattern.strip_prefix("*.") {
+            let node = self.walk_to_node(suffix);
+            node.wildcard_value.get_or_insert_with(V::default)
+        } else if pattern == "*" {
+            self.root.wildcard_value.get_or_insert_with(V::default)
+        } else if pattern.starts_with('.') {
+            panic!("entry_or_default does not support dot-shorthand patterns");
+        } else {
+            let node = self.walk_to_node(pattern);
+            node.exact_value.get_or_insert_with(V::default)
+        }
+    }
+
     /// Walks (or creates) trie nodes for the given hostname, splitting by label
     /// in reverse order (TLD first), and returns the final node.
     fn walk_to_node(&mut self, hostname: &str) -> &mut DomainTrieNode<V> {
@@ -379,5 +399,30 @@ mod tests {
         assert_eq!(t.insert(".example.com", 2), Some(1));
         assert_eq!(t.lookup("example.com"), Some(&2));
         assert_eq!(t.lookup("foo.example.com"), Some(&2));
+    }
+
+    #[test]
+    fn entry_or_default_creates_and_returns_mut() {
+        let mut t: DomainTrie<Vec<i32>> = DomainTrie::new();
+        t.entry_or_default("example.com").push(1);
+        t.entry_or_default("example.com").push(2);
+        assert_eq!(t.lookup("example.com"), Some(&vec![1, 2]));
+    }
+
+    #[test]
+    fn entry_or_default_wildcard() {
+        let mut t: DomainTrie<Vec<i32>> = DomainTrie::new();
+        t.entry_or_default("*.example.com").push(10);
+        t.entry_or_default("*.example.com").push(20);
+        assert_eq!(t.lookup("foo.example.com"), Some(&vec![10, 20]));
+        assert_eq!(t.lookup("example.com"), None);
+    }
+
+    #[test]
+    fn entry_or_default_root_wildcard() {
+        let mut t: DomainTrie<Vec<i32>> = DomainTrie::new();
+        t.entry_or_default("*").push(1);
+        t.entry_or_default("*").push(2);
+        assert_eq!(t.lookup("anything.com"), Some(&vec![1, 2]));
     }
 }
