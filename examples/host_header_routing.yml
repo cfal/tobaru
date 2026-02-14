@@ -32,15 +32,19 @@
             host: app.example.com
           http_action:
             type: forward
-            addresses:
-              - app-backend:8080
+            address: app-backend:8080
+            response_header_patch:
+              overwrite_headers:
+                host: app.example.com
 
         - required_request_headers:
             host: blog.example.com
           http_action:
             type: forward
-            addresses:
-              - blog-backend:8080
+            address: blog-backend:8080
+            response_header_patch:
+              overwrite_headers:
+                host: blog.example.com
 
     default_http_action:
       type: serve-message
