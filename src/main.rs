@@ -2,6 +2,7 @@ mod async_stream;
 mod config;
 mod copy_bidirectional;
 mod domain_trie;
+mod hostname_util;
 mod http;
 mod iptables_util;
 mod rustls_util;
@@ -288,12 +289,10 @@ fn main() {
                 return;
             }
 
-            let mut join_handles = Vec::with_capacity(server_configs.len());
-            for server_config in server_configs {
-                join_handles.push(tokio::spawn(async move {
-                    run(server_config).await;
-                }));
-            }
+            let join_handles: Vec<_> = server_configs
+                .into_iter()
+                .map(|sc| tokio::spawn(run(sc)))
+                .collect();
 
             config_rx.recv().await.unwrap();
 

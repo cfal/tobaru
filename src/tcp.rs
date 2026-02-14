@@ -3,8 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, Hash};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use futures::join;
 use ip_network_table_deps_treebitmap::IpLookupTable;
@@ -17,13 +16,13 @@ use tokio::time::{timeout, Duration};
 
 use crate::async_stream::AsyncStream;
 use crate::config::{
-    HttpForwardConfig, HttpHeaderPatch, HttpPathAction, HttpServeDirectoryConfig,
+    AlpnValue, HttpForwardConfig, HttpHeaderPatch, HttpPathAction, HttpServeDirectoryConfig,
     HttpServeMessageConfig, HttpTcpActionConfig, HttpValueMatch, IpMask, IpMaskSelection, Location,
-    NetLocation, NoneOrOne, RawTcpActionConfig, TcpAction, TcpKeepaliveConfig, TcpKeepaliveOption,
-    TcpTargetConfig, TcpTargetLocation, TlsOption,
+    NetLocation, NoneOrOne, RawTcpActionConfig, SniValue, TcpAction, TcpKeepaliveConfig,
+    TcpKeepaliveOption, TcpTargetConfig, TcpTargetLocation,
 };
-use crate::domain_trie::DomainTrie;
 use crate::copy_bidirectional::copy_bidirectional;
+use crate::domain_trie::DomainTrie;
 use crate::http::handle_http_stream;
 use crate::iptables_util::{configure_iptables, Protocol};
 use crate::rustls_util::{
@@ -222,23 +221,23 @@ fn hash_alpn<T: Hash>(x: T) -> u64 {
 
 /// Parse ALPN configuration into flags and hashes (common for both modes)
 fn parse_alpn_config(
-    alpn_protocols: &crate::config::NoneOrSome<TlsOption>,
+    alpn_protocols: &crate::config::NoneOrSome<AlpnValue>,
 ) -> (bool, bool, HashSet<u64>) {
     let mut allow_no_alpn = false;
     let mut allow_any_alpn = false;
     let mut alpn_protocol_hashes = HashSet::new();
 
     let alpn_list = if alpn_protocols.is_empty() {
-        vec![TlsOption::Any, TlsOption::None]
+        vec![AlpnValue::Any, AlpnValue::None]
     } else {
         alpn_protocols.clone().into_vec()
     };
 
     for alpn_protocol in alpn_list {
         match alpn_protocol {
-            TlsOption::None => allow_no_alpn = true,
-            TlsOption::Any => allow_any_alpn = true,
-            TlsOption::Specified(s) => {
+            AlpnValue::None => allow_no_alpn = true,
+            AlpnValue::Any => allow_any_alpn = true,
+            AlpnValue::Specified(s) => {
                 alpn_protocol_hashes.insert(hash_alpn(s.as_bytes()));
             }
         }
@@ -251,12 +250,12 @@ fn parse_alpn_config(
 fn build_rustls_configs(
     certs: Vec<rustls::pki_types::CertificateDer<'static>>,
     private_key: &rustls::pki_types::PrivateKeyDer<'static>,
-    alpn_protocols: &crate::config::NoneOrSome<TlsOption>,
+    alpn_protocols: &crate::config::NoneOrSome<AlpnValue>,
     client_fingerprints: &crate::config::NoneOrSome<String>,
 ) -> (Arc<rustls::ServerConfig>, Arc<rustls::ServerConfig>) {
     let mut alpn_protocol_bytes = vec![];
     for proto in alpn_protocols.iter() {
-        if let TlsOption::Specified(s) = proto {
+        if let AlpnValue::Specified(s) = proto {
             alpn_protocol_bytes.push(s.as_bytes().to_vec());
         }
     }
@@ -432,21 +431,23 @@ pub async fn run_tcp_server(
 
                 // Register SNI hostnames (common for both modes)
                 let sni_hostnames = if tls_config.sni_hostnames.is_empty() {
-                    vec![TlsOption::Any, TlsOption::None]
+                    vec![SniValue::Any, SniValue::None]
                 } else {
                     tls_config.sni_hostnames.clone().into_vec()
                 };
 
-                for sni_hostname in sni_hostnames.into_iter() {
+                for sni_hostname in sni_hostnames {
                     match sni_hostname {
-                        TlsOption::None => {
+                        SniValue::None => {
                             no_sni_targets.push(tls_target_data.clone());
                         }
-                        TlsOption::Any => {
+                        SniValue::Any => {
                             sni_trie.entry_or_default("*").push(tls_target_data.clone());
                         }
-                        TlsOption::Specified(pattern) => {
-                            sni_trie.entry_or_default(&pattern).push(tls_target_data.clone());
+                        SniValue::Specified(pattern) => {
+                            sni_trie
+                                .entry_or_default(&pattern)
+                                .push(tls_target_data.clone());
                         }
                     }
                 }
@@ -528,8 +529,15 @@ pub async fn run_tcp_server(
             let cloned_sni_trie = sni_trie.clone();
             let cloned_no_sni = no_sni_targets.clone();
             tokio::spawn(async move {
-                if let Err(e) =
-                    process_tls_stream(stream, &addr, ip, non_tls_data, cloned_sni_trie, cloned_no_sni).await
+                if let Err(e) = process_tls_stream(
+                    stream,
+                    &addr,
+                    ip,
+                    non_tls_data,
+                    cloned_sni_trie,
+                    cloned_no_sni,
+                )
+                .await
                 {
                     error!("{} finished with error: {:?}", addr, e);
                 } else {
@@ -550,13 +558,12 @@ pub async fn run_tcp_server(
     }
 }
 
-/// Find matching terminate target based on SNI and ALPN from parsed ClientHello
-fn find_matching_terminate_target(
+/// Resolves SNI candidates and computes ALPN hashes from a parsed ClientHello.
+fn resolve_tls_candidates<'a>(
     parsed: &crate::tls_parser::ParsedClientHello,
-    ip: Ipv6Addr,
-    sni_trie: &DomainTrie<Vec<Arc<TlsTargetData>>>,
-    no_sni_targets: &[Arc<TlsTargetData>],
-) -> Option<(Arc<TlsTargetData>, Arc<rustls::ServerConfig>)> {
+    sni_trie: &'a DomainTrie<Vec<Arc<TlsTargetData>>>,
+    no_sni_targets: &'a [Arc<TlsTargetData>],
+) -> Option<(&'a [Arc<TlsTargetData>], HashSet<u64>)> {
     let candidates = match &parsed.server_name {
         Some(hostname) => sni_trie.lookup(hostname)?,
         None => {
@@ -567,15 +574,34 @@ fn find_matching_terminate_target(
         }
     };
 
-    // Match ALPN
     let alpn_hashes: HashSet<u64> = parsed
         .alpn_protocols
         .iter()
         .map(|s| hash_alpn(s.as_bytes()))
         .collect();
 
+    Some((candidates, alpn_hashes))
+}
+
+/// Returns true if the candidate matches the client's ALPN offer.
+fn alpn_matches(candidate: &TlsTargetData, alpn_hashes: &HashSet<u64>) -> bool {
+    if alpn_hashes.is_empty() {
+        candidate.allow_no_alpn
+    } else {
+        !alpn_hashes.is_disjoint(&candidate.alpn_protocol_hashes) || candidate.allow_any_alpn
+    }
+}
+
+/// Find matching terminate target based on SNI and ALPN from parsed ClientHello
+fn find_matching_terminate_target(
+    parsed: &crate::tls_parser::ParsedClientHello,
+    ip: Ipv6Addr,
+    sni_trie: &DomainTrie<Vec<Arc<TlsTargetData>>>,
+    no_sni_targets: &[Arc<TlsTargetData>],
+) -> Option<(Arc<TlsTargetData>, Arc<rustls::ServerConfig>)> {
+    let (candidates, alpn_hashes) = resolve_tls_candidates(parsed, sni_trie, no_sni_targets)?;
+
     for candidate in candidates {
-        // Only consider terminate targets
         let (alpn_tls_config, no_alpn_tls_config) = match &candidate.tls_mode {
             TlsMode::Terminate {
                 alpn_tls_config,
@@ -584,21 +610,18 @@ fn find_matching_terminate_target(
             TlsMode::Passthrough => continue,
         };
 
-        // Check IP allowlist
         if candidate.ip_lookup_table.longest_match(ip).is_none() {
             continue;
         }
 
-        // Check ALPN matching and determine which config to use
+        // Select the appropriate rustls config based on ALPN match type
         if alpn_hashes.is_empty() {
             if candidate.allow_no_alpn {
                 return Some((candidate.clone(), no_alpn_tls_config.clone()));
             }
         } else if !alpn_hashes.is_disjoint(&candidate.alpn_protocol_hashes) {
-            // Specific protocol match - use ALPN config
             return Some((candidate.clone(), alpn_tls_config.clone()));
         } else if candidate.allow_any_alpn {
-            // Any ALPN allowed but no specific match - use no-ALPN config
             return Some((candidate.clone(), no_alpn_tls_config.clone()));
         }
     }
@@ -679,49 +702,23 @@ async fn handle_terminate_with_parsed(
     Ok((tls_stream, target_data.target_data.clone()))
 }
 
-/// Find matching TLS target based on SNI and ALPN
+/// Find matching passthrough target based on SNI and ALPN
 fn find_matching_passthrough_target(
     parsed: &crate::tls_parser::ParsedClientHello,
     ip: Ipv6Addr,
     sni_trie: &DomainTrie<Vec<Arc<TlsTargetData>>>,
     no_sni_targets: &[Arc<TlsTargetData>],
 ) -> Option<Arc<TlsTargetData>> {
-    let candidates = match &parsed.server_name {
-        Some(hostname) => sni_trie.lookup(hostname)?,
-        None => {
-            if no_sni_targets.is_empty() {
-                return None;
-            }
-            no_sni_targets
-        }
-    };
-
-    // Match ALPN
-    let alpn_hashes: HashSet<u64> = parsed
-        .alpn_protocols
-        .iter()
-        .map(|s| hash_alpn(s.as_bytes()))
-        .collect();
+    let (candidates, alpn_hashes) = resolve_tls_candidates(parsed, sni_trie, no_sni_targets)?;
 
     for candidate in candidates {
-        // Skip non-passthrough targets
         if !matches!(candidate.tls_mode, TlsMode::Passthrough) {
             continue;
         }
-
-        // Check IP allowlist
         if candidate.ip_lookup_table.longest_match(ip).is_none() {
             continue;
         }
-
-        // Check ALPN matching
-        if alpn_hashes.is_empty() {
-            if candidate.allow_no_alpn {
-                return Some(candidate.clone());
-            }
-        } else if !alpn_hashes.is_disjoint(&candidate.alpn_protocol_hashes)
-            || candidate.allow_any_alpn
-        {
+        if alpn_matches(candidate, &alpn_hashes) {
             return Some(candidate.clone());
         }
     }
@@ -785,13 +782,12 @@ async fn handle_passthrough_stream(
         &target_location.location,
     );
 
-    // Bidirectional copy for the rest of the connection
-    // Set b_need_initial_flush=true to flush the ClientHello before copying
+    // Flush target_stream (contains ClientHello) before starting bidirectional copy
     let copy_result = copy_bidirectional(
         &mut (Box::new(stream) as Box<dyn crate::async_stream::AsyncStream>),
         &mut target_stream,
         false,
-        true, // Flush target_stream before starting bidirectional copy
+        true,
     )
     .await;
 
@@ -800,8 +796,20 @@ async fn handle_passthrough_stream(
         addr, &target_location.location
     );
 
-    copy_result?;
-    Ok(())
+    copy_result.map(|_| ())
+}
+
+/// Falls back to non-TLS handling when ClientHello parsing fails or times out.
+async fn fallback_to_non_tls(
+    stream: TcpStream,
+    addr: &std::net::SocketAddr,
+    non_tls_data: Arc<TargetData>,
+    reader: crate::tls_reader::TlsReader,
+) -> std::io::Result<()> {
+    let (mut buf, _pos, end) = reader.into_inner();
+    buf.truncate(end);
+    let initial_data = if buf.is_empty() { None } else { Some(buf) };
+    run_stream_action(Box::new(stream), addr, non_tls_data, initial_data).await
 }
 
 async fn process_tls_stream(
@@ -826,45 +834,39 @@ async fn process_tls_stream(
 
     let parsed = match parse_timeout.await {
         Ok(Ok(parsed)) => parsed,
-        Ok(Err(e)) if non_tls_data.is_some() => {
-            // Not TLS (or malformed TLS) - try non-TLS target
-            // Pass buffered data to be written first (passthrough approach)
-            debug!(
-                "Failed to parse TLS ClientHello from {}: {}, trying non-TLS target",
-                addr, e
-            );
-            let (mut buf, _pos, end) = reader.into_inner();
-            buf.truncate(end);
-
-            let initial_data = if buf.is_empty() { None } else { Some(buf) };
-            return run_stream_action(Box::new(stream), addr, non_tls_data.unwrap(), initial_data)
-                .await;
-        }
         Ok(Err(e)) => {
-            // No non-TLS target and can't parse TLS
+            if let Some(non_tls_data) = non_tls_data {
+                debug!(
+                    "Failed to parse TLS ClientHello from {}: {}, trying non-TLS target",
+                    addr, e
+                );
+                return fallback_to_non_tls(stream, addr, non_tls_data, reader).await;
+            }
             return Err(e);
         }
-        Err(_) if non_tls_data.is_some() => {
-            // Timeout while parsing - assume non-TLS
-            // Pass buffered data to be written first (passthrough approach)
-            warn!(
-                "TLS ClientHello parse timed out for {}, assuming non-TLS connection",
-                addr
-            );
-            let (mut buf, _pos, end) = reader.into_inner();
-            buf.truncate(end);
-
-            let initial_data = if buf.is_empty() { None } else { Some(buf) };
-            return run_stream_action(Box::new(stream), addr, non_tls_data.unwrap(), initial_data)
-                .await;
-        }
         Err(elapsed) => {
+            if let Some(non_tls_data) = non_tls_data {
+                warn!(
+                    "TLS ClientHello parse timed out for {}, assuming non-TLS connection",
+                    addr
+                );
+                return fallback_to_non_tls(stream, addr, non_tls_data, reader).await;
+            }
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 format!("TLS ClientHello parse timed out: {}", elapsed),
             ));
         }
     };
+
+    if let Some(ref sni) = parsed.server_name {
+        crate::hostname_util::validate_sni_hostname(sni).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Invalid SNI from {}: {:?} ({})", addr, sni, e),
+            )
+        })?;
+    }
 
     debug!(
         "Parsed ClientHello from {} - SNI: {:?}, ALPN: {:?}",
@@ -876,12 +878,14 @@ async fn process_tls_stream(
     buf.truncate(end);
 
     // Try to match passthrough targets first (higher priority)
-    if let Some(target) = find_matching_passthrough_target(&parsed, ip, &sni_trie, &no_sni_targets) {
+    if let Some(target) = find_matching_passthrough_target(&parsed, ip, &sni_trie, &no_sni_targets)
+    {
         return handle_passthrough_stream(stream, addr, buf, target).await;
     }
 
     // Try to match terminate targets
-    if let Some((target, tls_config)) = find_matching_terminate_target(&parsed, ip, &sni_trie, &no_sni_targets)
+    if let Some((target, tls_config)) =
+        find_matching_terminate_target(&parsed, ip, &sni_trie, &no_sni_targets)
     {
         let (tls_stream, target_data) =
             handle_terminate_with_parsed(stream, addr, buf, target, tls_config).await?;
@@ -977,6 +981,52 @@ async fn run_stream_action(
     }
 }
 
+/// Resolves the TLS server name from the configured SNI hostname, falling back
+/// to parsing from `fallback_address` or using a dummy name.
+fn resolve_server_name(
+    sni_hostname: &NoneOrOne<String>,
+    fallback_address: Option<&str>,
+) -> rustls::pki_types::ServerName<'static> {
+    let from_fallback = || {
+        fallback_address
+            .and_then(|addr| {
+                rustls::pki_types::ServerName::try_from(addr)
+                    .map(|s| s.to_owned())
+                    .ok()
+            })
+            .unwrap_or_else(get_dummy_server_name)
+    };
+
+    match sni_hostname {
+        NoneOrOne::One(sni) => rustls::pki_types::ServerName::try_from(sni.as_str())
+            .map(|s| s.to_owned())
+            .unwrap_or_else(|_| {
+                warn!("Invalid SNI hostname in config: {}, using fallback", sni);
+                from_fallback()
+            }),
+        NoneOrOne::None | NoneOrOne::Unspecified => from_fallback(),
+    }
+}
+
+/// Wraps a stream with a TLS connector if present.
+async fn maybe_wrap_tls<S: AsyncStream + 'static>(
+    stream: S,
+    target_location: &TargetLocationData,
+    fallback_address: Option<&str>,
+) -> std::io::Result<Box<dyn AsyncStream>> {
+    if let Some(ref connector) = target_location.tls_connector {
+        let server_name = resolve_server_name(&target_location.sni_hostname, fallback_address);
+        let tls_stream = connector
+            .connect_with(server_name, stream, |server_conn| {
+                server_conn.set_buffer_limit(Some(32768));
+            })
+            .await?;
+        Ok(Box::new(tls_stream))
+    } else {
+        Ok(Box::new(stream))
+    }
+}
+
 pub async fn setup_target_stream(
     addr: &std::net::SocketAddr,
     target_location: &TargetLocationData,
@@ -992,7 +1042,6 @@ pub async fn setup_target_stream(
                     error!("Failed to set tcp_nodelay on target stream: {}", e);
                 }
             }
-            // Apply TCP keepalive on client-side (target-facing) connection
             if let Some(keepalive_config) = tcp_keepalive {
                 if let Err(e) = crate::socket_util::set_tcp_keepalive(
                     &tcp_stream,
@@ -1008,39 +1057,7 @@ pub async fn setup_target_stream(
                 tcp_stream.local_addr().unwrap()
             );
 
-            if let Some(ref connector) = target_location.tls_connector {
-                // Use SNI from config if specified, otherwise try to parse from address
-                // Note: If enable_sni=false in the config, the SNI won't be sent regardless
-                let server_name = match &target_location.sni_hostname {
-                    NoneOrOne::One(sni) => {
-                        // Use explicitly configured SNI
-                        rustls::pki_types::ServerName::try_from(sni.as_str())
-                            .map(|s| s.to_owned())
-                            .unwrap_or_else(|_| {
-                                warn!("Invalid SNI hostname in config: {}, using address", sni);
-                                rustls::pki_types::ServerName::try_from(address.as_str())
-                                    .map(|s| s.to_owned())
-                                    .unwrap_or_else(|_| get_dummy_server_name())
-                            })
-                    }
-                    NoneOrOne::None | NoneOrOne::Unspecified => {
-                        // Either explicitly disabled (None) or not configured (Unspecified)
-                        // For None: dummy name is fine since enable_sni=false
-                        // For Unspecified: try to parse from address
-                        rustls::pki_types::ServerName::try_from(address.as_str())
-                            .map(|s| s.to_owned())
-                            .unwrap_or_else(|_| get_dummy_server_name())
-                    }
-                };
-                let tls_stream = connector
-                    .connect_with(server_name, tcp_stream, |server_conn| {
-                        server_conn.set_buffer_limit(Some(32768));
-                    })
-                    .await?;
-                Ok(Box::new(tls_stream))
-            } else {
-                Ok(Box::new(tcp_stream))
-            }
+            maybe_wrap_tls(tcp_stream, target_location, Some(address.as_str())).await
         }
         Location::Path(ref path_buf) => {
             let unix_stream = UnixStream::connect(path_buf.as_path()).await?;
@@ -1050,30 +1067,7 @@ pub async fn setup_target_stream(
                 unix_stream.local_addr().unwrap()
             );
 
-            if let Some(ref connector) = target_location.tls_connector {
-                // For unix sockets, SNI behavior is controlled by the config's enable_sni setting
-                // Use configured SNI if specified, otherwise use dummy (won't be sent if enable_sni=false)
-                let server_name = match &target_location.sni_hostname {
-                    NoneOrOne::One(sni) => rustls::pki_types::ServerName::try_from(sni.as_str())
-                        .map(|s| s.to_owned())
-                        .unwrap_or_else(|_| {
-                            warn!("Invalid SNI hostname in config: {}, using dummy", sni);
-                            get_dummy_server_name()
-                        }),
-                    NoneOrOne::None | NoneOrOne::Unspecified => {
-                        // Use dummy name (won't be sent if enable_sni=false)
-                        get_dummy_server_name()
-                    }
-                };
-                let tls_stream = connector
-                    .connect_with(server_name, unix_stream, |server_conn| {
-                        server_conn.set_buffer_limit(Some(32768));
-                    })
-                    .await?;
-                Ok(Box::new(tls_stream))
-            } else {
-                Ok(Box::new(unix_stream))
-            }
+            maybe_wrap_tls(unix_stream, target_location, None).await
         }
     }
 }

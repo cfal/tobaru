@@ -12,10 +12,7 @@ pub enum NoneOrOne<T> {
 
 impl<T> NoneOrOne<T> {
     pub fn is_unspecified(&self) -> bool {
-        match self {
-            NoneOrOne::Unspecified => true,
-            _ => false,
-        }
+        matches!(self, NoneOrOne::Unspecified)
     }
 
     pub fn into_option(self) -> Option<T> {
@@ -39,10 +36,7 @@ pub enum NoneOrSome<T> {
 
 impl<T> NoneOrSome<T> {
     pub fn is_unspecified(&self) -> bool {
-        match self {
-            NoneOrSome::Unspecified => true,
-            _ => false,
-        }
+        matches!(self, NoneOrSome::Unspecified)
     }
 
     pub fn is_empty(&self) -> bool {

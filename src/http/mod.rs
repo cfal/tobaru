@@ -18,6 +18,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use crate::async_stream::AsyncStream;
 use crate::config::{HttpValueMatch, TcpKeepaliveConfig};
 use crate::copy_bidirectional::copy_bidirectional;
+use crate::hostname_util::{matches_host_header, strip_host_port, validate_host_header};
 use crate::tcp::{setup_target_stream, TargetHttpActionData, TargetHttpPathData};
 use crate::util::{allocate_vec, write_all};
 
@@ -57,7 +58,6 @@ pub async fn handle_http_stream(
         let request_id = format!("{}#{}", stream_id, iteration);
 
         // TODO: add a read timeout
-        // Use initial_data only on the first iteration (take() consumes it)
         let initial = if iteration == 1 {
             initial_data.take()
         } else {
@@ -74,7 +74,6 @@ pub async fn handle_http_stream(
             )));
         }
 
-        // remove the http specifier
         first_line.truncate(first_line.len() - 9);
 
         let space_index = match first_line.find(' ') {
@@ -96,12 +95,11 @@ pub async fn handle_http_stream(
         }
 
         let mut verb = first_line;
-        // remove the space from the verb.
         verb.truncate(verb.len() - 1);
         verb.make_ascii_uppercase();
 
         let (base_path, path_action) =
-            find_matching_action(path_configs, default_action, &request_path, &request_data);
+            find_matching_action(path_configs, default_action, &request_path, &request_data)?;
 
         match path_action {
             TargetHttpActionData::CloseConnection => {
@@ -508,100 +506,65 @@ fn find_matching_action<'a>(
     default_action: &'a TargetHttpActionData,
     request_path: &str,
     request_data: &http_parser::ParsedHttpData,
-) -> (&'a str, &'a TargetHttpActionData) {
-    let matching_configs = if request_path.ends_with("/") {
-        path_configs.get_ancestor(request_path)
+) -> std::io::Result<(&'a str, &'a TargetHttpActionData)> {
+    let mut lookup_path;
+    let lookup = if request_path.ends_with('/') {
+        request_path
     } else {
-        let mut lookup_path = String::with_capacity(request_path.len() + 1);
+        lookup_path = String::with_capacity(request_path.len() + 1);
         lookup_path.push_str(request_path);
         lookup_path.push('/');
-        path_configs.get_ancestor(&lookup_path)
+        &lookup_path
     };
+    let matching_configs = path_configs.get_ancestor(lookup);
 
     if let Some(t) = matching_configs {
         for path_config in t.value().unwrap().iter() {
-            if !has_required_headers(request_data.headers(), &path_config.required_request_headers) {
+            if !has_required_headers(
+                request_data.headers(),
+                &path_config.required_request_headers,
+            )? {
                 continue;
             }
-            return (t.key().unwrap(), &path_config.http_action);
+            return Ok((t.key().unwrap(), &path_config.http_action));
         }
     }
 
-    ("/", default_action)
+    Ok(("/", default_action))
 }
 
 fn has_required_headers(
     headers: &HashMap<String, String>,
     required: &HashMap<String, HttpValueMatch>,
-) -> bool {
-    for (key, value_match) in required.iter() {
+) -> std::io::Result<bool> {
+    for (key, rule) in required.iter() {
         let header_value = headers.get(key).map(String::as_str);
-        if !value_match.matches(header_value) {
-            return false;
+        if !matches_http_value(rule, header_value)? {
+            return Ok(false);
         }
     }
-    true
+    Ok(true)
 }
 
-/// Strips the port suffix from a Host header value.
-/// Handles bracketed IPv6 (e.g. "[::1]:8080" -> "[::1]").
-pub fn strip_host_port(host: &str) -> &str {
-    if let Some(bracket_end) = host.rfind(']') {
-        // Bracketed IPv6: only strip port after the closing bracket
-        match host[bracket_end + 1..].find(':') {
-            Some(offset) => &host[..bracket_end + 1 + offset],
-            None => host,
+/// Checks whether a header value matches an `HttpValueMatch` rule.
+/// For `Hostnames`, validates and strips the port before matching.
+pub fn matches_http_value(rule: &HttpValueMatch, value: Option<&str>) -> std::io::Result<bool> {
+    match rule {
+        HttpValueMatch::Any => Ok(value.is_some()),
+        HttpValueMatch::Single(allowed) => Ok(value.is_some_and(|v| v == allowed)),
+        HttpValueMatch::Multiple(allowed) => {
+            Ok(value.is_some_and(|v| allowed.iter().any(|a| a == v)))
         }
-    } else if let Some(colon) = host.rfind(':') {
-        if host[colon + 1..].bytes().all(|b| b.is_ascii_digit()) {
-            &host[..colon]
-        } else {
-            host
-        }
-    } else {
-        host
+        HttpValueMatch::Hostnames(patterns) => match value {
+            Some(v) => {
+                let hostname = strip_host_port(v);
+                validate_host_header(hostname)?;
+                Ok(patterns.iter().any(|p| matches_host_header(hostname, p)))
+            }
+            None => Ok(false),
+        },
     }
 }
-
-/// Matches a hostname against a domain pattern.
-///
-/// Supported patterns:
-///   `"example.com"`    -- exact match only
-///   `"*.example.com"`  -- any subdomain, but not `example.com` itself
-///   `".example.com"`   -- `example.com` and any subdomain
-///   `"*"`              -- catch-all
-pub fn matches_hostname_pattern(hostname: &str, pattern: &str) -> bool {
-    if pattern == "*" {
-        return true;
-    }
-    if let Some(suffix) = pattern.strip_prefix("*.") {
-        is_subdomain_of(hostname, suffix)
-    } else if let Some(suffix) = pattern.strip_prefix('.') {
-        hostname == suffix || is_subdomain_of(hostname, suffix)
-    } else {
-        hostname == pattern
-    }
-}
-
-/// Returns true if `hostname` is a proper subdomain of `domain`
-/// (i.e. has at least one additional label separated by a dot).
-fn is_subdomain_of(hostname: &str, domain: &str) -> bool {
-    hostname.len() > domain.len() + 1
-        && hostname.ends_with(domain)
-        && hostname.as_bytes()[hostname.len() - domain.len() - 1] == b'.'
-}
-
-//async fn connect_location(location: &Location) -> std::io::Result<Box<dyn TargetStream>> {
-//match location {
-//Location::Net(address) => TcpStream::connect(address).await.map(|stream| {
-//let _ = stream.set_nodelay(true);
-//Box::new(stream) as Box<dyn TargetStream>
-//}),
-//Location::Unix(path) => UnixStream::connect(path)
-//.await
-//.map(|stream| Box::new(stream) as Box<dyn TargetStream>),
-//}
-//}
 
 async fn forward_message<R, W>(
     from_stream: &mut R,
@@ -717,166 +680,150 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::matches_http_value;
+    use crate::config::HttpValueMatch;
 
-    mod strip_host_port_tests {
-        use super::*;
-
-        #[test]
-        fn plain_hostname() {
-            assert_eq!(strip_host_port("example.com"), "example.com");
-        }
-
-        #[test]
-        fn hostname_with_port() {
-            assert_eq!(strip_host_port("example.com:8080"), "example.com");
-        }
-
-        #[test]
-        fn hostname_with_default_port() {
-            assert_eq!(strip_host_port("example.com:443"), "example.com");
-        }
-
-        #[test]
-        fn ipv4_with_port() {
-            assert_eq!(strip_host_port("192.168.1.1:80"), "192.168.1.1");
-        }
-
-        #[test]
-        fn ipv4_without_port() {
-            assert_eq!(strip_host_port("192.168.1.1"), "192.168.1.1");
-        }
-
-        #[test]
-        fn bracketed_ipv6_with_port() {
-            assert_eq!(strip_host_port("[::1]:8080"), "[::1]");
-        }
-
-        #[test]
-        fn bracketed_ipv6_without_port() {
-            assert_eq!(strip_host_port("[::1]"), "[::1]");
-        }
-
-        #[test]
-        fn empty_string() {
-            assert_eq!(strip_host_port(""), "");
-        }
+    #[test]
+    fn any_variant() {
+        let m = HttpValueMatch::Any;
+        assert!(matches_http_value(&m, Some("anything")).unwrap());
+        assert!(!matches_http_value(&m, None).unwrap());
     }
 
-    mod matches_hostname_pattern_tests {
-        use super::*;
-
-        #[test]
-        fn exact_match() {
-            assert!(matches_hostname_pattern("example.com", "example.com"));
-        }
-
-        #[test]
-        fn exact_mismatch() {
-            assert!(!matches_hostname_pattern("other.com", "example.com"));
-        }
-
-        #[test]
-        fn wildcard_matches_subdomain() {
-            assert!(matches_hostname_pattern(
-                "foo.example.com",
-                "*.example.com"
-            ));
-        }
-
-        #[test]
-        fn wildcard_matches_deep_subdomain() {
-            assert!(matches_hostname_pattern(
-                "a.b.c.example.com",
-                "*.example.com"
-            ));
-        }
-
-        #[test]
-        fn wildcard_does_not_match_base() {
-            assert!(!matches_hostname_pattern("example.com", "*.example.com"));
-        }
-
-        #[test]
-        fn wildcard_no_partial_label_match() {
-            assert!(!matches_hostname_pattern(
-                "fooexample.com",
-                "*.example.com"
-            ));
-        }
-
-        #[test]
-        fn dot_shorthand_matches_base() {
-            assert!(matches_hostname_pattern("example.com", ".example.com"));
-        }
-
-        #[test]
-        fn dot_shorthand_matches_subdomain() {
-            assert!(matches_hostname_pattern(
-                "foo.example.com",
-                ".example.com"
-            ));
-        }
-
-        #[test]
-        fn dot_shorthand_matches_deep() {
-            assert!(matches_hostname_pattern(
-                "a.b.c.example.com",
-                ".example.com"
-            ));
-        }
-
-        #[test]
-        fn dot_shorthand_no_partial_label_match() {
-            assert!(!matches_hostname_pattern("fooexample.com", ".example.com"));
-        }
-
-        #[test]
-        fn catch_all() {
-            assert!(matches_hostname_pattern("anything.example.com", "*"));
-            assert!(matches_hostname_pattern("localhost", "*"));
-        }
-
-        #[test]
-        fn unrelated_domain() {
-            assert!(!matches_hostname_pattern("other.net", "*.example.com"));
-        }
+    #[test]
+    fn single_variant() {
+        let m = HttpValueMatch::Single("exact-value".into());
+        assert!(matches_http_value(&m, Some("exact-value")).unwrap());
+        assert!(!matches_http_value(&m, Some("other")).unwrap());
+        assert!(!matches_http_value(&m, None).unwrap());
     }
 
-    mod hostnames_match_tests {
-        use crate::config::HttpValueMatch;
+    #[test]
+    fn multiple_variant() {
+        let m = HttpValueMatch::Multiple(vec!["a".into(), "b".into()]);
+        assert!(matches_http_value(&m, Some("a")).unwrap());
+        assert!(matches_http_value(&m, Some("b")).unwrap());
+        assert!(!matches_http_value(&m, Some("c")).unwrap());
+        assert!(!matches_http_value(&m, None).unwrap());
+    }
 
-        #[test]
-        fn single_exact_pattern() {
-            let m = HttpValueMatch::Hostnames(vec!["example.com".into()]);
-            assert!(m.matches(Some("example.com")));
-            assert!(m.matches(Some("example.com:8080")));
-            assert!(!m.matches(Some("other.com")));
-        }
+    #[test]
+    fn single_exact_pattern() {
+        let m = HttpValueMatch::Hostnames(vec!["example.com".into()]);
+        assert!(matches_http_value(&m, Some("example.com")).unwrap());
+        assert!(matches_http_value(&m, Some("example.com:8080")).unwrap());
+        assert!(!matches_http_value(&m, Some("other.com")).unwrap());
+    }
 
-        #[test]
-        fn wildcard_pattern() {
-            let m = HttpValueMatch::Hostnames(vec!["*.example.com".into()]);
-            assert!(m.matches(Some("foo.example.com")));
-            assert!(m.matches(Some("foo.example.com:443")));
-            assert!(!m.matches(Some("example.com")));
-        }
+    #[test]
+    fn wildcard_pattern() {
+        let m = HttpValueMatch::Hostnames(vec!["*.example.com".into()]);
+        assert!(matches_http_value(&m, Some("foo.example.com")).unwrap());
+        assert!(matches_http_value(&m, Some("foo.example.com:443")).unwrap());
+        assert!(!matches_http_value(&m, Some("example.com")).unwrap());
+    }
 
-        #[test]
-        fn multiple_patterns() {
-            let m = HttpValueMatch::Hostnames(vec![
-                "api.example.com".into(),
-                "*.internal.example.com".into(),
-            ]);
-            assert!(m.matches(Some("api.example.com")));
-            assert!(m.matches(Some("foo.internal.example.com")));
-            assert!(!m.matches(Some("other.example.com")));
-        }
+    #[test]
+    fn multiple_patterns() {
+        let m = HttpValueMatch::Hostnames(vec![
+            "api.example.com".into(),
+            "*.internal.example.com".into(),
+        ]);
+        assert!(matches_http_value(&m, Some("api.example.com")).unwrap());
+        assert!(matches_http_value(&m, Some("foo.internal.example.com")).unwrap());
+        assert!(!matches_http_value(&m, Some("other.example.com")).unwrap());
+    }
 
-        #[test]
-        fn none_value() {
-            let m = HttpValueMatch::Hostnames(vec!["example.com".into()]);
-            assert!(!m.matches(None));
-        }
+    #[test]
+    fn none_value() {
+        let m = HttpValueMatch::Hostnames(vec!["example.com".into()]);
+        assert!(!matches_http_value(&m, None).unwrap());
+    }
+
+    #[test]
+    fn case_insensitive_with_port_stripping() {
+        let m = HttpValueMatch::Hostnames(vec!["example.com".into()]);
+        assert!(matches_http_value(&m, Some("EXAMPLE.COM")).unwrap());
+        assert!(matches_http_value(&m, Some("EXAMPLE.COM:8080")).unwrap());
+        assert!(matches_http_value(&m, Some("Example.Com:443")).unwrap());
+    }
+
+    #[test]
+    fn trailing_dot_rejected() {
+        let m = HttpValueMatch::Hostnames(vec!["example.com".into()]);
+        assert!(matches_http_value(&m, Some("example.com.")).is_err());
+        assert!(matches_http_value(&m, Some("example.com.:8080")).is_err());
+    }
+
+    #[test]
+    fn wildcard_case_and_trailing_dot_rejected() {
+        let m = HttpValueMatch::Hostnames(vec!["*.example.com".into()]);
+        assert!(matches_http_value(&m, Some("FOO.EXAMPLE.COM")).unwrap());
+        assert!(matches_http_value(&m, Some("foo.example.com.")).is_err());
+        assert!(matches_http_value(&m, Some("FOO.EXAMPLE.COM.:443")).is_err());
+    }
+
+    #[test]
+    fn empty_host_header() {
+        let m = HttpValueMatch::Hostnames(vec!["example.com".into()]);
+        assert!(matches_http_value(&m, Some("")).is_err());
+    }
+
+    #[test]
+    fn wildcard_through_deserialization() {
+        let m = deser_host("\"*.example.com\"");
+        assert!(matches_http_value(&m, Some("foo.example.com")).unwrap());
+        assert!(matches_http_value(&m, Some("foo.example.com:8080")).unwrap());
+        assert!(!matches_http_value(&m, Some("example.com")).unwrap());
+        assert!(!matches_http_value(&m, Some("other.com")).unwrap());
+    }
+
+    #[test]
+    fn dot_shorthand_through_deserialization() {
+        let m = deser_host("\".example.com\"");
+        assert!(matches!(m, HttpValueMatch::Hostnames(ref v) if v == &[".example.com"]));
+        assert!(matches_http_value(&m, Some("example.com")).unwrap());
+        assert!(matches_http_value(&m, Some("foo.example.com")).unwrap());
+        assert!(!matches_http_value(&m, Some("other.com")).unwrap());
+    }
+
+    #[test]
+    fn catch_all_through_deserialization() {
+        let m = deser_host("\"*\"");
+        assert!(matches!(m, HttpValueMatch::Hostnames(ref v) if v == &["*"]));
+        assert!(matches_http_value(&m, Some("anything.example.com")).unwrap());
+        assert!(matches_http_value(&m, Some("localhost")).unwrap());
+    }
+
+    #[test]
+    fn empty_patterns_list() {
+        let m = HttpValueMatch::Hostnames(vec![]);
+        assert!(!matches_http_value(&m, Some("example.com")).unwrap());
+        assert!(!matches_http_value(&m, None).unwrap());
+    }
+
+    #[test]
+    fn bracketed_ipv6_with_hostname_pattern() {
+        let m = HttpValueMatch::Hostnames(vec!["example.com".into()]);
+        assert!(!matches_http_value(&m, Some("[::1]")).unwrap());
+        assert!(!matches_http_value(&m, Some("[::1]:8080")).unwrap());
+    }
+
+    #[test]
+    fn ipv4_pattern_with_port_stripping() {
+        let m = HttpValueMatch::Hostnames(vec!["192.168.1.1".into()]);
+        assert!(matches_http_value(&m, Some("192.168.1.1")).unwrap());
+        assert!(matches_http_value(&m, Some("192.168.1.1:8080")).unwrap());
+        assert!(!matches_http_value(&m, Some("10.0.0.1")).unwrap());
+    }
+
+    /// Deserializes a host header value through the config pipeline.
+    fn deser_host(host_yaml: &str) -> HttpValueMatch {
+        let yaml = format!(
+            "required_request_headers:\n  host: {}\nhttp_action:\n  type: close\n",
+            host_yaml
+        );
+        let c: crate::config::HttpPathConfig = serde_yaml::from_str(&yaml).unwrap();
+        c.required_request_headers.get("host").unwrap().clone()
     }
 }

@@ -86,32 +86,38 @@ impl<V> DomainTrie<V> {
 
     /// Walks (or creates) trie nodes for the given hostname, splitting by label
     /// in reverse order (TLD first), and returns the final node.
+    /// Labels are ASCII-lowercased so that lookup is case-insensitive.
+    /// Strips a trailing dot (FQDN form) before splitting.
     fn walk_to_node(&mut self, hostname: &str) -> &mut DomainTrieNode<V> {
-        let labels: Vec<&str> = hostname.split('.').rev().collect();
+        let hostname = hostname.strip_suffix('.').unwrap_or(hostname);
         let mut current = &mut self.root;
-        for label in labels {
+        for label in hostname.split('.').rev() {
             current = current
                 .children
-                .entry(label.to_string())
-                .or_insert_with(DomainTrieNode::default);
+                .entry(label.to_ascii_lowercase())
+                .or_default();
         }
         current
     }
 
     /// Looks up a hostname, returning the best matching value.
     /// Priority: exact match > deepest wildcard > no match.
+    /// Comparison is ASCII case-insensitive, and a trailing dot (FQDN form)
+    /// is stripped before matching.
     pub fn lookup(&self, hostname: &str) -> Option<&V> {
+        let hostname = hostname.strip_suffix('.').unwrap_or(hostname);
         if hostname.is_empty() {
             return None;
         }
 
-        let labels: Vec<&str> = hostname.split('.').rev().collect();
+        let lowered = hostname.to_ascii_lowercase();
+        let label_count = lowered.split('.').count();
         let mut current = &self.root;
         let mut best_wildcard: Option<&V> = self.root.wildcard_value.as_ref();
 
-        for (i, label) in labels.iter().enumerate() {
-            let is_last = i == labels.len() - 1;
-            match current.children.get(*label) {
+        for (i, label) in lowered.split('.').rev().enumerate() {
+            let is_last = i == label_count - 1;
+            match current.children.get(label) {
                 Some(child) => {
                     current = child;
                     // Only record wildcards when more labels remain, since a wildcard
@@ -251,6 +257,14 @@ mod tests {
         t.insert("*", 1);
         assert_eq!(t.lookup("anything.example.com"), Some(&1));
         assert_eq!(t.lookup("localhost"), Some(&1));
+    }
+
+    #[test]
+    fn tld_wildcard_does_not_match_tld_itself() {
+        let mut t = DomainTrie::new();
+        t.insert("*.com", 1);
+        assert_eq!(t.lookup("com"), None);
+        assert_eq!(t.lookup("example.com"), Some(&1));
     }
 
     #[test]
@@ -424,5 +438,142 @@ mod tests {
         t.entry_or_default("*").push(1);
         t.entry_or_default("*").push(2);
         assert_eq!(t.lookup("anything.com"), Some(&vec![1, 2]));
+    }
+
+    // Case-insensitivity (RFC 4343)
+
+    #[test]
+    fn case_insensitive_exact_lookup() {
+        let mut t = DomainTrie::new();
+        t.insert("example.com", 1);
+        assert_eq!(t.lookup("EXAMPLE.COM"), Some(&1));
+        assert_eq!(t.lookup("Example.Com"), Some(&1));
+    }
+
+    #[test]
+    fn case_insensitive_wildcard_lookup() {
+        let mut t = DomainTrie::new();
+        t.insert("*.example.com", 1);
+        assert_eq!(t.lookup("FOO.EXAMPLE.COM"), Some(&1));
+        assert_eq!(t.lookup("Foo.Example.Com"), Some(&1));
+    }
+
+    #[test]
+    fn case_insensitive_insert_merges() {
+        let mut t = DomainTrie::new();
+        t.insert("Example.Com", 1);
+        // Same logical hostname, different case -- should replace
+        assert_eq!(t.insert("example.com", 2), Some(1));
+        assert_eq!(t.lookup("EXAMPLE.COM"), Some(&2));
+    }
+
+    // Trailing-dot FQDN form
+
+    #[test]
+    fn trailing_dot_exact() {
+        let mut t = DomainTrie::new();
+        t.insert("example.com", 1);
+        assert_eq!(t.lookup("example.com."), Some(&1));
+    }
+
+    #[test]
+    fn trailing_dot_wildcard() {
+        let mut t = DomainTrie::new();
+        t.insert("*.example.com", 1);
+        assert_eq!(t.lookup("foo.example.com."), Some(&1));
+    }
+
+    #[test]
+    fn trailing_dot_case_insensitive() {
+        let mut t = DomainTrie::new();
+        t.insert("*.example.com", 1);
+        assert_eq!(t.lookup("FOO.EXAMPLE.COM."), Some(&1));
+    }
+
+    #[test]
+    fn only_dot_lookup() {
+        let t: DomainTrie<i32> = DomainTrie::new();
+        assert_eq!(t.lookup("."), None);
+    }
+
+    #[test]
+    fn empty_after_dot_strip() {
+        let mut t = DomainTrie::new();
+        t.insert("*", 1);
+        // "." becomes "" after trailing-dot strip, which is empty
+        assert_eq!(t.lookup("."), None);
+    }
+
+    // Trailing-dot normalization on insert (defense in depth)
+
+    #[test]
+    fn insert_trailing_dot_exact() {
+        let mut t = DomainTrie::new();
+        t.insert("example.com.", 1);
+        assert_eq!(t.lookup("example.com"), Some(&1));
+        assert_eq!(t.lookup("example.com."), Some(&1));
+    }
+
+    #[test]
+    fn insert_trailing_dot_wildcard() {
+        let mut t = DomainTrie::new();
+        t.insert("*.example.com.", 1);
+        assert_eq!(t.lookup("foo.example.com"), Some(&1));
+        assert_eq!(t.lookup("foo.example.com."), Some(&1));
+    }
+
+    #[test]
+    fn insert_trailing_dot_merges_with_non_trailing() {
+        let mut t = DomainTrie::new();
+        t.insert("example.com", 1);
+        // Same node, should replace
+        assert_eq!(t.insert("example.com.", 2), Some(1));
+        assert_eq!(t.lookup("example.com"), Some(&2));
+    }
+
+    #[test]
+    fn entry_or_default_trailing_dot() {
+        let mut t: DomainTrie<Vec<i32>> = DomainTrie::new();
+        t.entry_or_default("example.com.").push(1);
+        assert_eq!(t.lookup("example.com"), Some(&vec![1]));
+    }
+
+    #[test]
+    fn entry_or_default_wildcard_trailing_dot() {
+        let mut t: DomainTrie<Vec<i32>> = DomainTrie::new();
+        t.entry_or_default("*.example.com.").push(1);
+        assert_eq!(t.lookup("foo.example.com"), Some(&vec![1]));
+    }
+
+    #[test]
+    #[should_panic(expected = "entry_or_default does not support dot-shorthand")]
+    fn entry_or_default_dot_shorthand_panics() {
+        let mut t: DomainTrie<i32> = DomainTrie::new();
+        t.entry_or_default(".example.com");
+    }
+
+    #[test]
+    fn insert_dot_shorthand_trailing_dot() {
+        let mut t = DomainTrie::new();
+        t.insert(".example.com.", 1);
+        assert_eq!(t.lookup("example.com"), Some(&1));
+        assert_eq!(t.lookup("foo.example.com"), Some(&1));
+    }
+
+    #[test]
+    fn case_insensitive_dot_shorthand() {
+        let mut t = DomainTrie::new();
+        t.insert(".Example.Com", 1);
+        assert_eq!(t.lookup("example.com"), Some(&1));
+        assert_eq!(t.lookup("EXAMPLE.COM"), Some(&1));
+        assert_eq!(t.lookup("foo.example.com"), Some(&1));
+        assert_eq!(t.lookup("FOO.EXAMPLE.COM"), Some(&1));
+    }
+
+    #[test]
+    fn root_wildcard_trailing_dot_lookup() {
+        let mut t = DomainTrie::new();
+        t.insert("*", 1);
+        assert_eq!(t.lookup("anything.com."), Some(&1));
     }
 }

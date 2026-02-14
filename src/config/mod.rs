@@ -1,10 +1,12 @@
+mod alpn_value;
 mod ip_mask;
 mod location;
 mod option_util;
-mod tls_option;
+mod sni_value;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::net::ToSocketAddrs;
 use std::path::PathBuf;
 
 use log::warn;
@@ -12,10 +14,13 @@ use percent_encoding::percent_decode_str;
 use serde::Deserialize;
 use url::Url;
 
+use crate::hostname_util::normalize_hostname_pattern;
+
+pub use alpn_value::AlpnValue;
 pub use ip_mask::IpMask;
 pub use location::{Location, NetLocation};
 pub use option_util::{NoneOrOne, NoneOrSome, OneOrSome};
-pub use tls_option::TlsOption;
+pub use sni_value::SniValue;
 
 fn default_true() -> bool {
     true
@@ -69,10 +74,9 @@ pub enum TcpKeepaliveOption {
 }
 
 impl TcpKeepaliveOption {
-    /// Resolve to a concrete config for server-side (client-facing) connections
-    pub fn resolve_for_server(&self) -> Option<TcpKeepaliveConfig> {
+    fn resolve(&self, default: TcpKeepaliveConfig) -> Option<TcpKeepaliveConfig> {
         match self {
-            TcpKeepaliveOption::UseDefaults => Some(TcpKeepaliveConfig::default_server()),
+            TcpKeepaliveOption::UseDefaults => Some(default),
             TcpKeepaliveOption::Disabled => None,
             TcpKeepaliveOption::Custom {
                 idle_secs,
@@ -84,19 +88,14 @@ impl TcpKeepaliveOption {
         }
     }
 
-    /// Resolve to a concrete config for client-side (target-facing) connections
+    /// Resolves to a concrete config for server-side (client-facing) connections.
+    pub fn resolve_for_server(&self) -> Option<TcpKeepaliveConfig> {
+        self.resolve(TcpKeepaliveConfig::default_server())
+    }
+
+    /// Resolves to a concrete config for client-side (target-facing) connections.
     pub fn resolve_for_target(&self) -> Option<TcpKeepaliveConfig> {
-        match self {
-            TcpKeepaliveOption::UseDefaults => Some(TcpKeepaliveConfig::default_target()),
-            TcpKeepaliveOption::Disabled => None,
-            TcpKeepaliveOption::Custom {
-                idle_secs,
-                interval_secs,
-            } => Some(TcpKeepaliveConfig {
-                idle_secs: *idle_secs,
-                interval_secs: *interval_secs,
-            }),
-        }
+        self.resolve(TcpKeepaliveConfig::default_target())
     }
 }
 
@@ -289,20 +288,18 @@ impl IpMaskSelection {
                 IpMaskSelection::Literal(ip_mask) => {
                     ret.push(IpMaskSelection::Literal(ip_mask.clone()));
                 }
-                IpMaskSelection::Group(client_group) => match groups.get(client_group.as_str()) {
-                    Some(ip_masks) => {
-                        ret.extend(ip_masks.iter().cloned().map(IpMaskSelection::Literal));
-                    }
-                    None => {
-                        return Err(std::io::Error::new(
+                IpMaskSelection::Group(group_name) => {
+                    let ip_masks = groups.get(group_name.as_str()).ok_or_else(|| {
+                        std::io::Error::new(
                             std::io::ErrorKind::InvalidInput,
-                            format!("No such ip group: {}", client_group),
-                        ));
-                    }
-                },
+                            format!("No such ip group: {}", group_name),
+                        )
+                    })?;
+                    ret.extend(ip_masks.iter().cloned().map(IpMaskSelection::Literal));
+                }
             }
         }
-        let _ = std::mem::replace(selections, OneOrSome::Some(ret));
+        *selections = OneOrSome::Some(ret);
         Ok(())
     }
 }
@@ -323,7 +320,6 @@ fn deserialize_socket_addr<'de, D>(deserializer: D) -> Result<SocketAddr, D::Err
 where
     D: serde::de::Deserializer<'de>,
 {
-    use std::net::ToSocketAddrs;
     let value = String::deserialize(deserializer)?;
     let mut iter = value.to_socket_addrs().map_err(|_| {
         serde::de::Error::invalid_value(
@@ -446,6 +442,7 @@ pub struct HttpPathConfig {
 
 /// Lowercases header keys and promotes "host" values to `Hostnames` variant
 /// for wildcard and dot-shorthand matching with automatic port stripping.
+/// Validates hostname patterns at config load time.
 fn deserialize_required_headers<'de, D>(
     deserializer: D,
 ) -> Result<HashMap<String, HttpValueMatch>, D::Error>
@@ -453,23 +450,32 @@ where
     D: serde::Deserializer<'de>,
 {
     let raw = HashMap::<String, HttpValueMatch>::deserialize(deserializer)?;
-    let result = raw
-        .into_iter()
+    raw.into_iter()
         .map(|(key, value)| {
             let key = key.to_ascii_lowercase();
             let value = if key == "host" {
                 match value {
-                    HttpValueMatch::Single(s) => HttpValueMatch::Hostnames(vec![s]),
-                    HttpValueMatch::Multiple(v) => HttpValueMatch::Hostnames(v),
+                    HttpValueMatch::Single(s) => {
+                        let normalized =
+                            normalize_hostname_pattern(&s).map_err(serde::de::Error::custom)?;
+                        HttpValueMatch::Hostnames(vec![normalized])
+                    }
+                    HttpValueMatch::Multiple(patterns) => {
+                        let normalized = patterns
+                            .into_iter()
+                            .map(|s| normalize_hostname_pattern(&s))
+                            .collect::<Result<_, _>>()
+                            .map_err(serde::de::Error::custom)?;
+                        HttpValueMatch::Hostnames(normalized)
+                    }
                     other => other,
                 }
             } else {
                 value
             };
-            (key, value)
+            Ok((key, value))
         })
-        .collect();
-    Ok(result)
+        .collect()
 }
 
 #[derive(Default, Debug, Clone)]
@@ -538,22 +544,6 @@ impl<'de> Deserialize<'de> for HttpValueMatch {
         }
 
         deserializer.deserialize_any(HttpValueMatchVisitor)
-    }
-}
-
-impl HttpValueMatch {
-    pub fn matches(&self, value: Option<&str>) -> bool {
-        match self {
-            HttpValueMatch::Any => value.is_some(),
-            HttpValueMatch::Single(allowed) => value.is_some_and(|v| v == allowed),
-            HttpValueMatch::Multiple(allowed) => value.is_some_and(|v| allowed.iter().any(|a| a == v)),
-            HttpValueMatch::Hostnames(patterns) => value.is_some_and(|v| {
-                let hostname = crate::http::strip_host_port(v);
-                patterns
-                    .iter()
-                    .any(|p| crate::http::matches_hostname_pattern(hostname, p))
-            }),
-        }
     }
 }
 
@@ -800,12 +790,12 @@ pub struct ServerTlsConfig {
     pub mode: TlsMode,
 
     #[serde(default, alias = "sni_hostname")]
-    pub sni_hostnames: NoneOrSome<TlsOption>,
+    pub sni_hostnames: NoneOrSome<SniValue>,
 
     // the alpn protocols to show in the serverhello response (terminate mode)
     // or to match against (passthrough mode)
     #[serde(default, alias = "alpn_protocol")]
-    pub alpn_protocols: NoneOrSome<TlsOption>,
+    pub alpn_protocols: NoneOrSome<AlpnValue>,
 
     // Required for terminate mode, ignored for passthrough mode
     #[serde(default)]
@@ -1034,14 +1024,14 @@ impl ClientTlsConfig {
     }
 
     pub fn has_client_cert(&self) -> bool {
-        match self {
+        matches!(
+            self,
             ClientTlsConfig::Enabled {
                 key: Some(_),
                 cert: Some(_),
                 ..
-            } => true,
-            _ => false,
-        }
+            }
+        )
     }
 
     pub fn key(&self) -> Option<&String> {
@@ -1417,27 +1407,35 @@ mod tests {
         serde_yaml::from_str(yaml).unwrap()
     }
 
-    fn get_header<'a>(
-        config: &'a HttpPathConfig,
-        key: &str,
-    ) -> &'a HttpValueMatch {
-        config
-            .required_request_headers
-            .get(key)
-            .unwrap()
+    fn get_header<'a>(config: &'a HttpPathConfig, key: &str) -> &'a HttpValueMatch {
+        config.required_request_headers.get(key).unwrap()
+    }
+
+    fn host_yaml(host_value: &str) -> String {
+        format!(
+            "required_request_headers:\n  host: {}\nhttp_action:\n  type: close\n",
+            host_value
+        )
+    }
+
+    /// Deserializes a config with a single host header value and returns the match.
+    fn deser_host(host_value: &str) -> HttpValueMatch {
+        let c: HttpPathConfig = serde_yaml::from_str(&host_yaml(host_value)).unwrap();
+        c.required_request_headers.get("host").unwrap().clone()
+    }
+
+    /// Asserts that a host header value is rejected during deserialization.
+    fn assert_host_rejected(host_value: &str) {
+        assert!(
+            serde_yaml::from_str::<HttpPathConfig>(&host_yaml(host_value)).is_err(),
+            "expected rejection for host: {}",
+            host_value
+        );
     }
 
     #[test]
     fn host_string_becomes_hostnames() {
-        let c = deser_path_config(
-            r#"
-            required_request_headers:
-              host: example.com
-            http_action:
-              type: close
-            "#,
-        );
-        let m = get_header(&c, "host");
+        let m = deser_host("example.com");
         assert!(matches!(m, HttpValueMatch::Hostnames(v) if v == &["example.com"]));
     }
 
@@ -1459,15 +1457,7 @@ mod tests {
 
     #[test]
     fn host_null_stays_any() {
-        let c = deser_path_config(
-            r#"
-            required_request_headers:
-              host: ~
-            http_action:
-              type: close
-            "#,
-        );
-        let m = get_header(&c, "host");
+        let m = deser_host("~");
         assert!(matches!(m, HttpValueMatch::Any));
     }
 
@@ -1546,20 +1536,65 @@ mod tests {
         assert!(c.required_request_headers.is_empty());
     }
 
+    // Hostname pattern validation in deserialize_required_headers
+
     #[test]
-    fn hostnames_matching_through_deserialization() {
+    fn host_trailing_dot_normalized() {
+        let m = deser_host("\"example.com.\"");
+        assert!(matches!(m, HttpValueMatch::Hostnames(v) if v == &["example.com"]));
+    }
+
+    #[test]
+    fn host_empty_string_rejected() {
+        assert_host_rejected("\"\"");
+    }
+
+    #[test]
+    fn host_consecutive_dots_rejected() {
+        assert_host_rejected("\"example..com\"");
+    }
+
+    #[test]
+    fn host_star_dot_rejected() {
+        assert_host_rejected("\"*.\"");
+    }
+
+    #[test]
+    fn host_bare_dot_rejected() {
+        assert_host_rejected("\".\"");
+    }
+
+    #[test]
+    fn host_control_char_rejected() {
+        assert_host_rejected(&format!("\"example{}.com\"", '\x01'));
+    }
+
+    #[test]
+    fn host_list_with_bad_entry_rejected() {
+        assert_host_rejected("\n    - good.com\n    - \"bad..com\"");
+    }
+
+    #[test]
+    fn host_wildcard_trailing_dot_normalized() {
+        let m = deser_host("\"*.example.com.\"");
+        assert!(matches!(m, HttpValueMatch::Hostnames(v) if v == &["*.example.com"]));
+    }
+
+    #[test]
+    fn host_valid_patterns_still_accepted() {
         let c = deser_path_config(
             r#"
             required_request_headers:
-              host: "*.example.com"
+              host:
+                - example.com
+                - "*.example.com"
+                - ".example.com"
+                - "*"
             http_action:
               type: close
             "#,
         );
         let m = get_header(&c, "host");
-        assert!(m.matches(Some("foo.example.com")));
-        assert!(m.matches(Some("foo.example.com:8080")));
-        assert!(!m.matches(Some("example.com")));
-        assert!(!m.matches(Some("other.com")));
+        assert!(matches!(m, HttpValueMatch::Hostnames(v) if v.len() == 4));
     }
 }
