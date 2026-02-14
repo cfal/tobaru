@@ -678,8 +678,11 @@ impl<'de> Deserialize<'de> for HttpPathAction {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct HttpHeaderPatch {
+    #[serde(default)]
     pub default_headers: HashMap<String, String>,
+    #[serde(default)]
     pub overwrite_headers: HashMap<String, String>,
+    #[serde(default)]
     pub remove_headers: Vec<String>,
 }
 
