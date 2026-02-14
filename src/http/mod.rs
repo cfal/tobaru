@@ -11,7 +11,7 @@ use log::{error, info};
 use memchr::memmem;
 use mime_guess::MimeGuess;
 use radix_trie::{Trie, TrieCommon};
-use rand::Rng;
+use rand::RngExt;
 use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
