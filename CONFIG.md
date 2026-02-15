@@ -212,7 +212,8 @@ server_tls:
   cert: string                     # Path to certificate file
   key: string                      # Path to private key file
 
-  # Client certificate pinning (terminate mode only)
+  # Client certificate authentication (terminate mode only)
+  client_ca_certs: [string]        # Paths to CA certificate PEM files
   client_fingerprints: [string]    # SHA256 fingerprints
 
   # Deprecated
@@ -278,9 +279,16 @@ alpn_protocols: any                # Match any ALPN
 alpn_protocols: none               # Match only when no ALPN
 ```
 
-### Client Certificate Pinning
+### Client Certificate Authentication
 
-Validates incoming client certificates by SHA256 fingerprint. Only available in terminate mode (TLS 1.3 sends client certificates inside the encrypted tunnel, so passthrough mode cannot inspect them).
+Requires clients to present a valid certificate. Only available in terminate mode (TLS 1.3 sends client certificates inside the encrypted tunnel, so passthrough mode cannot inspect them).
+
+Two methods are supported and can be combined:
+
+- **`client_ca_certs`** -- accept any client certificate that chains to one of the provided CA certificates
+- **`client_fingerprints`** -- accept client certificates matching specific SHA256 fingerprints
+
+When both are configured, a certificate is accepted if it passes **either** check.
 
 ```yaml
 server_tls:
@@ -288,17 +296,29 @@ server_tls:
   cert: server.crt
   key: server.key
   sni_hostnames: secure.example.com
+
+  # Accept any cert signed by this CA
+  client_ca_certs:
+    - /path/to/ca.crt
+
+  # Also accept these specific self-signed certs
   client_fingerprints:
     - "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99"
     - "1122334455667788990011223344556677889900112233445566778899001122"
 ```
 
-Both colon-separated and plain hex formats are accepted.
+Fingerprints accept both colon-separated and plain hex formats.
 
 ```bash
-# Generate a client certificate and get its fingerprint
+# Generate a CA and client certificate
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+  -nodes -keyout ca.key -out ca.crt -days 365 -subj "/CN=MyCA"
 openssl ecparam -genkey -name prime256v1 -out client.key
-openssl req -new -x509 -nodes -key client.key -out client.crt -days 365 -subj "/CN=Client"
+openssl req -new -key client.key -out client.csr -subj "/CN=Client"
+openssl x509 -req -in client.csr -CA ca.crt -CAkey ca.key \
+  -CAcreateserial -out client.crt -days 365
+
+# Get a certificate's SHA256 fingerprint
 openssl x509 -in client.crt -noout -fingerprint -sha256
 ```
 
