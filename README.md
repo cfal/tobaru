@@ -4,24 +4,24 @@ Advanced port forwarding tool written in Rust with powerful routing and TLS feat
 
 ## Key Features
 
-- **🔀 Multiple routing strategies**: Route connections based on IP address, TLS SNI (with wildcard support), ALPN protocol, or HTTP path
-- **🔒 Flexible TLS handling**:
+- **Multiple routing strategies**: Route connections based on IP address, TLS SNI (with wildcard support), ALPN protocol, or HTTP path
+- **Flexible TLS handling**:
   - **Passthrough mode**: Route TLS by SNI/ALPN without decryption (zero overhead, no private keys needed)
   - **Terminate mode**: Decrypt TLS and route based on SNI/ALPN or HTTP content
   - Mix both modes on the same port
   - Client certificate pinning (SHA256 fingerprint validation)
   - Server certificate pinning (SHA256 fingerprint validation)
-- **🌐 HTTP proxy features**:
+- **HTTP proxy features**:
   - Path-based routing with prefix matching
   - Serve static files from directories
   - Serve custom responses with configurable status codes
   - Header manipulation (add/remove/modify headers)
   - WebSocket support with automatic upgrade handling
   - Connection keep-alive support
-- **🔥 Hot reloading**: Config changes are automatically detected and applied
-- **🛡️ iptables integration**: Automatically configure firewall rules for IP allowlists
-- **📦 IP groups**: Reusable named groups of IP ranges
-- **⚡ High performance**: Async I/O with Tokio, minimal allocations
+- **Hot reloading**: Config changes are automatically detected and applied
+- **iptables integration**: Automatically configure firewall rules for IP allowlists
+- **IP groups**: Reusable named groups of IP ranges
+- **High performance**: Async I/O with Tokio, minimal allocations
 
 ## Quick Example
 
@@ -89,6 +89,8 @@ EXAMPLES:
 
 ## Configuration
 
+See [CONFIG.md](./CONFIG.md) for the complete YAML configuration reference.
+
 ### TLS Passthrough Mode
 
 Route TLS connections by SNI/ALPN without decryption - no private keys needed on the proxy:
@@ -116,10 +118,10 @@ Route TLS connections by SNI/ALPN without decryption - no private keys needed on
 ```
 
 **Benefits:**
-- ✅ No decryption/re-encryption overhead
-- ✅ No private keys needed on proxy (improved security)
-- ✅ Near-zero latency routing
-- ✅ Full end-to-end encryption preserved
+- No decryption/re-encryption overhead
+- No private keys needed on proxy (improved security)
+- Near-zero latency routing
+- Full end-to-end encryption preserved
 
 ### TLS Terminate Mode
 
