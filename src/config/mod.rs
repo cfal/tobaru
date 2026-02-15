@@ -807,10 +807,14 @@ pub struct ServerTlsConfig {
     #[serde(default)]
     pub optional: bool,
 
-    // sha256 fingerprints of allowed client certificates (terminate mode only)
-    // Get the certificate's SHA256 fingerprint:
-    //    openssl x509 -in client.crt -noout -fingerprint -sha256
-    // Multiple fingerprints can be specified to allow multiple client certificates
+    // Trusted CA certificates that client certs must chain to (terminate mode only).
+    // Accepts paths to PEM files containing one or more CA certificates.
+    #[serde(default, alias = "client_ca_cert")]
+    pub client_ca_certs: NoneOrSome<String>,
+
+    // SHA256 fingerprints of allowed client certificates (terminate mode only).
+    // When both client_ca_certs and client_fingerprints are set, a client cert
+    // is accepted if it satisfies either check.
     #[serde(default, alias = "client_fingerprint")]
     pub client_fingerprints: NoneOrSome<String>,
 }
@@ -832,13 +836,16 @@ impl ServerTlsConfig {
             if self.cert.is_none() || self.key.is_none() {
                 return Err("cert and key are required for TLS terminate mode".to_string());
             }
-        } else if self.is_passthrough() && !self.client_fingerprints.is_empty() {
-            // NOTE: client_fingerprints cannot be supported in passthrough mode.
-            // In TLS 1.3, client certificates are sent AFTER encryption starts (inside the
-            // encrypted tunnel). To validate the client certificate, we would need to complete
-            // our own TLS handshake and decrypt the connection, which defeats the purpose of
-            // passthrough mode. Use terminate mode if client certificate validation is needed.
-            return Err("client_fingerprints is not valid for TLS passthrough mode".to_string());
+        } else if self.is_passthrough()
+            && (!self.client_fingerprints.is_empty() || !self.client_ca_certs.is_empty())
+        {
+            // Client certificate validation requires decrypting the TLS tunnel.
+            // In TLS 1.3, client certificates are sent inside the encrypted channel,
+            // so passthrough mode cannot inspect them.
+            return Err(
+                "client_fingerprints and client_ca_certs are not valid for TLS passthrough mode"
+                    .to_string(),
+            );
         }
         Ok(())
     }
