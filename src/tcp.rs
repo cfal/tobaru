@@ -252,6 +252,7 @@ fn build_rustls_configs(
     private_key: &rustls::pki_types::PrivateKeyDer<'static>,
     alpn_protocols: &crate::config::NoneOrSome<AlpnValue>,
     client_fingerprints: &crate::config::NoneOrSome<String>,
+    client_ca_certs: &[Vec<u8>],
 ) -> (Arc<rustls::ServerConfig>, Arc<rustls::ServerConfig>) {
     let mut alpn_protocol_bytes = vec![];
     for proto in alpn_protocols.iter() {
@@ -268,6 +269,7 @@ fn build_rustls_configs(
             private_key,
             alpn_protocol_bytes,
             &client_fingerprint_vec,
+            client_ca_certs,
         ));
         (tls_config.clone(), tls_config)
     } else {
@@ -276,6 +278,7 @@ fn build_rustls_configs(
             private_key,
             alpn_protocol_bytes.clone(),
             &client_fingerprint_vec,
+            client_ca_certs,
         );
         let mut no_alpn_tls_config = alpn_tls_config.clone();
         no_alpn_tls_config.alpn_protocols = vec![];
@@ -391,11 +394,20 @@ pub async fn run_tcp_server(
                     key_file.read_to_end(&mut key_bytes).await?;
                     let private_key = load_private_key(&key_bytes);
 
+                    let mut ca_cert_bytes_vec = vec![];
+                    for ca_path in tls_config.client_ca_certs.iter() {
+                        let mut f = File::open(ca_path).await?;
+                        let mut bytes = vec![];
+                        f.read_to_end(&mut bytes).await?;
+                        ca_cert_bytes_vec.push(bytes);
+                    }
+
                     let (alpn_tls_config, no_alpn_tls_config) = build_rustls_configs(
                         certs,
                         &private_key,
                         &tls_config.alpn_protocols,
                         &tls_config.client_fingerprints,
+                        &ca_cert_bytes_vec,
                     );
 
                     TlsMode::Terminate {

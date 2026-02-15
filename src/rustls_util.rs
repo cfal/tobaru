@@ -261,6 +261,7 @@ pub fn create_server_config(
     private_key: &PrivateKeyDer<'static>,
     alpn_protocols: Vec<Vec<u8>>,
     client_fingerprints: &[String],
+    client_ca_certs: &[Vec<u8>],
 ) -> rustls::ServerConfig {
     let signing_key = get_crypto_provider()
         .key_provider
@@ -268,16 +269,36 @@ pub fn create_server_config(
         .unwrap();
     let certified_key = Arc::new(rustls::sign::CertifiedKey::new(certs, signing_key));
 
+    let webpki_verifier = if client_ca_certs.is_empty() {
+        None
+    } else {
+        let mut store = rustls::RootCertStore::empty();
+        for ca_bytes in client_ca_certs {
+            for cert in load_certs(ca_bytes) {
+                store.add(cert).unwrap();
+            }
+        }
+        Some(
+            rustls::server::WebPkiClientVerifier::builder_with_provider(
+                Arc::new(store),
+                get_crypto_provider(),
+            )
+            .build()
+            .unwrap(),
+        )
+    };
+
     let builder = rustls::ServerConfig::builder_with_provider(get_crypto_provider())
         .with_safe_default_protocol_versions()
         .unwrap();
 
-    let builder = if client_fingerprints.is_empty() {
+    let builder = if client_fingerprints.is_empty() && webpki_verifier.is_none() {
         builder.with_no_client_auth()
     } else {
         builder.with_client_cert_verifier(Arc::new(ClientFingerprintVerifier {
             supported_algs: get_supported_algorithms(),
             client_fingerprints: process_fingerprints(client_fingerprints).unwrap(),
+            webpki_verifier,
         }))
     };
 
@@ -329,10 +350,13 @@ pub fn process_fingerprints(client_fingerprints: &[String]) -> std::io::Result<B
     Ok(result)
 }
 
+/// Verifies client certificates via CA chain validation and/or SHA256 fingerprint.
+/// When both methods are configured, a certificate is accepted if either check passes.
 #[derive(Debug)]
 pub struct ClientFingerprintVerifier {
     supported_algs: rustls::crypto::WebPkiSupportedAlgorithms,
     client_fingerprints: BTreeSet<Vec<u8>>,
+    webpki_verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
 }
 
 impl rustls::server::danger::ClientCertVerifier for ClientFingerprintVerifier {
@@ -351,26 +375,38 @@ impl rustls::server::danger::ClientCertVerifier for ClientFingerprintVerifier {
     fn verify_client_cert(
         &self,
         end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _now: rustls::pki_types::UnixTime,
+        intermediates: &[CertificateDer<'_>],
+        now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        if let Some(ref webpki_verifier) = self.webpki_verifier {
+            if webpki_verifier
+                .verify_client_cert(end_entity, intermediates, now)
+                .is_ok()
+            {
+                return Ok(rustls::server::danger::ClientCertVerified::assertion());
+            }
+        }
+
+        if !self.client_fingerprints.is_empty() {
+            let fingerprint =
+                aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, end_entity.as_ref());
+            if self.client_fingerprints.contains(fingerprint.as_ref()) {
+                return Ok(rustls::server::danger::ClientCertVerified::assertion());
+            }
+        }
+
         let fingerprint =
             aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, end_entity.as_ref());
-        let fingerprint_bytes = fingerprint.as_ref();
+        let hex_fingerprint = fingerprint
+            .as_ref()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<String>>()
+            .join(":");
 
-        if self.client_fingerprints.contains(fingerprint_bytes) {
-            Ok(rustls::server::danger::ClientCertVerified::assertion())
-        } else {
-            let hex_fingerprint = fingerprint_bytes
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<Vec<String>>()
-                .join(":");
-
-            Err(rustls::Error::General(format!(
-                "unknown client fingerprint: {hex_fingerprint}"
-            )))
-        }
+        Err(rustls::Error::General(format!(
+            "unknown client fingerprint: {hex_fingerprint}"
+        )))
     }
 
     fn verify_tls12_signature(
