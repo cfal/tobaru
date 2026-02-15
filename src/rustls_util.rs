@@ -292,6 +292,8 @@ pub fn create_server_config(
         .with_safe_default_protocol_versions()
         .unwrap();
 
+    // Always wraps in ClientFingerprintVerifier even for CA-only auth, because
+    // WebPkiClientVerifier's root_hint_subjects() leaks CA names to unauthenticated clients.
     let builder = if client_fingerprints.is_empty() && webpki_verifier.is_none() {
         builder.with_no_client_auth()
     } else {
@@ -305,6 +307,7 @@ pub fn create_server_config(
     let mut config = builder.with_cert_resolver(Arc::new(AlwaysResolvesServerCert(certified_key)));
     config.alpn_protocols = alpn_protocols;
     config.max_early_data_size = u32::MAX;
+    config.ignore_client_order = true;
     config
 }
 
@@ -369,6 +372,7 @@ impl rustls::server::danger::ClientCertVerifier for ClientFingerprintVerifier {
     }
 
     fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        // Avoids leaking trusted CA names to unauthenticated clients.
         &[]
     }
 
@@ -387,26 +391,23 @@ impl rustls::server::danger::ClientCertVerifier for ClientFingerprintVerifier {
             }
         }
 
-        if !self.client_fingerprints.is_empty() {
-            let fingerprint =
-                aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, end_entity.as_ref());
-            if self.client_fingerprints.contains(fingerprint.as_ref()) {
-                return Ok(rustls::server::danger::ClientCertVerified::assertion());
-            }
-        }
-
         let fingerprint =
             aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, end_entity.as_ref());
-        let hex_fingerprint = fingerprint
-            .as_ref()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<Vec<String>>()
-            .join(":");
+        let fingerprint_bytes = fingerprint.as_ref();
 
-        Err(rustls::Error::General(format!(
-            "unknown client fingerprint: {hex_fingerprint}"
-        )))
+        if self.client_fingerprints.contains(fingerprint_bytes) {
+            Ok(rustls::server::danger::ClientCertVerified::assertion())
+        } else {
+            let hex_fingerprint = fingerprint_bytes
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<String>>()
+                .join(":");
+
+            Err(rustls::Error::General(format!(
+                "unknown client fingerprint: {hex_fingerprint}"
+            )))
+        }
     }
 
     fn verify_tls12_signature(
