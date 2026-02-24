@@ -11,30 +11,30 @@ keywords = ["tunnel", "proxy", "forward", "port", "http"]
 categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]
-async-trait = "*"
-aws-lc-rs = { version = "*", default-features = false }
-env_logger = "*"
-futures = "*"
-ipnet = "*"
-log = { version = "*", features = ["release_max_level_info"] }
-parking_lot = "*"
-percent-encoding = "*"
-rustls = { version = "*", default-features = false, features = ["aws_lc_rs", "std", "logging", "tls12"] }
-rustls-pemfile = { version = "*" }
-serde = { version = "*", features = ["derive", "std"] }
-serde_json = "*"
-serde_yaml = "*"
-tokio = { version = "*", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
-tokio-rustls = { version = "*", default-features = false, features = ["logging", "tls12", "aws_lc_rs"] }
-ip_network_table-deps-treebitmap = "*"
-url = "*"
-webpki-roots = { version = "*" }
-notify = "*"
-radix_trie = { version = "*", features = ["serde"] }
-rand = "*"
-memchr = "*"
-mime_guess = "*"
-socket2 = "*"
+async-trait = "0.1.89"
+aws-lc-rs = { version = "1.15.4", default-features = false }
+env_logger = "0.11.9"
+futures = "0.3.31"
+ipnet = "2.11.0"
+log = { version = "0.4.29", features = ["release_max_level_info"] }
+parking_lot = "0.12.5"
+percent-encoding = "2.3.2"
+rustls = { version = "0.23.36", default-features = false, features = ["aws_lc_rs", "std", "logging", "tls12"] }
+rustls-pemfile = { version = "2.2.0" }
+serde = { version = "1.0.228", features = ["derive", "std"] }
+serde_json = "1.0.149"
+serde_yaml = "0.9.34"
+tokio = { version = "1.49.0", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "tls12", "aws_lc_rs"] }
+ip_network_table-deps-treebitmap = "0.5.0"
+url = "2.5.8"
+webpki-roots = { version = "1.0.6" }
+notify = "8.2.0"
+radix_trie = { version = "0.3.0", features = ["serde"] }
+rand = "0.10.0"
+memchr = "2.8.0"
+mime_guess = "2.0.5"
+socket2 = "0.6.2"
 
 [profile.release]
 opt-level = 3
