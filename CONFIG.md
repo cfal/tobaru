@@ -294,6 +294,11 @@ alpn_protocols: any                # Match any ALPN
 alpn_protocols: none               # Match only when no ALPN
 ```
 
+`any` controls matching, not protocol negotiation. Termination advertises only
+explicit protocol names; `any` without explicit names negotiates no ALPN.
+Passthrough leaves negotiation to the backend. HTTP actions only support
+HTTP/1.1; do not advertise `h2` for them.
+
 ### Client Certificate Authentication
 
 Requires clients to present a valid certificate. Only available in terminate mode (TLS 1.3 sends client certificates inside the encrypted tunnel, so passthrough mode cannot inspect them).
@@ -322,7 +327,8 @@ server_tls:
     - "1122334455667788990011223344556677889900112233445566778899001122"
 ```
 
-Fingerprints accept both colon-separated and plain hex formats.
+Fingerprints require 32 bytes (64 hexadecimal digits), with optional colons or
+spaces. Invalid fingerprints are rejected when loading configuration.
 
 ```bash
 # Generate a CA and client certificate
@@ -371,6 +377,10 @@ client_tls:
 ```
 
 `client_tls` cannot be used with passthrough mode (would cause TLS-in-TLS).
+
+`verify: false` and `no-verify` disable WebPKI certificate verification. Without
+configured certificate pins, an active attacker can impersonate the backend;
+use verification or explicit SHA256 pins for untrusted networks.
 
 ### Server Certificate Pinning
 
@@ -441,13 +451,18 @@ whole-session deadlines; upgraded tunnels are not subject to them.
 
 ### Path Matching
 
-Paths are matched by longest prefix. A trailing `/` in the path key matches that prefix and everything below it.
+Paths use raw longest-prefix matching, including the query string. Keys without
+a trailing `/` are not exact matches. A trailing `/` provides a subtree boundary;
+the bare mount also matches when it has no query string.
 
 ```yaml
 http_paths:
-  /api/:     # matches /api/, /api/users, /api/v2/foo, etc.
-  /health:   # matches /health exactly
+  /api/:     # matches /api, /api/, /api/users; not /apiculture or /api?x=1
+  /health:   # matches /health, /health?x=1, and /healthcheck
 ```
+
+Only the longest matching key is considered. If its required headers do not
+match, `default_http_action` is used, not a shorter configured prefix.
 
 ### Required Request Headers
 
@@ -574,6 +589,13 @@ http_action:
 
 Serves static files from a directory. MIME types are automatically detected.
 
+After route selection, the query is removed and the file path is percent-decoded.
+Decoded parent-directory segments and NUL bytes are rejected; names such as
+`report..final.txt` are allowed. Both the requested file and a directory's
+`index.html` must resolve inside the canonical serving root. Keep serving trees
+immutable or trusted: canonicalization does not eliminate concurrent symlink
+replacement races.
+
 ```yaml
 http_action:
   type: serve-directory
@@ -683,10 +705,20 @@ tobaru [OPTIONS] <CONFIG PATH or CONFIG URL> [CONFIG PATH or CONFIG URL] ...
 
 OPTIONS:
   -t, --threads NUM           Worker threads (default: auto-detected from CPU count)
+  --dry-run                  Validate config, routing, and TLS files without binding listeners
   --clear-iptables-all        Clear all tobaru iptables rules and exit
   --clear-iptables-matching   Clear iptables rules for specified config files and exit
   -h, --help                  Show help
 ```
+
+Configuration file changes, including atomic replacements, are debounced for
+three seconds while current listeners continue serving. Invalid replacement
+configuration retains the last-good listeners. Valid replacements stop and await
+old listener tasks before rebinding, so reload is not gapless. Existing TCP
+sessions keep their old configuration until completion; UDP associations restart.
+Unexpected listener errors or panics exit the process nonzero. Bind and firewall
+failures also exit nonzero, including during reload. `--dry-run` does not verify
+that ports can be bound or firewall commands can succeed.
 
 ### Examples
 

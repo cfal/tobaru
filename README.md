@@ -69,6 +69,7 @@ USAGE:
 
 OPTIONS:
     -t, --threads NUM           Number of worker threads (default: auto-detected)
+    --dry-run                  Validate config, routing, and TLS files without binding listeners
     --clear-iptables-all        Clear all tobaru iptables rules and exit
     --clear-iptables-matching   Clear iptables rules for specified configs and exit
     -h, --help                  Show help
