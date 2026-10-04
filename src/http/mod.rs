@@ -5,6 +5,9 @@ mod http_parser;
 mod line_reader;
 mod string_util;
 
+#[cfg(test)]
+mod session_tests;
+
 use std::collections::HashMap;
 
 use log::{error, info};
