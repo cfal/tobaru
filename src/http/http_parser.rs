@@ -66,6 +66,22 @@ impl ParsedHttpData {
         self.first_line = first_line;
     }
 
+    pub fn response_status(&self) -> std::io::Result<u16> {
+        let mut parts = self.first_line.splitn(3, ' ');
+        if !matches!(parts.next(), Some("HTTP/1.1" | "HTTP/1.0")) {
+            return Err(std::io::Error::other("Invalid HTTP response version"));
+        }
+        let code = parts.next().unwrap_or_default();
+        if code.len() != 3 || !code.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(std::io::Error::other("Invalid HTTP response status"));
+        }
+        let status = code.parse::<u16>().map_err(std::io::Error::other)?;
+        if !(100..600).contains(&status) {
+            return Err(std::io::Error::other("Invalid HTTP response status"));
+        }
+        Ok(status)
+    }
+
     pub fn headers(&self) -> &Headers {
         &self.headers
     }

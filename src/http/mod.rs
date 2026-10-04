@@ -21,6 +21,7 @@ use crate::async_stream::AsyncStream;
 use crate::config::TcpKeepaliveConfig;
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::tcp::{TargetHttpActionData, TargetHttpPathData};
+use header_map::HeaderMap;
 use routing::find_matching_action;
 
 struct CachedTarget<'a> {
@@ -60,6 +61,11 @@ impl<'a> Request<'a> {
         path_configs: &'a Trie<String, Vec<TargetHttpPathData>>,
         default_action: &'a TargetHttpActionData,
     ) -> std::io::Result<Self> {
+        if data.headers().header_values("host").count() > 1 {
+            return Err(std::io::Error::other(
+                "Multiple Host fields are not allowed",
+            ));
+        }
         let mut first_line = data.first_line().to_string();
 
         if !first_line.ends_with(" HTTP/1.1") {

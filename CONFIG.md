@@ -488,6 +488,24 @@ http_action:
 
 The `address`, `addresses`, and `location` field names are accepted as aliases for `locations`.
 
+Backend reuse is local to a client connection and the selected HTTP action.
+Changing Host/header rules to select another action opens a different backend
+connection, even when the path prefix is unchanged. Round-robin selection occurs
+when a backend connection is opened, not on every request.
+
+Header names in patches are case-insensitive. Repeated received fields retain
+their value order; an overwrite replaces all values for that name. Patches must
+not change the received body's framing (for example, changing Content-Length or
+removing chunked Transfer-Encoding). Such requests/responses are rejected and the
+connection is closed; body bytes are not rewritten to match a patched length.
+
+Forwarding supports HEAD/bodyless responses, informational responses including
+100 Continue and 103 Early Hints, and close-delimited response bodies. An early
+final response during an unfinished upload is forwarded and both connections are
+closed rather than reused. HTTP mode still accepts only origin-form HTTP/1.1
+requests; it does not implement CONNECT or HTTP/2. For HTTP actions, configure TLS
+ALPN as `http/1.1`, not `h2`.
+
 ### serve-message
 
 Returns a static HTTP response.

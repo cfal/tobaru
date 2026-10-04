@@ -502,3 +502,180 @@ async fn upgrade_replays_both_sides_read_ahead_and_continues_tunneling() {
         (&mut upstream.0).await.unwrap();
     }).await;
 }
+
+#[tokio::test]
+async fn head_and_304_send_headers_and_allow_the_following_request() {
+    checked(async {
+        let (listener, address) = backend().await;
+        let mut upstream = Task(tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            for response in [
+                b"HTTP/1.1 200 OK\r\nContent-Length: 99\r\n\r\n".as_slice(),
+                b"HTTP/1.1 304 Not Modified\r\nContent-Length: 99\r\n\r\n",
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK",
+            ] {
+                head(&mut stream).await;
+                stream.write_all(response).await.unwrap();
+            }
+        }));
+        let (mut client, _task) = session(forward(address), Trie::new(), None);
+        for (method, status) in [("HEAD", "200"), ("GET", "304"), ("GET", "200")] {
+            client
+                .write_all(format!("{method} / HTTP/1.1\r\nHost: a.test\r\n\r\n").as_bytes())
+                .await
+                .unwrap();
+            assert!(head(&mut client)
+                .await
+                .starts_with(&format!("HTTP/1.1 {status}")));
+        }
+        assert_eq!(rest(&mut client).await, b"OK");
+        (&mut upstream.0).await.unwrap();
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn expect_and_informational_responses_progress_without_losing_read_ahead() {
+    checked(async {
+        let (listener, address) = backend().await;
+        let mut upstream = Task(tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = head(&mut stream).await;
+            assert_eq!(values(&request, "expect"), ["100-Continue"]);
+            stream.write_all(b"HTTP/1.1 103 Early Hints\r\nLink: </before>\r\n\r\nHTTP/1.1 100 Continue\r\nX-Continue: yes\r\n\r\n").await.unwrap();
+            let mut body = [0; 5];
+            stream.read_exact(&mut body).await.unwrap();
+            assert_eq!(&body, b"hello");
+            stream.write_all(b"HTTP/1.1 103 Early Hints\r\nLink: </after>\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK").await.unwrap();
+        }));
+        let (mut client, _task) = session(forward(address), Trie::new(), None);
+        client.write_all(b"POST / HTTP/1.1\r\nHost: a.test\r\nContent-Length: 5\r\nExpect: 100-Continue\r\n\r\n").await.unwrap();
+        assert!(head(&mut client).await.starts_with("HTTP/1.1 103 "));
+        let continuation = head(&mut client).await;
+        assert!(continuation.starts_with("HTTP/1.1 100 "));
+        assert_eq!(values(&continuation, "x-continue"), ["yes"]);
+        client.write_all(b"hello").await.unwrap();
+        assert!(head(&mut client).await.starts_with("HTTP/1.1 103 "));
+        assert!(head(&mut client).await.starts_with("HTTP/1.1 200 "));
+        assert_eq!(rest(&mut client).await, b"OK");
+        (&mut upstream.0).await.unwrap();
+    }).await;
+}
+
+#[tokio::test]
+async fn early_final_responses_cancel_incomplete_uploads_and_close() {
+    checked(async {
+        for expect in ["", "Expect: 100-continue\r\n"] {
+            let (listener, address) = backend().await;
+            let mut upstream = Task(tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                head(&mut stream).await;
+                stream
+                    .write_all(b"HTTP/1.1 413 Content Too Large\r\nContent-Length: 2\r\n\r\nNO")
+                    .await
+                    .unwrap();
+                let _ = rest(&mut stream).await;
+            }));
+            let (mut client, _task) = session(forward(address), Trie::new(), None);
+            client
+                .write_all(
+                    format!(
+                        "POST / HTTP/1.1\r\nHost: a.test\r\nContent-Length: 999999\r\n{expect}\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let response = head(&mut client).await;
+            assert!(response.starts_with("HTTP/1.1 413 "));
+            assert_eq!(values(&response, "connection"), ["close"]);
+            assert_eq!(rest(&mut client).await, b"NO");
+            (&mut upstream.0).await.unwrap();
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn eof_delimited_responses_and_client_close_tokens_end_the_session() {
+    checked(async {
+        for (response, expected) in [
+            (
+                b"HTTP/1.1 200 OK\r\n\r\nEOF-BODY".as_slice(),
+                b"EOF-BODY".as_slice(),
+            ),
+            (b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nOK", b"OK"),
+            (
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\nopaque",
+                b"opaque",
+            ),
+            (b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK", b"OK"),
+        ] {
+            let (listener, address) = backend().await;
+            let mut upstream = Task(tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                head(&mut stream).await;
+                stream.write_all(response).await.unwrap();
+            }));
+            let (mut client, _task) = session(forward(address), Trie::new(), None);
+            client
+                .write_all(
+                    b"GET / HTTP/1.1\r\nHost: a.test\r\nConnection: keep-alive, Close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            assert_eq!(values(&head(&mut client).await, "connection"), ["close"]);
+            assert_eq!(rest(&mut client).await, expected);
+            (&mut upstream.0).await.unwrap();
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn ambiguous_request_framing_is_rejected_before_upstream_io() {
+    checked(async {
+        for headers in [
+            "Transfer-Encoding: Chunked\r\nContent-Length: 5\r\n",
+            "Content-Length: 3\r\nContent-Length: 5\r\n",
+            "Transfer-Encoding: chunked, gzip\r\n",
+            "Transfer-Encoding: chunked, chunked\r\n",
+            "Transfer-Encoding: gzip\r\n",
+            "Host: conflicting.test\r\n",
+        ] {
+            let (_listener, address) = backend().await;
+            let (mut client, mut task) = session(forward(address), Trie::new(), None);
+            client
+                .write_all(format!("POST / HTTP/1.1\r\nHost: a.test\r\n{headers}\r\n").as_bytes())
+                .await
+                .unwrap();
+            assert!(rest(&mut client).await.is_empty());
+            assert!((&mut task.0).await.unwrap().is_err());
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn framing_patches_cannot_change_how_received_bytes_are_consumed() {
+    checked(async {
+        let (_listener, address) = backend().await;
+        let default = action(json!({"type": "forward", "location": address.to_string(), "request_header_patch": {"overwrite_headers": {"Content-Length": "2"}}}));
+        let (mut client, mut task) = session(default, Trie::new(), None);
+        client.write_all(b"POST / HTTP/1.1\r\nHost: a.test\r\nContent-Length: 3\r\n\r\nabc").await.unwrap();
+        assert!(rest(&mut client).await.is_empty());
+        assert!((&mut task.0).await.unwrap().is_err());
+        let (listener, address) = backend().await;
+        let mut upstream = Task(tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            head(&mut stream).await;
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc").await.unwrap();
+        }));
+        let default = action(json!({"type": "forward", "location": address.to_string(), "response_header_patch": {"remove_headers": ["Content-Length"]}}));
+        let (mut client, mut task) = session(default, Trie::new(), None);
+        client.write_all(b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n").await.unwrap();
+        assert!(rest(&mut client).await.is_empty());
+        assert!((&mut task.0).await.unwrap().is_err());
+        (&mut upstream.0).await.unwrap();
+    }).await;
+}

@@ -45,10 +45,6 @@ pub trait HeaderMap {
         })
     }
 
-    fn chunked(&self) -> bool {
-        self.contains_token("transfer-encoding", "chunked")
-    }
-
     fn content_length(&self) -> std::io::Result<Option<usize>> {
         let mut length = None;
         for value in self
@@ -197,7 +193,7 @@ mod tests {
         assert!(headers.connection_close());
         assert!(headers.websocket_upgrade());
         headers.append("transfer-encoding".into(), "Chunked".into());
-        assert!(headers.chunked());
+        assert!(headers.contains_token("transfer-encoding", "chunked"));
     }
 
     #[test]
