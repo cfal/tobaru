@@ -1,12 +1,11 @@
-use std::collections::HashMap;
-
 use tokio::io::AsyncRead;
 
+use super::header_map::Headers;
 use super::line_reader::LineReader;
 
 pub struct ParsedHttpData {
     first_line: String,
-    headers: HashMap<String, String>,
+    headers: Headers,
     line_reader: LineReader,
 }
 
@@ -21,7 +20,7 @@ impl ParsedHttpData {
             LineReader::new()
         };
         let mut first_line: Option<String> = None;
-        let mut headers: HashMap<String, String> = HashMap::new();
+        let mut headers = Headers::default();
 
         let mut line_count = 0;
         loop {
@@ -46,7 +45,7 @@ impl ParsedHttpData {
                 }
                 let header_key = tokens[0].trim().to_lowercase();
                 let header_value = tokens[1].trim().to_string();
-                headers.insert(header_key, header_value);
+                headers.append(header_key, header_value);
             }
 
             line_count += 1;
@@ -72,11 +71,11 @@ impl ParsedHttpData {
         self.first_line = first_line;
     }
 
-    pub fn headers(&self) -> &HashMap<String, String> {
+    pub fn headers(&self) -> &Headers {
         &self.headers
     }
 
-    pub fn headers_mut(&mut self) -> &mut HashMap<String, String> {
+    pub fn headers_mut(&mut self) -> &mut Headers {
         &mut self.headers
     }
 

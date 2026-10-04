@@ -414,3 +414,25 @@ async fn directory_checks_index_symlinks_and_canonicalizes_the_root() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn duplicate_fields_and_mixed_case_patches_survive_forwarding() {
+    checked(async {
+        let (listener, address) = backend().await;
+        let mut upstream = Task(tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = head(&mut stream).await;
+            assert_eq!(values(&request, "host"), ["replacement.test"]);
+            assert_eq!(values(&request, "x-repeat"), ["first", "second"]);
+            assert!(values(&request, "x-remove").is_empty());
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\nSet-Cookie: a=1\r\nSet-Cookie: a=2\r\n\r\n").await.unwrap();
+        }));
+        let default = action(json!({"type": "forward", "location": address.to_string(), "request_header_patch": {"remove_headers": ["X-Remove"], "overwrite_headers": {"Host": "replacement.test"}}}));
+        let (mut client, _task) = session(default, Trie::new(), None);
+        client.write_all(b"GET / HTTP/1.1\r\nHost: original.test\r\nX-Repeat: first\r\nx-repeat: second\r\nX-Remove: gone\r\n\r\n").await.unwrap();
+        let response = head(&mut client).await;
+        assert_eq!(values(&response, "set-cookie"), ["a=1", "a=2"]);
+        assert!(rest(&mut client).await.is_empty());
+        (&mut upstream.0).await.unwrap();
+    }).await;
+}

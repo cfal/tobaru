@@ -1,3 +1,4 @@
+use super::header_map::Headers;
 use super::http_parser;
 use crate::config::HttpValueMatch;
 use crate::hostname_util::{matches_host_header, strip_host_port, validate_host_header};
@@ -38,7 +39,7 @@ pub(super) fn find_matching_action<'a>(
 }
 
 fn has_required_headers(
-    headers: &HashMap<String, String>,
+    headers: &Headers,
     required: &HashMap<String, HttpValueMatch>,
 ) -> std::io::Result<bool> {
     for (key, rule) in required.iter() {
