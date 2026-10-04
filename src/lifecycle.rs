@@ -8,6 +8,7 @@ use std::pin::Pin;
 use log::{error, info};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc::{channel, Receiver};
+use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 use tokio::time::{sleep, Duration};
 
@@ -15,6 +16,37 @@ use crate::config::{ServerConfig, TargetConfigs};
 use crate::{config, iptables_util, tcp, udp, QuickAction};
 
 type ServerTask = Pin<Box<dyn Future<Output = io::Result<()>> + Send>>;
+
+struct PreparedServer {
+    task: ServerTask,
+    stop: oneshot::Sender<()>,
+}
+
+fn start_servers(
+    tasks: Vec<PreparedServer>,
+    servers: &mut JoinSet<io::Result<()>>,
+) -> Vec<oneshot::Sender<()>> {
+    tasks
+        .into_iter()
+        .map(|server| {
+            servers.spawn(server.task);
+            server.stop
+        })
+        .collect()
+}
+
+async fn stop_servers(
+    stops: Vec<oneshot::Sender<()>>,
+    servers: &mut JoinSet<io::Result<()>>,
+) -> io::Result<()> {
+    for stop in stops {
+        let _ = stop.send(());
+    }
+    while let Some(result) = servers.join_next().await {
+        result.map_err(io::Error::other)??;
+    }
+    Ok(())
+}
 
 fn relevant_event(event: &Event, paths: &HashSet<PathBuf>) -> bool {
     matches!(
@@ -54,7 +86,7 @@ fn watch_configs(config_paths: &[String]) -> io::Result<(RecommendedWatcher, Rec
     Ok((watcher, rx))
 }
 
-async fn prepare(configs: Vec<ServerConfig>) -> io::Result<Vec<ServerTask>> {
+async fn prepare(configs: Vec<ServerConfig>) -> io::Result<Vec<PreparedServer>> {
     let mut tasks = Vec::new();
     let mut listeners = HashSet::new();
     for config in configs {
@@ -67,21 +99,29 @@ async fn prepare(configs: Vec<ServerConfig>) -> io::Result<Vec<ServerTask>> {
         if !listeners.insert((is_tcp, address)) {
             return Err(io::Error::other(format!("Duplicate listener: {address}")));
         }
+        let (stop, stopped) = oneshot::channel();
         let task: ServerTask = match target_configs {
             TargetConfigs::Tcp {
                 tcp_nodelay,
                 tcp_keepalive,
                 targets,
-            } => Box::pin(
-                tcp::prepare_tcp_server(
+            } => {
+                let task = tcp::prepare_tcp_server(
                     address,
                     use_iptables,
                     tcp_nodelay,
                     tcp_keepalive,
                     targets.into_vec(),
                 )
-                .await?,
-            ),
+                .await?;
+                Box::pin(async move {
+                    tokio::select! {
+                        biased;
+                        result = task => result,
+                        _ = stopped => Ok(()),
+                    }
+                })
+            }
             TargetConfigs::Udp {
                 targets,
                 udp_max_associations,
@@ -90,13 +130,17 @@ async fn prepare(configs: Vec<ServerConfig>) -> io::Result<Vec<ServerTask>> {
                 use_iptables,
                 udp_max_associations,
                 targets.into_vec(),
+                stopped,
             )?),
         };
-        tasks.push(Box::pin(async move {
-            task.await.map_err(|error| {
-                io::Error::new(error.kind(), format!("Listener {address} failed: {error}"))
-            })
-        }) as ServerTask);
+        tasks.push(PreparedServer {
+            task: Box::pin(async move {
+                task.await.map_err(|error| {
+                    io::Error::new(error.kind(), format!("Listener {address} failed: {error}"))
+                })
+            }),
+            stop,
+        });
     }
     Ok(tasks)
 }
@@ -143,9 +187,7 @@ pub async fn run(
     let (_watcher, mut changes) = watch_configs(&paths)?;
     clear_rules(&firewall).await?;
     let mut servers = JoinSet::new();
-    for task in tasks {
-        servers.spawn(task);
-    }
+    let mut stops = start_servers(tasks, &mut servers);
 
     loop {
         tokio::select! {
@@ -173,12 +215,11 @@ pub async fn run(
                         continue;
                     }
                 };
-                servers.abort_all();
-                while servers.join_next().await.is_some() {}
+                stop_servers(stops, &mut servers).await?;
                 let stale_rules = firewall.union(&new_firewall).copied().collect();
                 clear_rules(&stale_rules).await?;
                 firewall = new_firewall;
-                for task in tasks { servers.spawn(task); }
+                stops = start_servers(tasks, &mut servers);
                 info!("Config reload complete");
             }
         }
@@ -224,5 +265,46 @@ mod tests {
             let config = serde_json::from_value(value).unwrap();
             assert!(prepare(vec![config]).await.is_err());
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn udp_stop_joins_active_associations_before_rebinding() {
+        use tokio::net::UdpSocket;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let backend = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+            let reservation = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+            let address = reservation.local_addr().unwrap();
+            let destination = SocketAddr::from(([127, 0, 0, 1], address.port()));
+            drop(reservation);
+            let config: ServerConfig = serde_json::from_value(serde_json::json!({
+                "address":address.to_string(), "transport":"udp",
+                "target":{"allowlist":"127.0.0.1/32", "location":format!("127.0.0.1:{}", backend.local_addr().unwrap().port())}
+            })).unwrap();
+            let mut servers = JoinSet::new();
+            for round in 0..3 {
+                let stops = start_servers(prepare(vec![config.clone()]).await.unwrap(), &mut servers);
+                let mut clients = Vec::new();
+                let mut bytes = [0; 16];
+                for index in 0..24 {
+                    let client = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+                    let packet = [round, index];
+                    let mut retry = tokio::time::interval(Duration::from_millis(5));
+                    loop {
+                        tokio::select! {
+                            _ = retry.tick() => { client.send_to(&packet, destination).await.unwrap(); }
+                            received = backend.recv_from(&mut bytes) => {
+                                let (length, _) = received.unwrap();
+                                if bytes[..length] == packet { break; }
+                            }
+                        }
+                    }
+                    clients.push(client);
+                }
+                stop_servers(stops, &mut servers).await.unwrap();
+                assert!(servers.is_empty());
+                let rebound = UdpSocket::bind(address).await.unwrap();
+                drop(rebound);
+            }
+        }).await.expect("UDP stop/rebind timed out");
     }
 }
