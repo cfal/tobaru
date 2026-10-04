@@ -739,6 +739,85 @@ async fn round_robin_advances_only_when_an_action_opens_a_connection() {
     .await;
 }
 
+#[tokio::test]
+async fn surplus_after_a_final_response_is_never_reused() {
+    checked(async {
+        for (first, body) in [
+            ("HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nA", "A"),
+            (
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nA\r\n0\r\n\r\n",
+                "1\r\nA\r\n0\r\n\r\n",
+            ),
+            ("HTTP/1.1 204 No Content\r\n\r\n", ""),
+        ] {
+            let (listener, address) = backend().await;
+            let mut upstream = Task(tokio::spawn(async move {
+                let (mut first_stream, _) = listener.accept().await.unwrap();
+                head(&mut first_stream).await;
+                first_stream
+                    .write_all(
+                        format!("{first}HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nFAKE")
+                            .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                assert!(rest(&mut first_stream).await.is_empty());
+                let (mut second_stream, _) = listener.accept().await.unwrap();
+                head(&mut second_stream).await;
+                second_stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nREAL",
+                    )
+                    .await
+                    .unwrap();
+            }));
+            let (mut client, _task) = session(forward(address), Trie::new(), None);
+            client
+                .write_all(b"GET /first HTTP/1.1\r\nHost: a.test\r\n\r\n")
+                .await
+                .unwrap();
+            head(&mut client).await;
+            let mut received = vec![0; body.len()];
+            client.read_exact(&mut received).await.unwrap();
+            assert_eq!(received, body.as_bytes());
+            client
+                .write_all(b"GET /second HTTP/1.1\r\nHost: a.test\r\n\r\n")
+                .await
+                .unwrap();
+            head(&mut client).await;
+            assert_eq!(rest(&mut client).await, b"REAL");
+            (&mut upstream.0).await.unwrap();
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn early_eof_delimited_rejection_receives_request_eof() {
+    checked(async {
+        let (listener, address) = backend().await;
+        let mut upstream = Task(tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            head(&mut stream).await;
+            stream
+                .write_all(b"HTTP/1.1 413 Content Too Large\r\nConnection: close\r\n\r\nNO")
+                .await
+                .unwrap();
+            let _ = rest(&mut stream).await;
+            stream.shutdown().await.unwrap();
+        }));
+        let (mut client, _task) = session(forward(address), Trie::new(), None);
+        client
+            .write_all(b"POST / HTTP/1.1\r\nHost: a.test\r\nContent-Length: 99999\r\n\r\nx")
+            .await
+            .unwrap();
+        assert!(head(&mut client).await.starts_with("HTTP/1.1 413 "));
+        assert_eq!(rest(&mut client).await, b"NO");
+        (&mut upstream.0).await.unwrap();
+    })
+    .await;
+}
+
 trait WireStream: AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + tokio::io::AsyncWrite + Unpin + Send> WireStream for T {}
 

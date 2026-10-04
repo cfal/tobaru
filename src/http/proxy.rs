@@ -112,6 +112,11 @@ impl<'a> Session<'a> {
         .await?;
         let upload_complete = reader.is_some();
         self.reader = reader;
+        if !upload_complete {
+            // An EOF-delimited rejection may wait for request EOF before finishing.
+            // Close only our write side so its response can still be drained.
+            let _ = target.stream.shutdown().await;
+        }
         let status = response.response_status()?;
         let response_body = response_framing(response.headers(), &request.verb, status)?;
         let upstream_close = response.headers().connection_close()
@@ -184,7 +189,12 @@ impl<'a> Session<'a> {
             let _ = target.stream.try_shutdown().await;
             Ok(Outcome::Close)
         } else {
-            self.cached_target = Some(target);
+            if target.reader.unparsed_data().is_empty() {
+                self.cached_target = Some(target);
+            } else {
+                // Only one request was sent. Surplus cannot be a subsequent response.
+                let _ = target.stream.try_shutdown().await;
+            }
             Ok(Outcome::Continue)
         }
     }
