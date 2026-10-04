@@ -1,79 +1,69 @@
+mod body;
 mod chunk_transfer;
 mod header_map;
 mod header_tuple;
 mod http_parser;
 mod line_reader;
+mod local;
+mod proxy;
+mod routing;
 mod string_util;
 
 #[cfg(test)]
 mod session_tests;
 
-use std::collections::HashMap;
-
-use log::{error, info};
-use memchr::memmem;
-use mime_guess::MimeGuess;
-use radix_trie::{Trie, TrieCommon};
+use log::info;
+use radix_trie::Trie;
 use rand::RngExt;
-use tokio::fs::File;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 
 use crate::async_stream::AsyncStream;
-use crate::config::{HttpValueMatch, TcpKeepaliveConfig};
+use crate::config::TcpKeepaliveConfig;
 use crate::copy_bidirectional::copy_bidirectional;
-use crate::hostname_util::{matches_host_header, strip_host_port, validate_host_header};
-use crate::tcp::{setup_target_stream, TargetHttpActionData, TargetHttpPathData};
-use crate::util::{allocate_vec, write_all};
+use crate::tcp::{TargetHttpActionData, TargetHttpPathData};
+use routing::find_matching_action;
 
-use header_map::HeaderMap;
-use header_tuple::HeaderTuple;
+struct CachedTarget {
+    base_path: String,
+    stream: Box<dyn AsyncStream>,
+}
 
-pub async fn handle_http_stream(
+struct Session<'a> {
+    stream: Box<dyn AsyncStream>,
+    cached_target: Option<CachedTarget>,
+    addr: &'a std::net::SocketAddr,
     tcp_nodelay: bool,
     tcp_keepalive: Option<TcpKeepaliveConfig>,
-    path_configs: &Trie<String, Vec<TargetHttpPathData>>,
-    default_action: &TargetHttpActionData,
-    mut stream: Box<dyn AsyncStream>,
-    addr: &std::net::SocketAddr,
-    mut initial_data: Option<Vec<u8>>,
-) -> std::io::Result<()> {
-    const LOG_PREFIX: &str = "http";
+}
 
-    let stream_id = format!("{:x}", rand::rng().random::<u64>());
+enum Outcome {
+    Continue,
+    Close,
+    Tunnel(Box<dyn AsyncStream>),
+}
 
-    let mut iteration = 0usize;
+struct Request<'a> {
+    data: http_parser::ParsedHttpData,
+    verb: String,
+    path: String,
+    id: String,
+    base_path: &'a str,
+    action: &'a TargetHttpActionData,
+}
 
-    struct CachedTarget {
-        base_path: String,
-        stream: Box<dyn AsyncStream>,
-    }
-
-    let mut cached_target: Option<CachedTarget> = None;
-
-    loop {
-        iteration = iteration.wrapping_add(1);
-
-        if iteration > 1 {
-            // A response was written to `stream`, make sure to flush it.
-            stream.flush().await?;
-        }
-
-        let request_id = format!("{}#{}", stream_id, iteration);
-
-        // TODO: add a read timeout
-        let initial = if iteration == 1 {
-            initial_data.take()
-        } else {
-            None
-        };
-        let mut request_data = http_parser::ParsedHttpData::parse(&mut stream, initial).await?;
-
-        let mut first_line = request_data.first_line().to_string();
+impl<'a> Request<'a> {
+    fn new(
+        data: http_parser::ParsedHttpData,
+        id: String,
+        path_configs: &'a Trie<String, Vec<TargetHttpPathData>>,
+        default_action: &'a TargetHttpActionData,
+    ) -> std::io::Result<Self> {
+        let mut first_line = data.first_line().to_string();
 
         if !first_line.ends_with(" HTTP/1.1") {
             return Err(std::io::Error::other(format!(
                 "Not a http/1.1 request: {}",
-                request_data.first_line()
+                data.first_line()
             )));
         }
 
@@ -84,7 +74,7 @@ pub async fn handle_http_stream(
             None => {
                 return Err(std::io::Error::other(format!(
                     "Invalid http request directive: {}",
-                    request_data.first_line()
+                    data.first_line()
                 )));
             }
         };
@@ -93,7 +83,7 @@ pub async fn handle_http_stream(
         if !request_path.starts_with('/') {
             return Err(std::io::Error::other(format!(
                 "Invalid http request path: {}",
-                request_data.first_line()
+                data.first_line()
             )));
         }
 
@@ -102,731 +92,88 @@ pub async fn handle_http_stream(
         verb.make_ascii_uppercase();
 
         let (base_path, path_action) =
-            find_matching_action(path_configs, default_action, &request_path, &request_data)?;
+            find_matching_action(path_configs, default_action, &request_path, &data)?;
 
-        match path_action {
+        Ok(Self {
+            data,
+            verb,
+            path: request_path,
+            id,
+            base_path,
+            action: path_action,
+        })
+    }
+}
+
+impl Session<'_> {
+    async fn close_target(&mut self) {
+        if let Some(mut target) = self.cached_target.take() {
+            let _ = target.stream.try_shutdown().await;
+        }
+    }
+
+    async fn dispatch(&mut self, request: Request<'_>) -> std::io::Result<Outcome> {
+        match request.action {
             TargetHttpActionData::CloseConnection => {
-                info!("[{}] {} {} [close]", LOG_PREFIX, verb, request_path);
-                break;
+                info!("[http] {} {} [close]", request.verb, request.path);
+                Ok(Outcome::Close)
             }
-            TargetHttpActionData::ServeMessage {
-                status_code,
-                status_message,
-                content,
-                response_headers,
-                response_id_header_name,
-            } => {
-                if let Some(mut t) = cached_target.take() {
-                    let _ = t.stream.try_shutdown().await;
-                }
-
-                if request_data.headers().expect_100()? {
-                    write_all(&mut stream, b"HTTP/1.1 417 Expectation Failed\r\n\r\n").await?;
-                    info!(
-                        "[{}] {} {} [serve message: expectation failed]",
-                        LOG_PREFIX, verb, request_path
-                    );
-                } else {
-                    forward_message(
-                        &mut stream,
-                        None::<&mut tokio::net::TcpStream>,
-                        request_data,
-                    )
-                    .await?;
-
-                    let mut error_response = format!("HTTP/1.1 {}", status_code);
-                    if let Some(msg) = status_message {
-                        error_response.push(' ');
-                        error_response.push_str(msg);
-                    }
-                    error_response.push_str("\r\n");
-                    response_headers.append_headers_to_string(&mut error_response);
-                    if let Some(header_name) = response_id_header_name {
-                        (header_name, &request_id).append_header_to_string(&mut error_response);
-                    }
-                    error_response
-                        .push_str("transfer-encoding: chunked\r\nconnection: close\r\n\r\n");
-                    write_all(&mut stream, &error_response.into_bytes()).await?;
-                    if verb != "HEAD" {
-                        if !content.is_empty() {
-                            write_all(
-                                &mut stream,
-                                &format!("{:X}\r\n", content.len()).into_bytes(),
-                            )
-                            .await?;
-                            write_all(&mut stream, content.as_bytes()).await?;
-                            write_all(&mut stream, b"\r\n").await?;
-                        }
-                        write_all(&mut stream, b"0\r\n\r\n").await?;
-                    }
-                }
-
-                info!(
-                    "[{}] {} {} [serve message: {}]",
-                    LOG_PREFIX, verb, request_path, status_code
-                );
-
-                break;
-            }
-            TargetHttpActionData::ServeDirectory {
-                path,
-                response_headers,
-                response_id_header_name,
-            } => {
-                if let Some(mut t) = cached_target.take() {
-                    let _ = t.stream.try_shutdown().await;
-                }
-
-                if verb != "GET" && verb != "HEAD" {
-                    let mut error_response = String::from("HTTP/1.1 501 Not Implemented\r\n");
-                    error_response.push_str("content-length: 0\r\nconnection: close\r\n");
-                    if let Some(header_name) = response_id_header_name {
-                        (header_name, &request_id).append_header_to_string(&mut error_response);
-                    }
-                    error_response.push_str("\r\n");
-                    write_all(&mut stream, &error_response.into_bytes()).await?;
-                    break;
-                }
-
-                if memmem::find(request_path.as_bytes(), b"..").is_some() {
-                    return Err(std::io::Error::other(format!(
-                        "Ignoring request with possible base path escape: {}",
-                        request_data.first_line()
-                    )));
-                }
-                let file_path = string_util::update_base_path(&request_path, base_path, path);
-                match tokio::fs::canonicalize(file_path).await {
-                    Ok(mut canonical_path) => {
-                        // We filter out '..' from requests, so can this still occur?
-                        if !canonical_path.starts_with(path) {
-                            return Err(std::io::Error::other(format!(
-                                "Canonical path ({}) does not start with serve path ({})",
-                                canonical_path.display(),
-                                path
-                            )));
-                        }
-
-                        if canonical_path.is_dir() {
-                            canonical_path.push("index.html");
-                        }
-
-                        match tokio::fs::metadata(&canonical_path).await {
-                            Ok(m) if m.is_file() => {
-                                let mime_type =
-                                    MimeGuess::from_path(&canonical_path).first_or_octet_stream();
-                                let mut file = File::open(canonical_path).await?;
-                                let mut buf = allocate_vec(4096);
-
-                                let mut ok_response = format!("HTTP/1.1 200\r\ntransfer-encoding: chunked\r\ncontent-type: {}\r\n", mime_type.essence_str());
-                                response_headers.append_headers_to_string(&mut ok_response);
-                                if let Some(header_name) = response_id_header_name {
-                                    (header_name, &request_id)
-                                        .append_header_to_string(&mut ok_response);
-                                }
-
-                                let request_connection_close =
-                                    request_data.headers().connection_close();
-                                if request_connection_close {
-                                    ok_response.push_str("connection: close\r\n");
-                                } else {
-                                    ok_response.push_str("connection: keep-alive\r\n");
-                                };
-
-                                ok_response.push_str("\r\n");
-                                write_all(&mut stream, &ok_response.into_bytes()).await?;
-
-                                if verb == "GET" {
-                                    loop {
-                                        let read_len = file.read(&mut buf).await?;
-                                        if read_len == 0 {
-                                            break;
-                                        }
-                                        write_all(
-                                            &mut stream,
-                                            &format!("{:X}\r\n", read_len).into_bytes(),
-                                        )
-                                        .await?;
-                                        write_all(&mut stream, &buf[0..read_len]).await?;
-                                        write_all(&mut stream, b"\r\n").await?;
-                                    }
-                                    stream.write_all(b"0\r\n\r\n").await?;
-                                }
-
-                                info!(
-                                    "[{}] {} {} [serve file: {}]",
-                                    LOG_PREFIX,
-                                    verb,
-                                    request_path,
-                                    mime_type.essence_str()
-                                );
-
-                                if request_connection_close {
-                                    break;
-                                }
-                            }
-                            _ => {
-                                let mut not_found_response =
-                                    String::from("HTTP/1.1 404\r\ncontent-length: 0\r\n");
-                                let request_connection_close =
-                                    request_data.headers().connection_close();
-                                if request_connection_close {
-                                    not_found_response.push_str("connection: close\r\n");
-                                } else {
-                                    not_found_response.push_str("connection: keep-alive\r\n");
-                                };
-                                if let Some(header_name) = response_id_header_name {
-                                    (header_name, &request_id)
-                                        .append_header_to_string(&mut not_found_response);
-                                }
-                                not_found_response.push_str("\r\n");
-                                write_all(&mut stream, &not_found_response.into_bytes()).await?;
-
-                                info!(
-                                    "[{}] {} {} [serve file: invalid, not a file]",
-                                    LOG_PREFIX, verb, request_path
-                                );
-
-                                if request_connection_close {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        let mut not_found_response =
-                            String::from("HTTP/1.1 404\r\ncontent-length: 0\r\n");
-                        let request_connection_close = request_data.headers().connection_close();
-                        if request_connection_close {
-                            not_found_response.push_str("connection: close\r\n");
-                        } else {
-                            not_found_response.push_str("connection: keep-alive\r\n");
-                        };
-                        if let Some(header_name) = response_id_header_name {
-                            (header_name, &request_id)
-                                .append_header_to_string(&mut not_found_response);
-                        }
-                        not_found_response.push_str("\r\n");
-                        write_all(&mut stream, &not_found_response.into_bytes()).await?;
-
-                        info!(
-                            "[{}] {} {} [serve file: not found]",
-                            LOG_PREFIX, verb, request_path
-                        );
-
-                        if request_connection_close {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        info!(
-                            "[{}] {} {} [serve file: invalid path]",
-                            LOG_PREFIX, verb, request_path
-                        );
-                        return Err(std::io::Error::other(format!(
-                            "Could not canonicalize path: {}",
-                            e
-                        )));
-                    }
-                }
-            }
-            TargetHttpActionData::Forward {
-                location_data,
-                next_address_index,
-                replacement_path,
-                request_header_patch,
-                response_header_patch,
-                request_id_header_name,
-                response_id_header_name,
-            } => {
-                if let Some(ref p) = replacement_path {
-                    let new_path = string_util::update_base_path(&request_path, base_path, p);
-                    request_data.set_first_line(format!("{} {} HTTP/1.1", verb, new_path));
-                }
-
-                let mut target_stream = match cached_target.take() {
-                    Some(t) if t.base_path == base_path => t.stream,
-                    no_match => {
-                        if let Some(mut t) = no_match {
-                            let _ = t.stream.try_shutdown().await;
-                        }
-                        let target_location = if location_data.len() > 1 {
-                            // fetch_add wraps around on overflow.
-                            let index = next_address_index
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            &location_data[index % location_data.len()]
-                        } else {
-                            &location_data[0]
-                        };
-                        setup_target_stream(addr, target_location, tcp_nodelay, tcp_keepalive)
-                            .await?
-                    }
-                };
-
-                request_data
-                    .headers_mut()
-                    .patch_headers(request_header_patch.as_deref());
-
-                if let Some(header_name) = request_id_header_name {
-                    request_data
-                        .headers_mut()
-                        .insert(header_name.to_string(), request_id.clone());
-                }
-
-                if request_data.headers().expect_100()? {
-                    // the expect response looks like: HTTP/1.1 100 Continue\r\n\r\n
-                    // TODO: can there be headers after the expectation status line? if so,
-                    // read them and check for connection close?
-                    let mut target_reader = line_reader::LineReader::new();
-
-                    let mut expect_response = target_reader
-                        .read_line(&mut target_stream)
-                        .await?
-                        .to_string();
-
-                    // Read the second '\r\n' after the expectation status line.
-                    if !target_reader
-                        .read_line(&mut target_stream)
-                        .await?
-                        .is_empty()
-                    {
-                        return Err(std::io::Error::other(
-                            "Unexpected non-empty line after reading expectation",
-                        ));
-                    }
-
-                    // Readd the crlfs to prepare our response for forwarding.
-                    expect_response.push_str("\r\n\r\n");
-
-                    let expectation_success = expect_response.starts_with("HTTP/1.1 100");
-                    let expectation_failure = expect_response.starts_with("HTTP/1.1 417");
-
-                    if !expectation_success && !expectation_failure {
-                        return Err(std::io::Error::other(format!(
-                            "Unexpected expectation response: {}",
-                            expect_response
-                        )));
-                    }
-
-                    if !target_reader.unparsed_data().is_empty() {
-                        return Err(std::io::Error::other(
-                            "Unexpected unparsed data after reading expectation",
-                        ));
-                    }
-
-                    write_all(&mut stream, &expect_response.into_bytes()).await?;
-
-                    if !expectation_success {
-                        cached_target = Some(CachedTarget {
-                            base_path: base_path.to_string(),
-                            stream: target_stream,
-                        });
-                        continue;
-                    }
-                }
-
-                let request_websocket_upgrade = request_data.headers().websocket_upgrade();
-
-                forward_message(&mut stream, Some(&mut target_stream), request_data).await?;
-
-                // Flush the request, and then read the response.
-                target_stream.flush().await?;
-
-                // TODO: add a read timeout
-                // Responses from target server never have initial_data
-                let mut response_data =
-                    http_parser::ParsedHttpData::parse(&mut target_stream, None).await?;
-
-                response_data
-                    .headers_mut()
-                    .patch_headers(response_header_patch.as_deref());
-
-                if let Some(header_name) = response_id_header_name {
-                    response_data
-                        .headers_mut()
-                        .insert(header_name.to_string(), request_id.clone());
-                }
-
-                response_data
-                    .headers_mut()
-                    .update_path_headers(base_path, replacement_path);
-
-                if request_websocket_upgrade && verb != "HEAD" {
-                    if response_data.first_line().starts_with("HTTP/1.1 101") {
-                        write_all(
-                            &mut stream,
-                            &string_util::create_message(&response_data).into_bytes(),
-                        )
-                        .await?;
-                        drop(response_data);
-                        info!("[{}] {} {} [forward-ws]", LOG_PREFIX, verb, request_path);
-                        return copy_bidirectional(
-                            &mut stream,
-                            &mut target_stream,
-                            // immediately flush 101 response
-                            true,
-                            false,
-                        )
-                        .await
-                        .map(|_| ());
-                    }
-                    error!("Websocket upgrade failed: {}", response_data.first_line());
-                }
-
-                let response_connection_close = response_data.headers().connection_close();
-
-                if verb != "HEAD" {
-                    forward_message(&mut target_stream, Some(&mut stream), response_data).await?;
-                }
-
-                info!("[{}] {} {} [forward]", LOG_PREFIX, verb, request_path);
-
-                if response_connection_close {
-                    let _ = target_stream.try_shutdown().await;
-                    break;
-                }
-
-                cached_target = Some(CachedTarget {
-                    base_path: base_path.to_string(),
-                    stream: target_stream,
-                });
-            }
+            TargetHttpActionData::ServeMessage { .. }
+            | TargetHttpActionData::ServeDirectory { .. } => self.serve_local(request).await,
+            TargetHttpActionData::Forward { .. } => self.forward(request).await,
         }
     }
-
-    // Flush any remaining response data.
-    stream.flush().await?;
-    let _ = stream.try_shutdown().await;
-
-    if let Some(mut t) = cached_target.take() {
-        let _ = t.stream.try_shutdown().await;
-    }
-
-    Ok(())
 }
 
-fn find_matching_action<'a>(
-    path_configs: &'a Trie<String, Vec<TargetHttpPathData>>,
-    default_action: &'a TargetHttpActionData,
-    request_path: &str,
-    request_data: &http_parser::ParsedHttpData,
-) -> std::io::Result<(&'a str, &'a TargetHttpActionData)> {
-    let mut lookup_path;
-    let lookup = if request_path.ends_with('/') {
-        request_path
-    } else {
-        lookup_path = String::with_capacity(request_path.len() + 1);
-        lookup_path.push_str(request_path);
-        lookup_path.push('/');
-        &lookup_path
+pub async fn handle_http_stream(
+    tcp_nodelay: bool,
+    tcp_keepalive: Option<TcpKeepaliveConfig>,
+    path_configs: &Trie<String, Vec<TargetHttpPathData>>,
+    default_action: &TargetHttpActionData,
+    stream: Box<dyn AsyncStream>,
+    addr: &std::net::SocketAddr,
+    mut initial_data: Option<Vec<u8>>,
+) -> std::io::Result<()> {
+    let mut session = Session {
+        stream,
+        cached_target: None,
+        addr,
+        tcp_nodelay,
+        tcp_keepalive,
     };
-    let matching_configs = path_configs.get_ancestor(lookup);
+    let stream_id = format!("{:x}", rand::rng().random::<u64>());
+    let mut iteration = 0usize;
 
-    if let Some(t) = matching_configs {
-        for path_config in t.value().unwrap().iter() {
-            if !has_required_headers(
-                request_data.headers(),
-                &path_config.required_request_headers,
-            )? {
-                continue;
+    loop {
+        iteration = iteration.wrapping_add(1);
+        if iteration > 1 {
+            session.stream.flush().await?;
+        }
+        let initial = if iteration == 1 {
+            initial_data.take()
+        } else {
+            None
+        };
+        let data = http_parser::ParsedHttpData::parse(&mut session.stream, initial).await?;
+        let request = Request::new(
+            data,
+            format!("{}#{}", stream_id, iteration),
+            path_configs,
+            default_action,
+        )?;
+        match session.dispatch(request).await? {
+            Outcome::Continue => {}
+            Outcome::Close => break,
+            Outcome::Tunnel(mut target) => {
+                return copy_bidirectional(&mut session.stream, &mut target, true, false)
+                    .await
+                    .map(|_| ())
             }
-            return Ok((t.key().unwrap(), &path_config.http_action));
         }
     }
 
-    Ok(("/", default_action))
-}
-
-fn has_required_headers(
-    headers: &HashMap<String, String>,
-    required: &HashMap<String, HttpValueMatch>,
-) -> std::io::Result<bool> {
-    for (key, rule) in required.iter() {
-        let header_value = headers.get(key).map(String::as_str);
-        if !matches_http_value(rule, header_value)? {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-/// Checks whether a header value matches an `HttpValueMatch` rule.
-/// For `Hostnames`, validates and strips the port before matching.
-pub fn matches_http_value(rule: &HttpValueMatch, value: Option<&str>) -> std::io::Result<bool> {
-    match rule {
-        HttpValueMatch::Any => Ok(value.is_some()),
-        HttpValueMatch::Single(allowed) => Ok(value.is_some_and(|v| v == allowed)),
-        HttpValueMatch::Multiple(allowed) => {
-            Ok(value.is_some_and(|v| allowed.iter().any(|a| a == v)))
-        }
-        HttpValueMatch::Hostnames(patterns) => match value {
-            Some(v) => {
-                let hostname = strip_host_port(v);
-                validate_host_header(hostname)?;
-                Ok(patterns.iter().any(|p| matches_host_header(hostname, p)))
-            }
-            None => Ok(false),
-        },
-    }
-}
-
-async fn forward_message<R, W>(
-    from_stream: &mut R,
-    mut maybe_to_stream: Option<&mut W>,
-    http_data: http_parser::ParsedHttpData,
-) -> std::io::Result<()>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let chunked = http_data.headers().chunked();
-    let content_length = http_data.headers().content_length()?;
-
-    if chunked && content_length.is_some() {
-        return Err(std::io::Error::other(
-            "Chunked transfer encoding and content length both provided",
-        ));
-    }
-
-    if let Some(ref mut to_stream) = maybe_to_stream {
-        let new_message = string_util::create_message(&http_data);
-        write_all(to_stream, &new_message.into_bytes()).await?;
-    }
-
-    let reader = http_data.into_reader();
-    if let Some(len) = content_length {
-        if len > 0 {
-            forward_content_with_length(from_stream, maybe_to_stream, reader, len).await?;
-        }
-    } else if chunked {
-        forward_chunked_content(from_stream, maybe_to_stream, reader).await?;
-    } else if !reader.unparsed_data().is_empty() {
-        return Err(std::io::Error::other(format!(
-            "Unexpected request data with len {}",
-            reader.unparsed_data().len()
-        )));
-    }
-
+    session.stream.flush().await?;
+    let _ = session.stream.try_shutdown().await;
+    session.close_target().await;
     Ok(())
-}
-
-async fn forward_content_with_length<R, W>(
-    from_stream: &mut R,
-    mut maybe_to_stream: Option<&mut W>,
-    reader: line_reader::LineReader,
-    content_length: usize,
-) -> std::io::Result<()>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let unparsed_data = reader.unparsed_data();
-    if unparsed_data.len() > content_length {
-        return Err(std::io::Error::other(format!(
-            "Unexpected content length ({} > {})",
-            unparsed_data.len(),
-            content_length
-        )));
-    }
-
-    if !unparsed_data.is_empty() {
-        if let Some(ref mut to_stream) = maybe_to_stream {
-            write_all(to_stream, unparsed_data).await?;
-        }
-    }
-
-    let mut remaining = content_length - unparsed_data.len();
-    let mut buf = reader.into_buf();
-    while remaining > 0 {
-        let max_len = std::cmp::min(remaining, buf.len());
-        let read_len = from_stream.read(&mut buf[0..max_len]).await?;
-        if read_len == 0 {
-            return Err(std::io::Error::other(format!(
-                "Got EOF while reading content with length, {} bytes were remaining",
-                remaining
-            )));
-        }
-        if let Some(ref mut to_stream) = maybe_to_stream {
-            write_all(to_stream, &buf[0..read_len]).await?;
-        }
-        remaining -= read_len;
-    }
-    Ok(())
-}
-
-async fn forward_chunked_content<R, W>(
-    from_stream: &mut R,
-    mut maybe_to_stream: Option<&mut W>,
-    reader: line_reader::LineReader,
-) -> std::io::Result<()>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let mut chunk_transfer = chunk_transfer::ChunkTransfer::new();
-    chunk_transfer
-        .run(reader.unparsed_data(), &mut maybe_to_stream)
-        .await?;
-
-    let mut buf = reader.into_buf();
-    while !chunk_transfer.is_done() {
-        let read_len = from_stream.read(&mut buf).await?;
-        if read_len == 0 {
-            return Err(std::io::Error::other("Got EOF during chunk transfer"));
-        }
-        chunk_transfer
-            .run(&buf[0..read_len], &mut maybe_to_stream)
-            .await?;
-    }
-
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::matches_http_value;
-    use crate::config::HttpValueMatch;
-
-    #[test]
-    fn any_variant() {
-        let m = HttpValueMatch::Any;
-        assert!(matches_http_value(&m, Some("anything")).unwrap());
-        assert!(!matches_http_value(&m, None).unwrap());
-    }
-
-    #[test]
-    fn single_variant() {
-        let m = HttpValueMatch::Single("exact-value".into());
-        assert!(matches_http_value(&m, Some("exact-value")).unwrap());
-        assert!(!matches_http_value(&m, Some("other")).unwrap());
-        assert!(!matches_http_value(&m, None).unwrap());
-    }
-
-    #[test]
-    fn multiple_variant() {
-        let m = HttpValueMatch::Multiple(vec!["a".into(), "b".into()]);
-        assert!(matches_http_value(&m, Some("a")).unwrap());
-        assert!(matches_http_value(&m, Some("b")).unwrap());
-        assert!(!matches_http_value(&m, Some("c")).unwrap());
-        assert!(!matches_http_value(&m, None).unwrap());
-    }
-
-    #[test]
-    fn single_exact_pattern() {
-        let m = HttpValueMatch::Hostnames(vec!["example.com".into()]);
-        assert!(matches_http_value(&m, Some("example.com")).unwrap());
-        assert!(matches_http_value(&m, Some("example.com:8080")).unwrap());
-        assert!(!matches_http_value(&m, Some("other.com")).unwrap());
-    }
-
-    #[test]
-    fn wildcard_pattern() {
-        let m = HttpValueMatch::Hostnames(vec!["*.example.com".into()]);
-        assert!(matches_http_value(&m, Some("foo.example.com")).unwrap());
-        assert!(matches_http_value(&m, Some("foo.example.com:443")).unwrap());
-        assert!(!matches_http_value(&m, Some("example.com")).unwrap());
-    }
-
-    #[test]
-    fn multiple_patterns() {
-        let m = HttpValueMatch::Hostnames(vec![
-            "api.example.com".into(),
-            "*.internal.example.com".into(),
-        ]);
-        assert!(matches_http_value(&m, Some("api.example.com")).unwrap());
-        assert!(matches_http_value(&m, Some("foo.internal.example.com")).unwrap());
-        assert!(!matches_http_value(&m, Some("other.example.com")).unwrap());
-    }
-
-    #[test]
-    fn none_value() {
-        let m = HttpValueMatch::Hostnames(vec!["example.com".into()]);
-        assert!(!matches_http_value(&m, None).unwrap());
-    }
-
-    #[test]
-    fn case_insensitive_with_port_stripping() {
-        let m = HttpValueMatch::Hostnames(vec!["example.com".into()]);
-        assert!(matches_http_value(&m, Some("EXAMPLE.COM")).unwrap());
-        assert!(matches_http_value(&m, Some("EXAMPLE.COM:8080")).unwrap());
-        assert!(matches_http_value(&m, Some("Example.Com:443")).unwrap());
-    }
-
-    #[test]
-    fn trailing_dot_rejected() {
-        let m = HttpValueMatch::Hostnames(vec!["example.com".into()]);
-        assert!(matches_http_value(&m, Some("example.com.")).is_err());
-        assert!(matches_http_value(&m, Some("example.com.:8080")).is_err());
-    }
-
-    #[test]
-    fn wildcard_case_and_trailing_dot_rejected() {
-        let m = HttpValueMatch::Hostnames(vec!["*.example.com".into()]);
-        assert!(matches_http_value(&m, Some("FOO.EXAMPLE.COM")).unwrap());
-        assert!(matches_http_value(&m, Some("foo.example.com.")).is_err());
-        assert!(matches_http_value(&m, Some("FOO.EXAMPLE.COM.:443")).is_err());
-    }
-
-    #[test]
-    fn empty_host_header() {
-        let m = HttpValueMatch::Hostnames(vec!["example.com".into()]);
-        assert!(matches_http_value(&m, Some("")).is_err());
-    }
-
-    #[test]
-    fn wildcard_through_deserialization() {
-        let m = deser_host("\"*.example.com\"");
-        assert!(matches_http_value(&m, Some("foo.example.com")).unwrap());
-        assert!(matches_http_value(&m, Some("foo.example.com:8080")).unwrap());
-        assert!(!matches_http_value(&m, Some("example.com")).unwrap());
-        assert!(!matches_http_value(&m, Some("other.com")).unwrap());
-    }
-
-    #[test]
-    fn dot_shorthand_through_deserialization() {
-        let m = deser_host("\".example.com\"");
-        assert!(matches!(m, HttpValueMatch::Hostnames(ref v) if v == &[".example.com"]));
-        assert!(matches_http_value(&m, Some("example.com")).unwrap());
-        assert!(matches_http_value(&m, Some("foo.example.com")).unwrap());
-        assert!(!matches_http_value(&m, Some("other.com")).unwrap());
-    }
-
-    #[test]
-    fn catch_all_through_deserialization() {
-        let m = deser_host("\"*\"");
-        assert!(matches!(m, HttpValueMatch::Hostnames(ref v) if v == &["*"]));
-        assert!(matches_http_value(&m, Some("anything.example.com")).unwrap());
-        assert!(matches_http_value(&m, Some("localhost")).unwrap());
-    }
-
-    #[test]
-    fn empty_patterns_list() {
-        let m = HttpValueMatch::Hostnames(vec![]);
-        assert!(!matches_http_value(&m, Some("example.com")).unwrap());
-        assert!(!matches_http_value(&m, None).unwrap());
-    }
-
-    #[test]
-    fn bracketed_ipv6_with_hostname_pattern() {
-        let m = HttpValueMatch::Hostnames(vec!["example.com".into()]);
-        assert!(!matches_http_value(&m, Some("[::1]")).unwrap());
-        assert!(!matches_http_value(&m, Some("[::1]:8080")).unwrap());
-    }
-
-    #[test]
-    fn ipv4_pattern_with_port_stripping() {
-        let m = HttpValueMatch::Hostnames(vec!["192.168.1.1".into()]);
-        assert!(matches_http_value(&m, Some("192.168.1.1")).unwrap());
-        assert!(matches_http_value(&m, Some("192.168.1.1:8080")).unwrap());
-        assert!(!matches_http_value(&m, Some("10.0.0.1")).unwrap());
-    }
-
-    /// Deserializes a host header value through the config pipeline.
-    fn deser_host(host_yaml: &str) -> HttpValueMatch {
-        let yaml = format!(
-            "required_request_headers:\n  host: {}\nhttp_action:\n  type: close\n",
-            host_yaml
-        );
-        let c: crate::config::HttpPathConfig = serde_yaml::from_str(&yaml).unwrap();
-        c.required_request_headers.get("host").unwrap().clone()
-    }
 }
