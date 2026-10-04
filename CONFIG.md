@@ -498,7 +498,8 @@ their value order; an overwrite replaces all values for that name. Patches must
 not change the received body's framing (for example, changing Content-Length or
 removing chunked Transfer-Encoding). Such requests/responses are rejected and the
 connection is closed; body bytes are not rewritten to match a patched length or
-transfer-coding stack. Patches also cannot manufacture or relabel a successful
+transfer-coding stack. Transfer-Encoding fields with parameters must remain
+unchanged; their quoted values are not normalized. Patches also cannot manufacture or relabel a successful
 protocol upgrade: the original and forwarded handshakes must agree.
 
 Forwarding supports HEAD/bodyless responses, informational responses including

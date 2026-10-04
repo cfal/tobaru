@@ -46,17 +46,16 @@ pub trait HeaderMap {
     }
 
     fn transfer_codings(&self) -> Vec<String> {
-        self.header_values("transfer-encoding")
+        let values: Vec<_> = self.header_values("transfer-encoding").collect();
+        // Parameter values can contain quoted commas and case-sensitive text.
+        // Keep such fields opaque rather than normalizing pieces of a parameter.
+        if values.iter().any(|value| value.contains(';')) {
+            return values.into_iter().map(str::to_owned).collect();
+        }
+        values
+            .into_iter()
             .flat_map(|value| value.split(','))
-            .map(|coding| {
-                let coding = coding.trim();
-                match coding.split_once(';') {
-                    Some((name, parameters)) => {
-                        format!("{};{}", name.trim().to_ascii_lowercase(), parameters)
-                    }
-                    None => coding.to_ascii_lowercase(),
-                }
-            })
+            .map(|coding| coding.trim().to_ascii_lowercase())
             .collect()
     }
 
@@ -209,6 +208,22 @@ mod tests {
         assert!(headers.websocket_upgrade());
         headers.append("transfer-encoding".into(), "Chunked".into());
         assert!(headers.contains_token("transfer-encoding", "chunked"));
+    }
+
+    #[test]
+    fn transfer_coding_parameters_are_not_case_folded_or_split() {
+        let mut headers = Headers::default();
+        headers.append("transfer-encoding".into(), "GZIP, Chunked".into());
+        assert_eq!(headers.transfer_codings(), ["gzip", "chunked"]);
+        let original = "x-dictionary; key=\"A,B\", chunked";
+        headers.set_header("transfer-encoding".into(), original.into());
+        let codings = headers.transfer_codings();
+        assert_eq!(codings, [original]);
+        headers.set_header(
+            "transfer-encoding".into(),
+            "x-dictionary; key=\"A,b\", chunked".into(),
+        );
+        assert_ne!(headers.transfer_codings(), codings);
     }
 
     #[test]

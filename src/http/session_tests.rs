@@ -943,6 +943,8 @@ async fn tls_early_rejection_drains_while_upload_shutdown_is_backpressured() {
 async fn header_patches_cannot_relabel_transfer_codings_or_upgrades() {
     checked(async {
         for (request_headers, request_patch, response, response_patch) in [
+            ("Transfer-Encoding: x-dictionary; key=\"A,B\", chunked\r\n", json!({"overwrite_headers": {"Transfer-Encoding": "x-dictionary; key=\"A,b\", chunked"}}), "", json!({})),
+            ("", json!({}), "HTTP/1.1 200 OK\r\nTransfer-Encoding: x-dictionary; key=\"A,B\", chunked\r\nConnection: close\r\n\r\n0\r\n\r\n", json!({"overwrite_headers": {"Transfer-Encoding": "x-dictionary; key=\"A,b\", chunked"}})),
             ("Transfer-Encoding: chunked\r\n", json!({"overwrite_headers": {"Transfer-Encoding": "gzip, chunked"}}), "", json!({})),
             ("", json!({}), "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\nConnection: close\r\n\r\ncompressed", json!({"remove_headers": ["Transfer-Encoding"]})),
             ("", json!({}), "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n0\r\n\r\n", json!({"overwrite_headers": {"Transfer-Encoding": "gzip, chunked"}})),
