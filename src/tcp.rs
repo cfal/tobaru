@@ -959,7 +959,7 @@ async fn run_stream_action(
             {
                 Ok(s) => s,
                 Err(e) => {
-                    source_stream.try_shutdown().await?;
+                    let _ = source_stream.try_shutdown().await;
                     return Err(e);
                 }
             };
