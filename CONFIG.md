@@ -499,8 +499,9 @@ not change the received body's framing (for example, changing Content-Length or
 removing chunked Transfer-Encoding). Such requests/responses are rejected and the
 connection is closed; body bytes are not rewritten to match a patched length or
 transfer-coding stack. Transfer-Encoding fields with parameters must remain
-unchanged; their quoted values are not normalized. Patches also cannot manufacture or relabel a successful
-protocol upgrade: the original and forwarded handshakes must agree.
+unchanged; their quoted values are not normalized. Patches also cannot manufacture
+or relabel a successful protocol upgrade: the original and forwarded handshakes
+must agree, including the case-sensitive protocol version when present.
 
 Forwarding supports HEAD/bodyless responses, informational responses including
 100 Continue and 103 Early Hints, and close-delimited response bodies. An early

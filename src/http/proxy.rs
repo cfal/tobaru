@@ -26,7 +26,13 @@ impl Upgrade {
             protocols: headers
                 .header_values("upgrade")
                 .flat_map(|value| value.split(','))
-                .map(|value| value.trim().to_ascii_lowercase())
+                .map(|value| {
+                    let value = value.trim();
+                    match value.split_once('/') {
+                        Some((name, version)) => format!("{}/{version}", name.to_ascii_lowercase()),
+                        None => value.to_ascii_lowercase(),
+                    }
+                })
                 .collect(),
         }
     }
@@ -288,5 +294,26 @@ async fn read_response<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         write_head(client, &response).await?;
         client.flush().await?;
         reader = response.into_reader();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::http::header_map::Headers;
+
+    #[test]
+    fn upgrade_names_ignore_case_but_versions_do_not() {
+        let upgrade = |protocol: &str| {
+            let mut headers = Headers::default();
+            headers.append("connection".into(), "upgrade".into());
+            headers.append("upgrade".into(), protocol.into());
+            Upgrade::from_headers(&headers)
+        };
+        let offer = upgrade("CaseProto/V1");
+        assert_eq!(offer.protocols, ["caseproto/V1"]);
+        assert!(offer.accepts(&upgrade("caseproto/V1")));
+        assert!(!offer.accepts(&upgrade("caseproto/v1")));
+        assert!(!offer.accepts(&upgrade("caseproto")));
     }
 }
