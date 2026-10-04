@@ -48,6 +48,22 @@ async fn stop_servers(
     Ok(())
 }
 
+async fn supervise_until<T>(
+    servers: &mut JoinSet<io::Result<()>>,
+    work: impl Future<Output = T>,
+) -> io::Result<T> {
+    tokio::pin!(work);
+    loop {
+        tokio::select! {
+            biased;
+            finished = servers.join_next(), if !servers.is_empty() => {
+                finished.expect("nonempty listener set").map_err(io::Error::other)??;
+            }
+            result = &mut work => return Ok(result),
+        }
+    }
+}
+
 fn relevant_event(event: &Event, paths: &HashSet<PathBuf>) -> bool {
     matches!(
         event.kind,
@@ -190,39 +206,36 @@ pub async fn run(
     let mut stops = start_servers(tasks, &mut servers);
 
     loop {
-        tokio::select! {
-            finished = servers.join_next(), if !servers.is_empty() => {
-                match finished.expect("nonempty listener set") {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => return Err(error),
-                    Err(error) => return Err(io::Error::other(format!("Listener task failed: {error}"))),
-                }
-            }
-            changed = changes.recv() => {
-                if changed.is_none() { return Err(io::Error::other("Config watcher stopped")); }
-                sleep(Duration::from_secs(3)).await;
-                while changes.try_recv().is_ok() {}
-                let replacement = async {
-                    let configs = config::load_server_configs(paths.clone(), urls.clone()).await?;
-                    if configs.is_empty() { return Err(io::Error::other("No server configs found")); }
-                    let firewall = firewall_addresses(&configs);
-                    Ok::<_, io::Error>((prepare(configs).await?, firewall))
-                }.await;
-                let (tasks, new_firewall) = match replacement {
-                    Ok(replacement) => replacement,
-                    Err(error) => {
-                        error!("Config reload rejected; keeping running listeners: {error}");
-                        continue;
-                    }
-                };
-                stop_servers(stops, &mut servers).await?;
-                let stale_rules = firewall.union(&new_firewall).copied().collect();
-                clear_rules(&stale_rules).await?;
-                firewall = new_firewall;
-                stops = start_servers(tasks, &mut servers);
-                info!("Config reload complete");
-            }
+        if supervise_until(&mut servers, changes.recv())
+            .await?
+            .is_none()
+        {
+            return Err(io::Error::other("Config watcher stopped"));
         }
+        let replacement = supervise_until(&mut servers, async {
+            sleep(Duration::from_secs(3)).await;
+            while changes.try_recv().is_ok() {}
+            let configs = config::load_server_configs(paths.clone(), urls.clone()).await?;
+            if configs.is_empty() {
+                return Err(io::Error::other("No server configs found"));
+            }
+            let firewall = firewall_addresses(&configs);
+            Ok::<_, io::Error>((prepare(configs).await?, firewall))
+        })
+        .await?;
+        let (tasks, new_firewall) = match replacement {
+            Ok(replacement) => replacement,
+            Err(error) => {
+                error!("Config reload rejected; keeping running listeners: {error}");
+                continue;
+            }
+        };
+        stop_servers(stops, &mut servers).await?;
+        let stale_rules = firewall.union(&new_firewall).copied().collect();
+        clear_rules(&stale_rules).await?;
+        firewall = new_firewall;
+        stops = start_servers(tasks, &mut servers);
+        info!("Config reload complete");
     }
 }
 
@@ -230,6 +243,36 @@ pub async fn run(
 mod tests {
     use super::*;
     use notify::event::{CreateKind, ModifyKind, RemoveKind};
+
+    #[tokio::test(start_paused = true)]
+    async fn listener_failures_interrupt_reload_work() {
+        for panic in [false, true] {
+            let mut servers = JoinSet::new();
+            servers.spawn(async move {
+                sleep(Duration::from_secs(1)).await;
+                assert!(!panic, "listener panic");
+                Err(io::Error::other("listener failure"))
+            });
+            let start = tokio::time::Instant::now();
+            let result = supervise_until(&mut servers, sleep(Duration::from_secs(3))).await;
+            assert!(result.is_err());
+            assert_eq!(start.elapsed(), Duration::from_secs(1));
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_does_not_discard_completed_listener_errors() {
+        let mut servers = JoinSet::new();
+        servers.spawn(async { Err(io::Error::other("listener failure")) });
+        tokio::task::yield_now().await;
+        assert_eq!(
+            stop_servers(vec![], &mut servers)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "listener failure"
+        );
+    }
 
     #[test]
     fn watch_filter_handles_atomic_save_and_recreation() {
