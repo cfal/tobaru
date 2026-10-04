@@ -10,6 +10,8 @@ mod routing;
 mod string_util;
 
 #[cfg(test)]
+mod idle_tests;
+#[cfg(test)]
 mod session_tests;
 #[cfg(test)]
 mod test_io;
@@ -17,7 +19,7 @@ mod test_io;
 use log::info;
 use radix_trie::Trie;
 use rand::RngExt;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::async_stream::AsyncStream;
 use crate::config::TcpKeepaliveConfig;
@@ -102,6 +104,25 @@ impl<'a> Request<'a> {
 }
 
 impl<'a> Session<'a> {
+    async fn read_request(&mut self) -> std::io::Result<http_parser::ParsedHttpData> {
+        let reader = self
+            .reader
+            .take()
+            .expect("continued session must retain its reader");
+        let request = http_parser::ParsedHttpData::parse(&mut self.stream, reader);
+        tokio::pin!(request);
+        if let Some(target) = &mut self.cached_target {
+            let mut byte = [0];
+            tokio::select! {
+                biased;
+                _ = target.stream.read(&mut byte) => self.cached_target = None,
+                data = &mut request => return data,
+            }
+        }
+        // Preserve partial frontend parsing when an idle backend is retired.
+        request.await
+    }
+
     async fn close_target(&mut self) {
         if let Some(mut target) = self.cached_target.take() {
             let _ = target.stream.try_shutdown().await;
@@ -149,11 +170,7 @@ pub async fn handle_http_stream(
         if iteration > 1 {
             session.stream.flush().await?;
         }
-        let reader = session
-            .reader
-            .take()
-            .expect("continued session must retain its reader");
-        let data = http_parser::ParsedHttpData::parse(&mut session.stream, reader).await?;
+        let data = session.read_request().await?;
         let request = Request::new(
             data,
             format!("{}#{}", stream_id, iteration),

@@ -98,6 +98,21 @@ async fn rest(stream: &mut (impl AsyncRead + Unpin)) -> Vec<u8> {
     data
 }
 
+async fn assert_retired(stream: &mut (impl AsyncRead + Unpin)) {
+    let mut bytes = Vec::new();
+    let result = stream.read_to_end(&mut bytes).await;
+    assert!(bytes.is_empty(), "retired backend received another request");
+    if let Err(error) = result {
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::UnexpectedEof
+            ),
+            "{error}"
+        );
+    }
+}
+
 struct Files(PathBuf);
 
 impl Files {
@@ -819,44 +834,123 @@ async fn surplus_after_a_final_response_is_never_reused() {
 #[tokio::test]
 async fn surplus_beyond_the_reader_buffer_is_not_reused() {
     checked(async {
-        let (listener, address) = backend().await;
-        let mut upstream = Task(tokio::spawn(async move {
-            let (mut first, _) = listener.accept().await.unwrap();
-            head(&mut first).await;
-            let mut response = b"HTTP/1.1 200 OK\r\nContent-Length: 32726\r\n\r\n".to_vec();
-            response.extend(vec![b'A'; 32726]);
-            assert_eq!(response.len(), 32768);
-            response.extend_from_slice(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nFAKE");
-            first.write_all(&response).await.unwrap();
-            assert!(rest(&mut first).await.is_empty());
-            let (mut second, _) = listener.accept().await.unwrap();
-            head(&mut second).await;
-            second
+        for total in [32767, 32768, 32769, 65536, 65537] {
+            let length = total - b"HTTP/1.1 200 OK\r\nContent-Length: 00000\r\n\r\n".len();
+            let (listener, address) = backend().await;
+            let mut upstream =
+                Task(tokio::spawn(async move {
+                    let (mut first, _) = listener.accept().await.unwrap();
+                    head(&mut first).await;
+                    let mut response =
+                        format!("HTTP/1.1 200 OK\r\nContent-Length: {length}\r\n\r\n").into_bytes();
+                    response.extend(vec![b'A'; length]);
+                    assert_eq!(response.len(), total);
+                    response.extend_from_slice(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nFAKE");
+                    first.write_all(&response).await.unwrap();
+                    assert_retired(&mut first).await;
+                    let (mut second, _) = listener.accept().await.unwrap();
+                    head(&mut second).await;
+                    second
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nREAL")
                 .await
                 .unwrap();
-        }));
-        let (mut client, _task) = session(forward(address), Trie::new(), None);
-        client
-            .write_all(b"GET /first HTTP/1.1\r\nHost: a.test\r\n\r\n")
-            .await
-            .unwrap();
-        head(&mut client).await;
-        let mut body = vec![0; 32726];
-        client.read_exact(&mut body).await.unwrap();
-        assert_eq!(body, vec![b'A'; 32726]);
-        client
-            .write_all(b"GET /second HTTP/1.1\r\nHost: a.test\r\n\r\n")
-            .await
-            .unwrap();
-        head(&mut client).await;
-        let mut second_body = [0; 4];
-        client.read_exact(&mut second_body).await.unwrap();
-        assert_eq!(&second_body, b"REAL");
-        assert!(rest(&mut client).await.is_empty());
-        (&mut upstream.0).await.unwrap();
+                }));
+            let (mut client, _task) = session(forward(address), Trie::new(), None);
+            client
+                .write_all(b"GET /first HTTP/1.1\r\nHost: a.test\r\n\r\n")
+                .await
+                .unwrap();
+            head(&mut client).await;
+            let mut body = vec![0; length];
+            client.read_exact(&mut body).await.unwrap();
+            assert_eq!(body, vec![b'A'; length]);
+            client
+                .write_all(b"GET /second HTTP/1.1\r\nHost: a.test\r\n\r\n")
+                .await
+                .unwrap();
+            head(&mut client).await;
+            let mut second_body = [0; 4];
+            client.read_exact(&mut second_body).await.unwrap();
+            assert_eq!(&second_body, b"REAL");
+            assert!(rest(&mut client).await.is_empty());
+            (&mut upstream.0).await.unwrap();
+        }
     })
     .await;
+}
+
+#[tokio::test]
+async fn idle_data_and_closure_retire_tcp_unix_and_tls_backends_before_the_next_head() {
+    checked(async {
+        use crate::rustls_util::{create_server_config, load_certs, load_private_key};
+        use std::sync::Arc;
+        let files = Files::new();
+        let identity = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(create_server_config(
+            load_certs(identity.cert.pem().as_bytes()),
+            &load_private_key(identity.signing_key.serialize_pem().as_bytes()),
+            vec![b"http/1.1".to_vec()], &[], &[],
+        )));
+        for transport in ["tcp", "unix", "tls"] {
+            for send_data in [false, true] {
+                let (tcp, address) = backend().await;
+                let path = files.0.join(format!("{transport}-{send_data}.sock"));
+                let unix = tokio::net::UnixListener::bind(&path).unwrap();
+                let acceptor = acceptor.clone();
+                let (start, started) = tokio::sync::oneshot::channel();
+                let (retired, retirement) = tokio::sync::oneshot::channel();
+                let mut upstream = Task(tokio::spawn(async move {
+                    let connect = || async {
+                        let stream: Box<dyn WireStream> = if transport == "unix" {
+                            Box::new(unix.accept().await.unwrap().0)
+                        } else { Box::new(tcp.accept().await.unwrap().0) };
+                        if transport == "tls" {
+                            Box::new(acceptor.accept(stream).await.unwrap()) as Box<dyn WireStream>
+                        } else { stream }
+                    };
+                    let mut first = connect().await;
+                    assert!(head(&mut first).await.starts_with("GET /first "));
+                    first.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nA").await.unwrap();
+                    first.flush().await.unwrap();
+                    started.await.unwrap();
+                    if send_data {
+                        first.write_all(b"unsolicited").await.unwrap();
+                        first.flush().await.unwrap();
+                    } else {
+                        first.shutdown().await.unwrap();
+                    }
+                    assert_retired(&mut first).await;
+                    retired.send(()).unwrap();
+                    let mut second = connect().await;
+                    let request = head(&mut second).await;
+                    assert!(request.starts_with("POST /second HTTP/1.1\r\n"));
+                    assert_eq!(values(&request, "content-length"), ["3"]);
+                    let mut body = [0; 3];
+                    second.read_exact(&mut body).await.unwrap();
+                    assert_eq!(&body, b"abc");
+                    second.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\nB").await.unwrap();
+                    second.shutdown().await.unwrap();
+                }));
+                let location = match transport {
+                    "unix" => json!({"path": path}),
+                    "tls" => json!({"address": address.to_string(), "client_tls": {"verify": false, "sni": "localhost"}}),
+                    _ => json!({"address": address.to_string()}),
+                };
+                let (mut client, mut proxy) = session(action(json!({"type": "forward", "location": location})), Trie::new(), None);
+                client.write_all(b"GET /first HTTP/1.1\r\nHost: a.test\r\n\r\n").await.unwrap();
+                head(&mut client).await;
+                assert_eq!(client.read_u8().await.unwrap(), b'A');
+                client.write_all(b"POST /second HTTP/1.1\r\nHos").await.unwrap();
+                start.send(()).unwrap();
+                retirement.await.unwrap();
+                client.write_all(b"t: a.test\r\nContent-Length: 3\r\n\r\nabc").await.unwrap();
+                head(&mut client).await;
+                assert_eq!(rest(&mut client).await, b"B");
+                (&mut proxy.0).await.unwrap().unwrap();
+                (&mut upstream.0).await.unwrap();
+            }
+        }
+    }).await;
 }
 
 #[tokio::test]
