@@ -115,10 +115,7 @@ pub async fn run_udp_server(
     ));
 
     loop {
-        let (len, addr) = server_socket
-            .recv_from(&mut buf)
-            .await
-            .expect("Could not read from server socket");
+        let (len, addr) = server_socket.recv_from(&mut buf).await?;
 
         let ip = match addr.ip() {
             IpAddr::V4(a) => a.to_ipv6_mapped(),
@@ -286,8 +283,12 @@ async fn run_forward_tasks(
     rx: Receiver<Box<[u8]>>,
 ) -> std::io::Result<()> {
     let forward_addr = resolve_host((target_address.address.as_str(), target_address.port)).await?;
-    // TODO: bind to local interface only if forwarding to one.
-    let forward_socket = UdpSocket::bind("0.0.0.0:0").await.map(Arc::new)?;
+    let bind_address = if forward_addr.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
+    let forward_socket = UdpSocket::bind(bind_address).await.map(Arc::new)?;
     forward_socket.connect(forward_addr).await?;
 
     join!(
@@ -295,4 +296,54 @@ async fn run_forward_tasks(
         run_forward_from_target_task(forward_socket, server_socket, client_address, last_active)
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn associations_relay_to_ipv4_and_ipv6_targets() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for bind_address in ["0.0.0.0:0", "[::]:0"] {
+                let backend = UdpSocket::bind(bind_address).await.unwrap();
+                let bound = backend.local_addr().unwrap();
+                let upstream = SocketAddr::new(
+                    if bound.is_ipv4() {
+                        "127.0.0.1".parse().unwrap()
+                    } else {
+                        "::1".parse().unwrap()
+                    },
+                    bound.port(),
+                );
+                let server = Arc::new(UdpSocket::bind("0.0.0.0:0").await.unwrap());
+                let client = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+                let client_address = SocketAddr::new(
+                    "127.0.0.1".parse().unwrap(),
+                    client.local_addr().unwrap().port(),
+                );
+                let (tx, rx) = channel(1);
+                let task = TaskDropGuard(tokio::spawn(run_forward_tasks(
+                    client_address,
+                    server,
+                    NetLocation::try_from(upstream.to_string().as_str()).unwrap(),
+                    Arc::new(AtomicU32::new(get_timestamp_secs())),
+                    rx,
+                )));
+                tx.send(b"request".to_vec().into_boxed_slice())
+                    .await
+                    .unwrap();
+                let mut bytes = [0; 32];
+                let (length, peer) = backend.recv_from(&mut bytes).await.unwrap();
+                assert_eq!(&bytes[..length], b"request");
+                assert_eq!(peer.is_ipv4(), bound.is_ipv4());
+                backend.send_to(b"response", peer).await.unwrap();
+                let length = client.recv(&mut bytes).await.unwrap();
+                assert_eq!(&bytes[..length], b"response");
+                drop(task);
+            }
+        })
+        .await
+        .expect("UDP relay timed out");
+    }
 }
