@@ -323,3 +323,57 @@ async fn close_action_and_local_expect_rejection() {
         assert!(rest(&mut client).await.is_empty());
     }).await;
 }
+
+#[tokio::test]
+async fn same_prefix_host_actions_and_default_use_the_selected_backend() {
+    checked(async {
+        for use_default in [false, true] {
+            let (a, address_a) = backend().await;
+            let (b, address_b) = backend().await;
+            let mut server_a = Task(tokio::spawn(async move {
+                let (mut stream, _) = a.accept().await.unwrap();
+                let request = head(&mut stream).await;
+                assert_eq!(values(&request, "host"), ["a.test"]);
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nA")
+                    .await
+                    .unwrap();
+                assert!(rest(&mut stream).await.is_empty());
+            }));
+            let mut server_b = Task(tokio::spawn(async move {
+                let (mut stream, _) = b.accept().await.unwrap();
+                let request = head(&mut stream).await;
+                assert_eq!(values(&request, "host"), ["b.test"]);
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\nB",
+                    )
+                    .await
+                    .unwrap();
+            }));
+            let mut paths = Trie::new();
+            let mut first = route(forward(address_a));
+            first
+                .required_request_headers
+                .insert("host".into(), HttpValueMatch::Single("a.test".into()));
+            let mut alternatives = vec![first];
+            if !use_default {
+                alternatives.push(route(forward(address_b)));
+            }
+            paths.insert("/".into(), alternatives);
+            let (mut client, _task) = session(forward(address_b), paths, None);
+            for (host, expected) in [("a.test", b'A'), ("b.test", b'B')] {
+                client
+                    .write_all(format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
+                    .await
+                    .unwrap();
+                head(&mut client).await;
+                assert_eq!(client.read_u8().await.unwrap(), expected);
+            }
+            assert!(rest(&mut client).await.is_empty());
+            (&mut server_a.0).await.unwrap();
+            (&mut server_b.0).await.unwrap();
+        }
+    })
+    .await;
+}

@@ -9,8 +9,8 @@ use crate::util::write_all;
 use log::{error, info};
 use tokio::io::AsyncWriteExt;
 
-impl Session<'_> {
-    pub(super) async fn forward(&mut self, request: Request<'_>) -> std::io::Result<Outcome> {
+impl<'a> Session<'a> {
+    pub(super) async fn forward(&mut self, request: Request<'a>) -> std::io::Result<Outcome> {
         let Self {
             stream,
             cached_target,
@@ -48,7 +48,8 @@ impl Session<'_> {
         }
 
         let mut target_stream = match cached_target.take() {
-            Some(t) if t.base_path == base_path => t.stream,
+            // Actions live in the immutable configuration retained by this session.
+            Some(t) if std::ptr::eq(t.action, path_action) => t.stream,
             no_match => {
                 if let Some(mut t) = no_match {
                     let _ = t.stream.try_shutdown().await;
@@ -120,7 +121,7 @@ impl Session<'_> {
 
             if !expectation_success {
                 *cached_target = Some(CachedTarget {
-                    base_path: base_path.to_string(),
+                    action: path_action,
                     stream: target_stream,
                 });
                 return Ok(Outcome::Continue);
@@ -181,7 +182,7 @@ impl Session<'_> {
         }
 
         *cached_target = Some(CachedTarget {
-            base_path: base_path.to_string(),
+            action: path_action,
             stream: target_stream,
         });
 

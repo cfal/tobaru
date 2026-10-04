@@ -23,14 +23,14 @@ use crate::copy_bidirectional::copy_bidirectional;
 use crate::tcp::{TargetHttpActionData, TargetHttpPathData};
 use routing::find_matching_action;
 
-struct CachedTarget {
-    base_path: String,
+struct CachedTarget<'a> {
+    action: &'a TargetHttpActionData,
     stream: Box<dyn AsyncStream>,
 }
 
 struct Session<'a> {
     stream: Box<dyn AsyncStream>,
-    cached_target: Option<CachedTarget>,
+    cached_target: Option<CachedTarget<'a>>,
     addr: &'a std::net::SocketAddr,
     tcp_nodelay: bool,
     tcp_keepalive: Option<TcpKeepaliveConfig>,
@@ -105,14 +105,14 @@ impl<'a> Request<'a> {
     }
 }
 
-impl Session<'_> {
+impl<'a> Session<'a> {
     async fn close_target(&mut self) {
         if let Some(mut target) = self.cached_target.take() {
             let _ = target.stream.try_shutdown().await;
         }
     }
 
-    async fn dispatch(&mut self, request: Request<'_>) -> std::io::Result<Outcome> {
+    async fn dispatch(&mut self, request: Request<'a>) -> std::io::Result<Outcome> {
         match request.action {
             TargetHttpActionData::CloseConnection => {
                 info!("[http] {} {} [close]", request.verb, request.path);
