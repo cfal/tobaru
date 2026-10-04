@@ -819,6 +819,36 @@ async fn early_eof_delimited_rejection_receives_request_eof() {
 }
 
 trait WireStream: AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+
+#[tokio::test]
+async fn header_patches_cannot_relabel_transfer_codings_or_upgrades() {
+    checked(async {
+        for (request_headers, request_patch, response, response_patch) in [
+            ("Transfer-Encoding: chunked\r\n", json!({"overwrite_headers": {"Transfer-Encoding": "gzip, chunked"}}), "", json!({})),
+            ("", json!({}), "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\nConnection: close\r\n\r\ncompressed", json!({"remove_headers": ["Transfer-Encoding"]})),
+            ("", json!({}), "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n0\r\n\r\n", json!({"overwrite_headers": {"Transfer-Encoding": "gzip, chunked"}})),
+            ("", json!({"overwrite_headers": {"Connection": "Upgrade", "Upgrade": "websocket"}}), "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\nFRAME", json!({})),
+            ("Connection: Upgrade\r\nUpgrade: websocket\r\n", json!({}), "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: h2c\r\n\r\nFRAME", json!({"overwrite_headers": {"Upgrade": "websocket"}})),
+            ("Connection: Upgrade\r\nUpgrade: websocket\r\n", json!({}), "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\nFRAME", json!({"overwrite_headers": {"Connection": "Upgrade"}})),
+            ("Connection: Upgrade\r\nUpgrade: websocket\r\n", json!({"overwrite_headers": {"Upgrade": "h2c"}}), "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: h2c\r\n\r\nFRAME", json!({})),
+        ] {
+            let (listener, address) = backend().await;
+            let mut upstream = Task(tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                head(&mut stream).await;
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }));
+            let default = action(json!({"type": "forward", "location": address.to_string(), "request_header_patch": request_patch, "response_header_patch": response_patch}));
+            let (mut client, mut task) = session(default, Trie::new(), None);
+            client.write_all(format!("GET / HTTP/1.1\r\nHost: a.test\r\n{request_headers}\r\n").as_bytes()).await.unwrap();
+            assert!(rest(&mut client).await.is_empty());
+            assert!((&mut task.0).await.unwrap().is_err());
+            if !response.is_empty() {
+                (&mut upstream.0).await.unwrap();
+            }
+        }
+    }).await;
+}
 impl<T: AsyncRead + tokio::io::AsyncWrite + Unpin + Send> WireStream for T {}
 
 #[tokio::test]

@@ -45,6 +45,21 @@ pub trait HeaderMap {
         })
     }
 
+    fn transfer_codings(&self) -> Vec<String> {
+        self.header_values("transfer-encoding")
+            .flat_map(|value| value.split(','))
+            .map(|coding| {
+                let coding = coding.trim();
+                match coding.split_once(';') {
+                    Some((name, parameters)) => {
+                        format!("{};{}", name.trim().to_ascii_lowercase(), parameters)
+                    }
+                    None => coding.to_ascii_lowercase(),
+                }
+            })
+            .collect()
+    }
+
     fn content_length(&self) -> std::io::Result<Option<usize>> {
         let mut length = None;
         for value in self

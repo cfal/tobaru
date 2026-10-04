@@ -11,6 +11,35 @@ use super::{string_util, CachedTarget, Outcome, Request, Session};
 use crate::async_stream::AsyncStream;
 use crate::tcp::{setup_target_stream, TargetHttpActionData};
 
+#[derive(PartialEq, Eq)]
+struct Upgrade {
+    enabled: bool,
+    protocols: Vec<String>,
+}
+
+impl Upgrade {
+    fn from_headers(headers: &impl HeaderMap) -> Self {
+        Self {
+            enabled: headers.websocket_upgrade(),
+            protocols: headers
+                .header_values("upgrade")
+                .flat_map(|value| value.split(','))
+                .map(|value| value.trim().to_ascii_lowercase())
+                .collect(),
+        }
+    }
+
+    fn accepts(&self, selected: &Self) -> bool {
+        self.enabled
+            && selected.enabled
+            && !selected.protocols.is_empty()
+            && selected
+                .protocols
+                .iter()
+                .all(|protocol| !protocol.is_empty() && self.protocols.contains(protocol))
+    }
+}
+
 impl<'a> Session<'a> {
     async fn target_for(
         &mut self,
@@ -66,6 +95,8 @@ impl<'a> Session<'a> {
         };
 
         let request_body = request_framing(request.data.headers())?;
+        let request_codings = request.data.headers().transfer_codings();
+        let client_upgrade = Upgrade::from_headers(request.data.headers());
         let client_close = request.data.headers().connection_close();
         if let Some(path) = replacement_path {
             let path = string_util::update_base_path(&request.path, request.base_path, path);
@@ -83,21 +114,17 @@ impl<'a> Session<'a> {
                 .headers_mut()
                 .insert(name.clone(), request.id.clone());
         }
-        if request_framing(request.data.headers())? != request_body {
+        if request_framing(request.data.headers())? != request_body
+            || (request_body != Framing::Empty
+                && request.data.headers().transfer_codings() != request_codings)
+        {
             return Err(io::Error::other(
                 "Request header patch changes body framing",
             ));
         }
         request.data.headers().expect_100()?;
         let client_close = client_close || request.data.headers().connection_close();
-        let upgrade = request.data.headers().websocket_upgrade();
-        let offered: Vec<String> = request
-            .data
-            .headers()
-            .header_values("upgrade")
-            .flat_map(|value| value.split(','))
-            .map(|value| value.trim().to_owned())
-            .collect();
+        let forwarded_upgrade = Upgrade::from_headers(request.data.headers());
 
         let mut target = self.target_for(request.action).await?;
         write_head(&mut target.stream, &request.data).await?;
@@ -119,6 +146,8 @@ impl<'a> Session<'a> {
         }
         let status = response.response_status()?;
         let response_body = response_framing(response.headers(), &request.verb, status)?;
+        let response_codings = response.headers().transfer_codings();
+        let upstream_upgrade = Upgrade::from_headers(response.headers());
         let upstream_close = response.headers().connection_close()
             || (response.first_line().starts_with("HTTP/1.0 ")
                 && !response
@@ -134,30 +163,22 @@ impl<'a> Session<'a> {
         response
             .headers_mut()
             .update_path_headers(request.base_path, replacement_path);
-        if response_framing(response.headers(), &request.verb, status)? != response_body {
+        if response_framing(response.headers(), &request.verb, status)? != response_body
+            || (response_body != Framing::Empty
+                && response.headers().transfer_codings() != response_codings)
+        {
             return Err(io::Error::other(
                 "Response header patch changes body framing",
             ));
         }
 
         if status == 101 {
-            let selected: Vec<_> = response
-                .headers()
-                .header_values("upgrade")
-                .flat_map(|value| value.split(','))
-                .map(str::trim)
-                .collect();
-            if !upgrade
-                || request.verb == "HEAD"
+            let returned_upgrade = Upgrade::from_headers(response.headers());
+            if request.verb == "HEAD"
                 || !upload_complete
-                || !response.headers().websocket_upgrade()
-                || selected.is_empty()
-                || selected.iter().any(|value| {
-                    value.is_empty()
-                        || !offered
-                            .iter()
-                            .any(|offer| offer.eq_ignore_ascii_case(value))
-                })
+                || client_upgrade != forwarded_upgrade
+                || upstream_upgrade != returned_upgrade
+                || !client_upgrade.accepts(&upstream_upgrade)
             {
                 return Err(io::Error::other("Invalid upstream protocol upgrade"));
             }
