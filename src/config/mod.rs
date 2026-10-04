@@ -805,6 +805,9 @@ pub struct ServerTlsConfig {
     #[serde(default)]
     pub mode: TlsMode,
 
+    #[serde(default)]
+    pub handshake_timeout_secs: Option<std::num::NonZeroU64>,
+
     #[serde(default, alias = "sni_hostname")]
     pub sni_hostnames: NoneOrSome<SniValue>,
 
@@ -848,6 +851,9 @@ impl ServerTlsConfig {
         // Note: optional flag is now handled by auto-expansion in load_server_configs
         // so we don't validate it here
 
+        if self.is_passthrough() && self.handshake_timeout_secs.is_some() {
+            return Err("handshake_timeout_secs requires TLS terminate mode".into());
+        }
         if self.is_terminate() {
             if self.cert.is_none() || self.key.is_none() {
                 return Err("cert and key are required for TLS terminate mode".to_string());

@@ -160,4 +160,24 @@ mod tests {
             serde_json::from_value(json!({"default_http_action":"close"})).unwrap();
         assert!(config.http_timeouts.request_header_timeout_secs.is_none());
     }
+
+    #[test]
+    fn handshake_timeout_is_positive_and_only_applies_to_termination() {
+        use super::super::ServerTlsConfig;
+        assert!(
+            serde_json::from_value::<ServerTlsConfig>(json!({"handshake_timeout_secs":0})).is_err()
+        );
+        let config: ServerTlsConfig =
+            serde_json::from_value(json!({"mode":"passthrough", "handshake_timeout_secs":1}))
+                .unwrap();
+        assert!(config.validate().is_err());
+        let config: ServerTlsConfig = serde_json::from_value(
+            json!({"cert":"cert.pem", "key":"key.pem", "handshake_timeout_secs":1}),
+        )
+        .unwrap();
+        assert!(config.validate().is_ok());
+        let config: ServerTlsConfig =
+            serde_json::from_value(json!({"mode":"passthrough"})).unwrap();
+        assert!(config.handshake_timeout_secs.is_none());
+    }
 }

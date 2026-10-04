@@ -211,6 +211,7 @@ enum TlsMode {
 }
 
 struct TlsTargetData {
+    pub handshake_timeout_secs: Option<std::num::NonZeroU64>,
     pub allow_no_alpn: bool,
     pub allow_any_alpn: bool,
     pub alpn_protocol_hashes: HashSet<u64>,
@@ -442,6 +443,7 @@ pub async fn prepare_tcp_server(
 
                 // Create unified TlsTargetData
                 let tls_target_data = Arc::new(TlsTargetData {
+                    handshake_timeout_secs: tls_config.handshake_timeout_secs,
                     allow_no_alpn,
                     allow_any_alpn,
                     alpn_protocol_hashes,
@@ -718,7 +720,14 @@ async fn handle_terminate_with_parsed(
         accept_future
     };
 
-    let tls_stream = Box::new(accept_future.await?);
+    let tls_stream = Box::new(
+        crate::tokio_util::with_timeout(
+            target_data.handshake_timeout_secs,
+            "TLS handshake",
+            accept_future,
+        )
+        .await?,
+    );
 
     debug!("Completed TLS handshake for {}", addr);
 
@@ -1088,5 +1097,65 @@ pub async fn setup_target_stream(
 
             maybe_wrap_tls(unix_stream, target_location, None).await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn termination_times_out_when_the_peer_stops_after_client_hello() {
+        let identity = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let tls_config = Arc::new(
+            create_server_config(
+                load_certs(identity.cert.pem().as_bytes()).unwrap(),
+                &load_private_key(identity.signing_key.serialize_pem().as_bytes()).unwrap(),
+                vec![],
+                &[],
+                &[],
+            )
+            .unwrap(),
+        );
+        let client_config =
+            crate::rustls_util::create_client_config_with_cert(false, None, vec![], true, vec![])
+                .unwrap();
+        let mut client_tls = rustls::ClientConnection::new(
+            client_config,
+            rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+        )
+        .unwrap();
+        let mut hello = Vec::new();
+        client_tls.write_tls(&mut hello).unwrap();
+        let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let address: SocketAddr = ([127, 0, 0, 1], listener.local_addr().unwrap().port()).into();
+        let (client, accepted) = tokio::join!(TcpStream::connect(address), listener.accept());
+        let _client = client.unwrap();
+        let (server, peer) = accepted.unwrap();
+        let target = Arc::new(TlsTargetData {
+            handshake_timeout_secs: std::num::NonZeroU64::new(1),
+            allow_no_alpn: true,
+            allow_any_alpn: true,
+            alpn_protocol_hashes: HashSet::new(),
+            ip_lookup_table: IpLookupTable::new(),
+            tls_mode: TlsMode::Terminate {
+                alpn_tls_config: tls_config.clone(),
+                no_alpn_tls_config: tls_config.clone(),
+            },
+            target_data: Arc::new(TargetData {
+                tcp_nodelay: true,
+                tcp_keepalive: None,
+                action_data: TargetActionData::Raw {
+                    location_data: vec![],
+                    next_address_index: AtomicUsize::new(0),
+                },
+            }),
+        });
+        let error = handle_terminate_with_parsed(server, &peer, hello, target, tls_config)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(error.to_string(), "TLS handshake timed out");
     }
 }

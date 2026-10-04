@@ -9,7 +9,9 @@ pub async fn with_timeout<T>(
         Some(seconds) => {
             let deadline = tokio::time::Instant::now()
                 .checked_add(std::time::Duration::from_secs(seconds.get()))
-                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "Timeout is too large"))?;
+                .ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "Timeout is too large")
+                })?;
             tokio::time::timeout_at(deadline, future)
                 .await
                 .map_err(|_| {

@@ -266,6 +266,21 @@ Matching priority: exact match > deepest wildcard > shallower wildcard.
 
 Hostnames are case-insensitive. Trailing dots are stripped.
 
+### TLS Handshake Timeout
+
+TLS termination accepts an optional positive `server_tls.handshake_timeout_secs`.
+It bounds handshake completion after ClientHello routing, independently of the
+existing ClientHello read timeout. Omitted or `null` disables the additional
+deadline. It is invalid for passthrough, where the backend owns the handshake.
+Terminated TLS does not accept 0-RTT early data.
+
+```yaml
+server_tls:
+  cert: server.crt
+  key: server.key
+  handshake_timeout_secs: 10
+```
+
 ### ALPN Protocol Matching
 
 In passthrough mode, ALPN protocols from the ClientHello are matched against the configured list. In terminate mode, the configured protocols are advertised in the ServerHello.
