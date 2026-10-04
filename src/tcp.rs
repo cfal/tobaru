@@ -109,7 +109,7 @@ pub enum TargetActionData {
         next_address_index: AtomicUsize,
     },
     Http {
-        path_configs: Trie<String, Vec<TargetHttpPathData>>,
+        path_configs: Box<Trie<String, Vec<TargetHttpPathData>>>,
         default_http_action: TargetHttpActionData,
     },
 }
@@ -141,8 +141,8 @@ pub enum TargetHttpActionData {
         // replacement paths are best effort - it's entirely possible that absolute paths are specified
         // in the returned content and it would break.
         replacement_path: Option<String>,
-        request_header_patch: Option<HttpHeaderPatch>,
-        response_header_patch: Option<HttpHeaderPatch>,
+        request_header_patch: Option<Box<HttpHeaderPatch>>,
+        response_header_patch: Option<Box<HttpHeaderPatch>>,
         request_id_header_name: Option<String>,
         response_id_header_name: Option<String>,
     },
@@ -347,7 +347,7 @@ pub async fn run_tcp_server(
                     path_configs.insert(path, path_data_vec);
                 }
                 TargetActionData::Http {
-                    path_configs,
+                    path_configs: Box::new(path_configs),
                     default_http_action: default_http_action.into(),
                 }
             }
@@ -483,7 +483,7 @@ pub async fn run_tcp_server(
             }
         }
 
-        iptable_masks.extend(allowlist.into_iter());
+        iptable_masks.extend(allowlist);
     }
 
     if use_iptables {
@@ -791,7 +791,7 @@ async fn handle_passthrough_stream(
         "Forwarded ClientHello ({} bytes) from {} to {}",
         client_hello_frame.len(),
         addr,
-        &target_location.location,
+        target_location.location,
     );
 
     // Flush target_stream (contains ClientHello) before starting bidirectional copy
@@ -805,7 +805,7 @@ async fn handle_passthrough_stream(
 
     debug!(
         "Passthrough finished: {} to {}",
-        addr, &target_location.location
+        addr, target_location.location
     );
 
     copy_result.map(|_| ())
@@ -951,11 +951,11 @@ async fn run_stream_action(
                     "Forwarded initial data ({} bytes) from {} to {}",
                     data.len(),
                     addr,
-                    &target_location.location,
+                    target_location.location,
                 );
             }
 
-            debug!("Copying: {} to {}", addr, &target_location.location,);
+            debug!("Copying: {} to {}", addr, target_location.location,);
 
             let copy_result = copy_bidirectional(
                 &mut source_stream,
@@ -965,11 +965,11 @@ async fn run_stream_action(
             )
             .await;
 
-            debug!("Shutdown: {} to {}", addr, &target_location.location,);
+            debug!("Shutdown: {} to {}", addr, target_location.location,);
 
             let (_, _) = join!(source_stream.try_shutdown(), target_stream.try_shutdown());
 
-            debug!("Done: {} to {}", addr, &target_location.location,);
+            debug!("Done: {} to {}", addr, target_location.location,);
 
             copy_result?;
 

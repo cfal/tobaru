@@ -299,6 +299,7 @@ impl ChunkTransfer {
         self.state == ChunkTransferState::Done
     }
 
+    #[cfg(test)]
     pub fn trailer_headers(&mut self) -> &mut HashMap<String, String> {
         &mut self.trailer_headers
     }
@@ -374,10 +375,10 @@ mod tests {
                 // If already done and there's more data, it might be an error depending on protocol
                 // The `run` method itself handles data after Done *within* a single call.
                 // This simulates receiving more data *after* completion.
-                final_result = Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Extra data fragment {} received after completion", i),
-                ));
+                final_result = Err(std::io::Error::other(format!(
+                    "Extra data fragment {} received after completion",
+                    i
+                )));
                 break;
             }
 

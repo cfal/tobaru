@@ -10,7 +10,7 @@ pub trait HeaderMap {
     fn expect_100(&self) -> std::io::Result<bool>;
     fn websocket_upgrade(&self) -> bool;
     fn append_headers_to_string(&self, s: &mut String);
-    fn patch_headers(&mut self, header_patch: &Option<HttpHeaderPatch>);
+    fn patch_headers(&mut self, header_patch: Option<&HttpHeaderPatch>);
     fn update_path_headers(&mut self, base_path: &str, replacement_base_path: &Option<String>);
 }
 
@@ -85,7 +85,7 @@ impl HeaderMap for HashMap<String, String> {
         }
     }
 
-    fn patch_headers(&mut self, header_patch: &Option<HttpHeaderPatch>) {
+    fn patch_headers(&mut self, header_patch: Option<&HttpHeaderPatch>) {
         if let Some(patch) = header_patch {
             for key in patch.remove_headers.iter() {
                 let _ = self.remove(key);
@@ -99,6 +99,79 @@ impl HeaderMap for HashMap<String, String> {
                 }
                 let _ = self.insert(key.to_string(), value.to_string());
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::HttpPathAction;
+    use crate::tcp::TargetHttpActionData;
+
+    #[test]
+    fn forward_header_patches_survive_config_conversion() {
+        let config: HttpPathAction = serde_yaml::from_str(
+            "type: forward
+location: 127.0.0.1:9001
+request_header_patch:
+  remove_headers: [x-remove]
+  overwrite_headers: {x-existing: overwritten}
+  default_headers: {x-existing: ignored, x-default: added}
+response_header_patch:
+  overwrite_headers: {x-response: replaced}
+",
+        )
+        .unwrap();
+        let TargetHttpActionData::Forward {
+            request_header_patch,
+            response_header_patch,
+            ..
+        } = config.into()
+        else {
+            panic!("expected forwarding action");
+        };
+        let mut request = HashMap::from([
+            ("x-remove".to_owned(), "removed".to_owned()),
+            ("x-existing".to_owned(), "original".to_owned()),
+        ]);
+        request.patch_headers(request_header_patch.as_deref());
+        assert_eq!(
+            request,
+            HashMap::from([
+                ("x-existing".to_owned(), "overwritten".to_owned()),
+                ("x-default".to_owned(), "added".to_owned()),
+            ])
+        );
+        let mut response = HashMap::new();
+        response.patch_headers(response_header_patch.as_deref());
+        assert_eq!(response["x-response"], "replaced");
+    }
+
+    #[test]
+    fn absent_forward_header_patches_leave_headers_unchanged() {
+        for extra in [
+            "",
+            "request_header_patch: null\nresponse_header_patch: null\n",
+        ] {
+            let config: HttpPathAction =
+                serde_yaml::from_str(&format!("type: forward\nlocation: 127.0.0.1:9001\n{extra}"))
+                    .unwrap();
+            let TargetHttpActionData::Forward {
+                request_header_patch,
+                response_header_patch,
+                ..
+            } = config.into()
+            else {
+                panic!("expected forwarding action");
+            };
+            assert!(request_header_patch.is_none());
+            assert!(response_header_patch.is_none());
+            let original = HashMap::from([("x-existing".to_owned(), "original".to_owned())]);
+            let mut headers = original.clone();
+            headers.patch_headers(request_header_patch.as_deref());
+            headers.patch_headers(response_header_patch.as_deref());
+            assert_eq!(headers, original);
         }
     }
 }

@@ -62,16 +62,24 @@ pub fn validate_sni_hostname(hostname: &str) -> std::io::Result<()> {
     }
     // RFC 6066: SNI must be ASCII (IDN hostnames use punycode).
     if !hostname.is_ascii() {
-        return Err(std::io::Error::other("SNI hostname contains non-ASCII bytes"));
+        return Err(std::io::Error::other(
+            "SNI hostname contains non-ASCII bytes",
+        ));
     }
     if hostname.bytes().any(|b| b.is_ascii_control()) {
-        return Err(std::io::Error::other("SNI hostname contains control characters"));
+        return Err(std::io::Error::other(
+            "SNI hostname contains control characters",
+        ));
     }
     if hostname.parse::<std::net::IpAddr>().is_ok() {
-        return Err(std::io::Error::other("SNI hostname is an IP address literal"));
+        return Err(std::io::Error::other(
+            "SNI hostname is an IP address literal",
+        ));
     }
     if hostname.starts_with('[') {
-        return Err(std::io::Error::other("SNI hostname is a bracketed IP literal"));
+        return Err(std::io::Error::other(
+            "SNI hostname is a bracketed IP literal",
+        ));
     }
     Ok(())
 }
@@ -126,25 +134,39 @@ pub fn validate_host_header(hostname: &str) -> std::io::Result<()> {
         return Err(std::io::Error::other("empty Host header hostname"));
     }
     if hostname.len() > 253 {
-        return Err(std::io::Error::other("Host header hostname exceeds 253 bytes"));
+        return Err(std::io::Error::other(
+            "Host header hostname exceeds 253 bytes",
+        ));
     }
     if hostname.ends_with('.') {
-        return Err(std::io::Error::other("Host header hostname has trailing dot"));
+        return Err(std::io::Error::other(
+            "Host header hostname has trailing dot",
+        ));
     }
     if hostname.starts_with('.') {
-        return Err(std::io::Error::other("Host header hostname has leading dot"));
+        return Err(std::io::Error::other(
+            "Host header hostname has leading dot",
+        ));
     }
     if hostname.contains("..") {
-        return Err(std::io::Error::other("Host header hostname has empty label"));
+        return Err(std::io::Error::other(
+            "Host header hostname has empty label",
+        ));
     }
     if hostname.split('.').any(|label| label.len() > 63) {
-        return Err(std::io::Error::other("Host header hostname label exceeds 63 bytes"));
+        return Err(std::io::Error::other(
+            "Host header hostname label exceeds 63 bytes",
+        ));
     }
     if !hostname.is_ascii() {
-        return Err(std::io::Error::other("Host header hostname contains non-ASCII bytes"));
+        return Err(std::io::Error::other(
+            "Host header hostname contains non-ASCII bytes",
+        ));
     }
     if hostname.bytes().any(|b| b.is_ascii_control() || b == b' ') {
-        return Err(std::io::Error::other("Host header hostname contains control characters"));
+        return Err(std::io::Error::other(
+            "Host header hostname contains control characters",
+        ));
     }
     Ok(())
 }
@@ -813,10 +835,7 @@ mod tests {
 
         #[test]
         fn wildcard_matches_deep_subdomain() {
-            assert!(matches_host_header(
-                "a.b.c.example.com",
-                "*.example.com"
-            ));
+            assert!(matches_host_header("a.b.c.example.com", "*.example.com"));
         }
 
         #[test]
@@ -841,10 +860,7 @@ mod tests {
 
         #[test]
         fn dot_shorthand_matches_deep() {
-            assert!(matches_host_header(
-                "a.b.c.example.com",
-                ".example.com"
-            ));
+            assert!(matches_host_header("a.b.c.example.com", ".example.com"));
         }
 
         #[test]
@@ -884,19 +900,13 @@ mod tests {
 
         #[test]
         fn hostname_is_pattern_prefix() {
-            assert!(!matches_host_header(
-                "example.com.evil.com",
-                "example.com"
-            ));
+            assert!(!matches_host_header("example.com.evil.com", "example.com"));
         }
 
         #[test]
         fn hostname_is_pattern_suffix() {
             assert!(!matches_host_header("evilexample.com", ".example.com"));
-            assert!(!matches_host_header(
-                "evilexample.com",
-                "*.example.com"
-            ));
+            assert!(!matches_host_header("evilexample.com", "*.example.com"));
         }
 
         #[test]

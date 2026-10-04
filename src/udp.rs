@@ -101,7 +101,7 @@ pub async fn run_udp_server(
     }
 
     for entry in lookup_table.iter() {
-        debug!("Lookup table entry: {:?} (masklen {})", &entry.0, &entry.1);
+        debug!("Lookup table entry: {:?} (masklen {})", entry.0, entry.1);
     }
 
     let server_socket = Arc::new(UdpSocket::bind(&server_address).await?);
@@ -148,7 +148,7 @@ pub async fn run_udp_server(
                 } else {
                     &target_data.addresses[0]
                 };
-                debug!("Creating new association: {} -> {}", &addr, &target_address);
+                debug!("Creating new association: {} -> {}", addr, target_address);
                 let new_assoc = Association::new(
                     addr,
                     server_socket.clone(),

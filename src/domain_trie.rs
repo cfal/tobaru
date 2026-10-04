@@ -45,6 +45,7 @@ impl<V> DomainTrie<V> {
     /// - `"*"` -- catch-all, matches everything
     ///
     /// Returns the previous value for the same pattern slot, if any.
+    #[cfg(test)]
     pub fn insert(&mut self, pattern: &str, value: V) -> Option<V>
     where
         V: Clone,

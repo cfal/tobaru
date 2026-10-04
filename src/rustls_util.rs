@@ -83,20 +83,6 @@ fn create_client_config(
     }
 }
 
-fn get_client_config(verify: bool) -> Arc<rustls::ClientConfig> {
-    static VERIFIED_INSTANCE: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
-    static UNVERIFIED_INSTANCE: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
-    if verify {
-        VERIFIED_INSTANCE
-            .get_or_init(|| Arc::new(create_client_config(true, None, vec![])))
-            .clone()
-    } else {
-        UNVERIFIED_INSTANCE
-            .get_or_init(|| Arc::new(create_client_config(false, None, vec![])))
-            .clone()
-    }
-}
-
 pub fn create_client_config_with_cert(
     verify: bool,
     client_cert: Option<(Vec<u8>, Vec<u8>)>,
@@ -315,10 +301,6 @@ pub fn get_dummy_server_name() -> ServerName<'static> {
     INSTANCE
         .get_or_init(|| ServerName::try_from("example.com").unwrap().to_owned())
         .clone()
-}
-
-pub fn create_connector(verify: bool) -> tokio_rustls::TlsConnector {
-    get_client_config(verify).into()
 }
 
 pub fn process_fingerprints(client_fingerprints: &[String]) -> std::io::Result<BTreeSet<Vec<u8>>> {

@@ -347,7 +347,7 @@ pub enum TargetConfigs {
         #[serde(default)]
         tcp_keepalive: TcpKeepaliveOption,
         #[serde(alias = "target")]
-        targets: OneOrSome<TcpTargetConfig>,
+        targets: Box<OneOrSome<TcpTargetConfig>>,
     },
     Udp {
         #[serde(alias = "target")]
@@ -584,9 +584,9 @@ pub struct HttpForwardConfig {
     #[serde(default)]
     pub replacement_path: Option<String>,
     #[serde(default)]
-    pub request_header_patch: Option<HttpHeaderPatch>,
+    pub request_header_patch: Option<Box<HttpHeaderPatch>>,
     #[serde(default)]
-    pub response_header_patch: Option<HttpHeaderPatch>,
+    pub response_header_patch: Option<Box<HttpHeaderPatch>>,
     #[serde(default)]
     pub request_id_header_name: Option<String>,
     #[serde(default)]
@@ -1242,7 +1242,7 @@ pub async fn load_server_configs(
                 }
 
                 // Replace targets with expanded version
-                *targets = OneOrSome::Some(expanded_targets);
+                **targets = OneOrSome::Some(expanded_targets);
 
                 // Then replace IP groups
                 for target in targets.iter_mut() {
@@ -1352,7 +1352,7 @@ pub async fn load_url(config_url: &str) -> std::io::Result<ServerConfig> {
                 target_configs: TargetConfigs::Tcp {
                     tcp_nodelay: true,
                     tcp_keepalive: TcpKeepaliveOption::default(),
-                    targets: OneOrSome::One(tcp_target_config),
+                    targets: Box::new(OneOrSome::One(tcp_target_config)),
                 },
             })
         }
@@ -1410,6 +1410,53 @@ pub async fn load_url(config_url: &str) -> std::io::Result<ServerConfig> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn tcp_target_forms_deserialize_from_json_and_yaml() {
+        let target = serde_json::json!({
+            "allowlist": "127.0.0.1/32",
+            "location": "127.0.0.1:9001"
+        });
+        for (field, targets, expected_count) in [
+            ("target", target.clone(), 1),
+            ("targets", serde_json::json!([target.clone(), target]), 2),
+            ("targets", serde_json::json!([]), 0),
+        ] {
+            let config = serde_json::json!([{
+                "address": "0.0.0.0:9000",
+                "transport": "tcp",
+                field: targets
+            }]);
+            for (filename, contents) in [
+                ("config.json", serde_json::to_string(&config).unwrap()),
+                ("config.yaml", serde_yaml::to_string(&config).unwrap()),
+            ] {
+                let result = deserialize_configs(contents, filename);
+                if expected_count == 0 {
+                    assert!(result.is_err(), "{filename} accepted empty targets");
+                    continue;
+                }
+                let Config::ServerConfig(server) = result.unwrap().pop().unwrap() else {
+                    panic!("expected server config");
+                };
+                let TargetConfigs::Tcp { targets, .. } = server.target_configs else {
+                    panic!("expected TCP targets");
+                };
+                assert_eq!(targets.into_vec().len(), expected_count);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_url_builds_single_target() {
+        let server = load_url("tcp://0.0.0.0:9000?target=127.0.0.1:9001")
+            .await
+            .unwrap();
+        let TargetConfigs::Tcp { targets, .. } = server.target_configs else {
+            panic!("expected TCP targets");
+        };
+        assert_eq!(targets.into_vec().len(), 1);
+    }
+
     fn deser_path_config(yaml: &str) -> HttpPathConfig {
         serde_yaml::from_str(yaml).unwrap()
     }
@@ -1443,7 +1490,7 @@ mod tests {
     #[test]
     fn host_string_becomes_hostnames() {
         let m = deser_host("example.com");
-        assert!(matches!(m, HttpValueMatch::Hostnames(v) if v == &["example.com"]));
+        assert!(matches!(m, HttpValueMatch::Hostnames(v) if v == ["example.com"]));
     }
 
     #[test]
@@ -1548,7 +1595,7 @@ mod tests {
     #[test]
     fn host_trailing_dot_normalized() {
         let m = deser_host("\"example.com.\"");
-        assert!(matches!(m, HttpValueMatch::Hostnames(v) if v == &["example.com"]));
+        assert!(matches!(m, HttpValueMatch::Hostnames(v) if v == ["example.com"]));
     }
 
     #[test]
@@ -1584,7 +1631,7 @@ mod tests {
     #[test]
     fn host_wildcard_trailing_dot_normalized() {
         let m = deser_host("\"*.example.com.\"");
-        assert!(matches!(m, HttpValueMatch::Hostnames(v) if v == &["*.example.com"]));
+        assert!(matches!(m, HttpValueMatch::Hostnames(v) if v == ["*.example.com"]));
     }
 
     #[test]

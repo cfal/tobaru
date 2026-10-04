@@ -10,19 +10,6 @@ pub enum NoneOrOne<T> {
     One(T),
 }
 
-impl<T> NoneOrOne<T> {
-    pub fn is_unspecified(&self) -> bool {
-        matches!(self, NoneOrOne::Unspecified)
-    }
-
-    pub fn into_option(self) -> Option<T> {
-        match self {
-            NoneOrOne::One(item) => Some(item),
-            _ => None,
-        }
-    }
-}
-
 #[derive(Default, Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum NoneOrSome<T> {
@@ -35,34 +22,12 @@ pub enum NoneOrSome<T> {
 }
 
 impl<T> NoneOrSome<T> {
-    pub fn is_unspecified(&self) -> bool {
-        matches!(self, NoneOrSome::Unspecified)
-    }
-
     pub fn is_empty(&self) -> bool {
         match self {
             NoneOrSome::Unspecified => true,
             NoneOrSome::None => true,
             NoneOrSome::One(_) => false,
             NoneOrSome::Some(v) => v.is_empty(),
-        }
-    }
-
-    pub fn as_option(&self) -> Option<Vec<&T>> {
-        match self {
-            NoneOrSome::Unspecified => None,
-            NoneOrSome::None => Some(vec![]),
-            NoneOrSome::One(item) => Some(vec![&item]),
-            NoneOrSome::Some(v) => Some(v.iter().collect()),
-        }
-    }
-
-    pub fn into_option(self) -> Option<Vec<T>> {
-        match self {
-            NoneOrSome::Unspecified => None,
-            NoneOrSome::None => Some(vec![]),
-            NoneOrSome::One(item) => Some(vec![item]),
-            NoneOrSome::Some(v) => Some(v),
         }
     }
 
@@ -74,17 +39,6 @@ impl<T> NoneOrSome<T> {
         }
     }
 
-    pub fn into_iter(self) -> Box<dyn Iterator<Item = T> + Send>
-    where
-        T: Send + 'static,
-    {
-        match self {
-            NoneOrSome::Unspecified | NoneOrSome::None => Box::new(std::iter::empty()),
-            NoneOrSome::One(item) => Box::new(SingleItemIter(Some(item))),
-            NoneOrSome::Some(v) => Box::new(v.into_iter()),
-        }
-    }
-
     pub fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = &'a T> + Send + 'a>
     where
         T: Sync,
@@ -93,54 +47,6 @@ impl<T> NoneOrSome<T> {
             NoneOrSome::Unspecified | NoneOrSome::None => Box::new(std::iter::empty()),
             NoneOrSome::One(item) => Box::new(SingleItemIter(Some(item))),
             NoneOrSome::Some(v) => Box::new(v.iter()),
-        }
-    }
-
-    pub fn iter_mut<'a>(&'a mut self) -> Box<dyn Iterator<Item = &'a mut T> + Send + 'a>
-    where
-        T: Send,
-    {
-        match self {
-            NoneOrSome::Unspecified | NoneOrSome::None => Box::new(std::iter::empty()),
-            NoneOrSome::One(ref mut item) => Box::new(SingleItemIter(Some(item))),
-            NoneOrSome::Some(v) => Box::new(v.iter_mut()),
-        }
-    }
-
-    pub fn map<F, U>(self, mut f: F) -> NoneOrSome<U>
-    where
-        F: FnMut(T) -> U,
-    {
-        match self {
-            NoneOrSome::Unspecified => NoneOrSome::Unspecified,
-            NoneOrSome::None => NoneOrSome::None,
-            NoneOrSome::One(item) => NoneOrSome::One(f(item)),
-            NoneOrSome::Some(v) => NoneOrSome::Some(v.into_iter().map(f).collect()),
-        }
-    }
-
-    pub fn filter<F>(self, f: F) -> Self
-    where
-        F: Fn(&T) -> bool,
-    {
-        match self {
-            NoneOrSome::Unspecified => NoneOrSome::Unspecified,
-            NoneOrSome::None => NoneOrSome::None,
-            NoneOrSome::One(item) => {
-                if f(&item) {
-                    NoneOrSome::One(item)
-                } else {
-                    NoneOrSome::None
-                }
-            }
-            NoneOrSome::Some(v) => {
-                let filtered: Vec<T> = v.into_iter().filter(f).collect();
-                if filtered.is_empty() {
-                    NoneOrSome::None
-                } else {
-                    NoneOrSome::Some(filtered)
-                }
-            }
         }
     }
 }
@@ -203,16 +109,6 @@ impl<T> OneOrSome<T> {
         match self {
             OneOrSome::One(ref mut item) => Box::new(SingleItemIter(Some(item))),
             OneOrSome::Some(v) => Box::new(v.iter_mut()),
-        }
-    }
-
-    pub fn contains(&self, x: &T) -> bool
-    where
-        T: PartialEq,
-    {
-        match self {
-            OneOrSome::One(item) => item == x,
-            OneOrSome::Some(v) => v.contains(x),
         }
     }
 }

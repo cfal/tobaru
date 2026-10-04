@@ -103,7 +103,7 @@ pub async fn handle_http_stream(
 
         match path_action {
             TargetHttpActionData::CloseConnection => {
-                info!("[{}] {} {} [close]", LOG_PREFIX, &verb, &request_path);
+                info!("[{}] {} {} [close]", LOG_PREFIX, verb, request_path);
                 break;
             }
             TargetHttpActionData::ServeMessage {
@@ -121,7 +121,7 @@ pub async fn handle_http_stream(
                     write_all(&mut stream, b"HTTP/1.1 417 Expectation Failed\r\n\r\n").await?;
                     info!(
                         "[{}] {} {} [serve message: expectation failed]",
-                        LOG_PREFIX, &verb, &request_path
+                        LOG_PREFIX, verb, request_path
                     );
                 } else {
                     forward_message(
@@ -160,7 +160,7 @@ pub async fn handle_http_stream(
 
                 info!(
                     "[{}] {} {} [serve message: {}]",
-                    LOG_PREFIX, &verb, &request_path, status_code
+                    LOG_PREFIX, verb, request_path, status_code
                 );
 
                 break;
@@ -252,8 +252,8 @@ pub async fn handle_http_stream(
                                 info!(
                                     "[{}] {} {} [serve file: {}]",
                                     LOG_PREFIX,
-                                    &verb,
-                                    &request_path,
+                                    verb,
+                                    request_path,
                                     mime_type.essence_str()
                                 );
 
@@ -280,7 +280,7 @@ pub async fn handle_http_stream(
 
                                 info!(
                                     "[{}] {} {} [serve file: invalid, not a file]",
-                                    LOG_PREFIX, &verb, &request_path
+                                    LOG_PREFIX, verb, request_path
                                 );
 
                                 if request_connection_close {
@@ -307,7 +307,7 @@ pub async fn handle_http_stream(
 
                         info!(
                             "[{}] {} {} [serve file: not found]",
-                            LOG_PREFIX, &verb, &request_path
+                            LOG_PREFIX, verb, request_path
                         );
 
                         if request_connection_close {
@@ -317,7 +317,7 @@ pub async fn handle_http_stream(
                     Err(e) => {
                         info!(
                             "[{}] {} {} [serve file: invalid path]",
-                            LOG_PREFIX, &verb, &request_path
+                            LOG_PREFIX, verb, request_path
                         );
                         return Err(std::io::Error::other(format!(
                             "Could not canonicalize path: {}",
@@ -361,7 +361,7 @@ pub async fn handle_http_stream(
 
                 request_data
                     .headers_mut()
-                    .patch_headers(request_header_patch);
+                    .patch_headers(request_header_patch.as_deref());
 
                 if let Some(header_name) = request_id_header_name {
                     request_data
@@ -435,7 +435,7 @@ pub async fn handle_http_stream(
 
                 response_data
                     .headers_mut()
-                    .patch_headers(response_header_patch);
+                    .patch_headers(response_header_patch.as_deref());
 
                 if let Some(header_name) = response_id_header_name {
                     response_data
@@ -455,7 +455,7 @@ pub async fn handle_http_stream(
                         )
                         .await?;
                         drop(response_data);
-                        info!("[{}] {} {} [forward-ws]", LOG_PREFIX, &verb, &request_path);
+                        info!("[{}] {} {} [forward-ws]", LOG_PREFIX, verb, request_path);
                         return copy_bidirectional(
                             &mut stream,
                             &mut target_stream,
@@ -475,7 +475,7 @@ pub async fn handle_http_stream(
                     forward_message(&mut target_stream, Some(&mut stream), response_data).await?;
                 }
 
-                info!("[{}] {} {} [forward]", LOG_PREFIX, &verb, &request_path);
+                info!("[{}] {} {} [forward]", LOG_PREFIX, verb, request_path);
 
                 if response_connection_close {
                     let _ = target_stream.try_shutdown().await;

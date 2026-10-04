@@ -269,7 +269,7 @@ fn main() {
                 return;
             }
 
-            debug!("Loaded server configs: {:#?}", &server_configs);
+            debug!("Loaded server configs: {:#?}", server_configs);
             if matches!(quick_action, Some(QuickAction::DryRun)) {
                 println!("Dry run complete, exiting.");
                 return;
