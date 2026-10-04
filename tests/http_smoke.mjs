@@ -196,6 +196,7 @@ try {
 
   writeFileSync(configPath, '{invalid');
   await waitForLog('Config reload rejected');
+  agent.destroy();
   assert.equal((await request(port, 'GET', '/')).body.toString(), 'working');
   logs = '';
   writeFileSync(configPath, JSON.stringify([{ ...config[0], target: {
@@ -203,6 +204,7 @@ try {
     server_tls: { cert: join(directory, 'missing.pem'), key: join(directory, 'missing.key') },
   } }]));
   await waitForLog('Config reload rejected');
+  agent.destroy();
   assert.equal((await request(port, 'GET', '/')).body.toString(), 'working');
   for (const content of ['atomic-one', 'atomic-two']) {
     logs = '';
