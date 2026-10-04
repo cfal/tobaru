@@ -1,4 +1,5 @@
 mod alpn_value;
+mod deprecation;
 mod ip_mask;
 mod location;
 mod option_util;
@@ -216,8 +217,12 @@ impl<'de> serde::de::Deserialize<'de> for Config {
                     serde_json::Value::String("tcp".to_string()),
                 );
             }
+            let deprecated = deprecation::deprecated_keys(&map);
             let config = serde_json::from_value(serde_json::Value::Object(map))
                 .map_err(serde::de::Error::custom)?;
+            for (old, new) in deprecated {
+                warn!("{old} is deprecated and has been renamed to {new}. This will be removed in future versions.");
+            }
             Ok(Config::ServerConfig(config))
         }
     }
@@ -1151,20 +1156,6 @@ fn deserialize_configs(mut config_str: String, filename: &str) -> std::io::Resul
             .filter(|s| !s.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
             .join("\n");
-    }
-
-    if config_str.contains("serverTls") {
-        eprintln!("WARNING: serverTls is deprecated and has been renamed to server_tls. This will be removed in future versions.");
-    }
-
-    if config_str.contains("bindAddress") {
-        eprintln!("WARNING: bindAddress is deprecated and has been renamed to address. This will be removed in future versions.");
-    }
-
-    // Unfortunately, we can't grep for `address` in target configs since it's valid for server
-    // configs.
-    if config_str.contains("addresses") {
-        eprintln!("WARNING: addresses is deprecated and has been renamed to locations. This will be removed in future versions.");
     }
 
     if is_json {
