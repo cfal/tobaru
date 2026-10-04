@@ -966,8 +966,10 @@ async fn header_patches_cannot_relabel_transfer_codings_or_upgrades() {
             let (mut client, mut task) = session(default, Trie::new(), None);
             client.write_all(format!("GET / HTTP/1.1\r\nHost: a.test\r\n{request_headers}\r\n").as_bytes()).await.unwrap();
             assert!(rest(&mut client).await.is_empty());
-            assert!((&mut task.0).await.unwrap().is_err());
-            if !response.is_empty() {
+            let error = (&mut task.0).await.unwrap().unwrap_err();
+            if response.is_empty() {
+                assert_eq!(error.to_string(), "Request header patch changes body framing");
+            } else {
                 (&mut upstream.0).await.unwrap();
             }
         }
