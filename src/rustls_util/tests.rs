@@ -168,6 +168,11 @@ fn tls_configuration_errors_are_recoverable() {
 }
 
 #[test]
+fn terminated_tls_does_not_accept_unconsumed_early_data() {
+    assert_eq!(server_config(&identity(), &[], &[]).max_early_data_size, 0);
+}
+
+#[test]
 fn server_ca_validation_and_pin_are_both_required() {
     let server = identity();
     let mut roots = rustls::RootCertStore::empty();

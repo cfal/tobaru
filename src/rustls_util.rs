@@ -292,7 +292,8 @@ pub fn create_server_config(
 
     let mut config = builder.with_cert_resolver(Arc::new(AlwaysResolvesServerCert(certified_key)));
     config.alpn_protocols = alpn_protocols;
-    config.max_early_data_size = u32::MAX;
+    // The stream adapter does not consume rustls's separate early-data buffer.
+    config.max_early_data_size = 0;
     config.ignore_client_order = true;
     Ok(config)
 }
