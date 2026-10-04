@@ -1,6 +1,7 @@
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -39,6 +40,7 @@ fn get_timestamp_secs() -> u32 {
 pub fn prepare_udp_server(
     server_address: SocketAddr,
     use_iptables: bool,
+    max_associations: Option<NonZeroUsize>,
     target_configs: Vec<UdpTargetConfig>,
 ) -> std::io::Result<impl std::future::Future<Output = std::io::Result<()>> + Send> {
     let mut lookup_table = IpLookupTable::new();
@@ -132,30 +134,14 @@ pub fn prepare_udp_server(
                 }
             };
 
-            let copied_msg = buf[0..len].to_vec().into_boxed_slice();
-
-            let send_result = match associations.lock().entry(addr) {
-                Entry::Occupied(o) => o.get().try_send(copied_msg),
-                Entry::Vacant(v) => {
-                    let target_address = if target_data.addresses.len() > 1 {
-                        // fetch_add wraps around on overflow.
-                        let index = target_data
-                            .next_address_index
-                            .fetch_add(1, Ordering::Relaxed);
-                        &target_data.addresses[index % target_data.addresses.len()]
-                    } else {
-                        &target_data.addresses[0]
-                    };
-                    debug!("Creating new association: {} -> {}", addr, target_address);
-                    let new_assoc = Association::new(
-                        addr,
-                        server_socket.clone(),
-                        target_address.clone(),
-                        target_data.association_timeout_secs,
-                    );
-                    v.insert(new_assoc).try_send(copied_msg)
-                }
-            };
+            let send_result = forward_packet(
+                &mut associations.lock(),
+                max_associations,
+                addr,
+                &server_socket,
+                target_data,
+                &buf[..len],
+            );
 
             // Sends can fail if the channel is full.
             if let Err(e) = send_result {
@@ -163,6 +149,36 @@ pub fn prepare_udp_server(
             }
         }
     })
+}
+
+fn forward_packet(
+    associations: &mut HashMap<SocketAddr, Association>,
+    max_associations: Option<NonZeroUsize>,
+    addr: SocketAddr,
+    server_socket: &Arc<UdpSocket>,
+    target_data: &UdpTargetData,
+    packet: &[u8],
+) -> std::io::Result<()> {
+    let at_capacity = max_associations.is_some_and(|limit| associations.len() >= limit.get());
+    let association = match associations.entry(addr) {
+        Entry::Occupied(entry) => entry.into_mut(),
+        Entry::Vacant(_) if at_capacity => return Ok(()),
+        Entry::Vacant(entry) => {
+            // fetch_add wraps around on overflow.
+            let index = target_data
+                .next_address_index
+                .fetch_add(1, Ordering::Relaxed);
+            let target_address = &target_data.addresses[index % target_data.addresses.len()];
+            debug!("Creating new association: {} -> {}", addr, target_address);
+            entry.insert(Association::new(
+                addr,
+                server_socket.clone(),
+                target_address.clone(),
+                target_data.association_timeout_secs,
+            ))
+        }
+    };
+    association.try_send(packet.to_vec().into_boxed_slice())
 }
 
 struct TaskDropGuard<T>(JoinHandle<T>);
@@ -303,6 +319,93 @@ async fn run_forward_tasks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn association_cap_preserves_existing_clients_and_recovers_after_cleanup() {
+        let backend = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        let server = Arc::new(UdpSocket::bind("0.0.0.0:0").await.unwrap());
+        let target = UdpTargetData {
+            addresses: vec![NetLocation::try_from(
+                format!("127.0.0.1:{}", backend.local_addr().unwrap().port()).as_str(),
+            )
+            .unwrap()],
+            next_address_index: AtomicUsize::new(0),
+            association_timeout_secs: 5,
+        };
+        let associations = Arc::new(Mutex::new(HashMap::new()));
+        let first = "127.0.0.1:1".parse().unwrap();
+        let second = "127.0.0.1:2".parse().unwrap();
+        let cap = NonZeroUsize::new(1);
+        let mut bytes = [0; 32];
+
+        forward_packet(
+            &mut associations.lock(),
+            cap,
+            first,
+            &server,
+            &target,
+            b"first",
+        )
+        .unwrap();
+        let (length, peer) = backend.recv_from(&mut bytes).await.unwrap();
+        assert_eq!(&bytes[..length], b"first");
+        forward_packet(
+            &mut associations.lock(),
+            cap,
+            second,
+            &server,
+            &target,
+            b"dropped",
+        )
+        .unwrap();
+        assert!(!associations.lock().contains_key(&second));
+        forward_packet(
+            &mut associations.lock(),
+            cap,
+            first,
+            &server,
+            &target,
+            b"existing",
+        )
+        .unwrap();
+        let (length, same_peer) = backend.recv_from(&mut bytes).await.unwrap();
+        assert_eq!(peer, same_peer);
+        assert_eq!(&bytes[..length], b"existing");
+
+        associations.lock()[&first]
+            .last_active
+            .store(get_timestamp_secs() - 10, Ordering::SeqCst);
+        let cleanup = TaskDropGuard(start_cleanup_task(associations.clone(), 5));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        assert!(associations.lock().is_empty());
+        drop(cleanup);
+        forward_packet(
+            &mut associations.lock(),
+            cap,
+            second,
+            &server,
+            &target,
+            b"new",
+        )
+        .unwrap();
+        let (length, _) = backend.recv_from(&mut bytes).await.unwrap();
+        assert_eq!(&bytes[..length], b"new");
+
+        forward_packet(
+            &mut associations.lock(),
+            None,
+            first,
+            &server,
+            &target,
+            b"unlimited",
+        )
+        .unwrap();
+        assert_eq!(associations.lock().len(), 2);
+        let (length, _) = backend.recv_from(&mut bytes).await.unwrap();
+        assert_eq!(&bytes[..length], b"unlimited");
+    }
 
     #[tokio::test]
     async fn associations_relay_to_ipv4_and_ipv6_targets() {

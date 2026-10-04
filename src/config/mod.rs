@@ -351,6 +351,8 @@ pub enum TargetConfigs {
         targets: Box<OneOrSome<TcpTargetConfig>>,
     },
     Udp {
+        #[serde(default)]
+        udp_max_associations: Option<std::num::NonZeroUsize>,
         #[serde(alias = "target")]
         targets: OneOrSome<UdpTargetConfig>,
     },
@@ -1274,7 +1276,9 @@ pub async fn load_server_configs(
                     IpMaskSelection::replace_groups(&mut target.allowlist, &groups)?;
                 }
             }
-            TargetConfigs::Udp { ref mut targets } => {
+            TargetConfigs::Udp {
+                ref mut targets, ..
+            } => {
                 for target in targets.iter_mut() {
                     IpMaskSelection::replace_groups(&mut target.allowlist, &groups)?;
                 }
@@ -1420,6 +1424,7 @@ pub async fn load_url(config_url: &str) -> std::io::Result<ServerConfig> {
                 address,
                 use_iptables: false,
                 target_configs: TargetConfigs::Udp {
+                    udp_max_associations: None,
                     targets: OneOrSome::One(udp_target_config),
                 },
             })

@@ -180,4 +180,27 @@ mod tests {
             serde_json::from_value(json!({"mode":"passthrough"})).unwrap();
         assert!(config.handshake_timeout_secs.is_none());
     }
+    #[test]
+    fn udp_association_cap_is_optional_and_positive() {
+        use super::super::TargetConfigs;
+        let base = json!({"transport":"udp", "target":{"allowlist":"127.0.0.1", "location":"127.0.0.1:53"}});
+        let config: TargetConfigs = serde_json::from_value(base.clone()).unwrap();
+        assert!(matches!(
+            config,
+            TargetConfigs::Udp {
+                udp_max_associations: None,
+                ..
+            }
+        ));
+        for value in [json!(null), json!(1), json!(4096)] {
+            let mut config = base.clone();
+            config["udp_max_associations"] = value;
+            assert!(serde_json::from_value::<TargetConfigs>(config).is_ok());
+        }
+        for value in [json!(0), json!(-1), json!(1.5)] {
+            let mut config = base.clone();
+            config["udp_max_associations"] = value;
+            assert!(serde_json::from_value::<TargetConfigs>(config).is_err());
+        }
+    }
 }

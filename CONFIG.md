@@ -599,9 +599,15 @@ http_action: close
 
 UDP forwarding with round-robin load balancing and stateful association tracking.
 
+The optional listener-level `udp_max_associations` caps the total across all
+targets. Omitted or `null` means unlimited; configured values must be positive
+integers. At capacity, packets for new client addresses are dropped, while
+existing associations continue forwarding. Idle cleanup frees capacity.
+
 ```yaml
 - address: 0.0.0.0:53
   transport: udp
+  udp_max_associations: 4096  # Optional, shared by all targets on this listener
   target:
     addresses: [string]            # Backend address(es) -- round-robin
     allowlist: string | [string]   # IP masks or group names

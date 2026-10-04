@@ -82,9 +82,13 @@ async fn prepare(configs: Vec<ServerConfig>) -> io::Result<Vec<ServerTask>> {
                 )
                 .await?,
             ),
-            TargetConfigs::Udp { targets } => Box::pin(udp::prepare_udp_server(
+            TargetConfigs::Udp {
+                targets,
+                udp_max_associations,
+            } => Box::pin(udp::prepare_udp_server(
                 address,
                 use_iptables,
+                udp_max_associations,
                 targets.into_vec(),
             )?),
         };
