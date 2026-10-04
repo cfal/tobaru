@@ -110,13 +110,13 @@ impl ConfigWatcher {
     }
 }
 
-fn watch_configs(config_paths: &[String]) -> io::Result<(ConfigWatcher, Receiver<()>)> {
+fn watch_configs(config_paths: &[String]) -> io::Result<(ConfigWatcher, Receiver<Event>)> {
     let (tx, rx) = channel(1);
     let paths = Arc::new(Mutex::new(HashSet::new()));
     let event_paths = paths.clone();
     let watcher = notify::recommended_watcher(move |result: notify::Result<Event>| match result {
         Ok(event) if relevant_event(&event, &event_paths.lock()) => {
-            let _ = tx.try_send(());
+            let _ = tx.try_send(event);
         }
         Ok(_) => {}
         Err(error) => error!("Config watch error: {error}"),
@@ -303,6 +303,24 @@ mod tests {
         }
     }
 
+    async fn assert_file_changes_observed(changes: &mut Receiver<Event>, path: &Path) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let mut retry = tokio::time::interval(Duration::from_millis(20));
+            loop {
+                tokio::select! {
+                    // The production queue coalesces events. Retry a write if a stale
+                    // rename notification occupied its single slot.
+                    _ = retry.tick() => std::fs::write(path, "updated").unwrap(),
+                    event = changes.recv() => {
+                        if event.unwrap().paths.iter().any(|changed| changed == path) { break; }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("No modification event for the expected config target");
+    }
+
     #[tokio::test]
     async fn config_watches_capture_changes_before_the_first_load() {
         let files = WatchFiles::new();
@@ -312,12 +330,11 @@ mod tests {
         let replacement = files.0.join("replacement.json");
         std::fs::write(&replacement, "new").unwrap();
         std::fs::rename(replacement, &path).unwrap();
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(3), changes.recv())
-                .await
-                .unwrap(),
-            Some(())
-        );
+        let event = tokio::time::timeout(Duration::from_secs(3), changes.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(event.paths.contains(&path));
         assert_eq!(std::fs::read_to_string(path).unwrap(), "new");
     }
 
@@ -332,13 +349,7 @@ mod tests {
         std::os::unix::fs::symlink(&first, &link).unwrap();
         let paths = [link.to_str().unwrap().into()];
         let (mut watcher, mut changes) = watch_configs(&paths).unwrap();
-        std::fs::write(&first, "updated").unwrap();
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(3), changes.recv())
-                .await
-                .unwrap(),
-            Some(())
-        );
+        assert_file_changes_observed(&mut changes, &first).await;
 
         let replacement = files.0.join("replacement.json");
         std::os::unix::fs::symlink(&second, &replacement).unwrap();
@@ -350,14 +361,7 @@ mod tests {
             watcher.parents,
             HashSet::from([files.0.clone(), files.0.join("b")])
         );
-        while changes.try_recv().is_ok() {}
-        std::fs::write(&second, "retargeted").unwrap();
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(3), changes.recv())
-                .await
-                .unwrap(),
-            Some(())
-        );
+        assert_file_changes_observed(&mut changes, &second).await;
     }
 
     #[tokio::test(start_paused = true)]
