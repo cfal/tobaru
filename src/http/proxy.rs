@@ -139,11 +139,6 @@ impl<'a> Session<'a> {
         .await?;
         let upload_complete = reader.is_some();
         self.reader = reader;
-        if !upload_complete {
-            // An EOF-delimited rejection may wait for request EOF before finishing.
-            // Close only our write side so its response can still be drained.
-            let _ = target.stream.shutdown().await;
-        }
         let status = response.response_status()?;
         let response_body = response_framing(response.headers(), &request.verb, status)?;
         let response_codings = response.headers().transfer_codings();
@@ -198,16 +193,28 @@ impl<'a> Session<'a> {
                 .insert("connection".into(), "close".into());
         }
         write_head(&mut self.stream, &response).await?;
-        target.reader = forward_body(
-            &mut target.stream,
-            Some(&mut self.stream),
-            response.into_reader(),
-            response_body,
-        )
-        .await?;
+        target.reader = {
+            let (mut target_read, mut target_write) = tokio::io::split(&mut target.stream);
+            let drain = forward_body(
+                &mut target_read,
+                Some(&mut self.stream),
+                response.into_reader(),
+                response_body,
+            );
+            tokio::pin!(drain);
+            // EOF replies may need request EOF, but TLS shutdown can itself block on writes.
+            // Drain concurrently and stop waiting for shutdown once the response is complete.
+            tokio::select! {
+                biased;
+                _ = target_write.shutdown(), if !upload_complete => drain.await?,
+                reader = &mut drain => reader?,
+            }
+        };
         info!("[http] {} {} [forward]", request.verb, request.path);
         if close {
-            let _ = target.stream.try_shutdown().await;
+            if upload_complete {
+                let _ = target.stream.try_shutdown().await;
+            }
             Ok(Outcome::Close)
         } else {
             if target.reader.unparsed_data().is_empty() {

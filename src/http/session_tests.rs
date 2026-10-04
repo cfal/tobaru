@@ -886,6 +886,60 @@ async fn early_eof_delimited_rejection_receives_request_eof() {
 }
 
 #[tokio::test]
+async fn tls_early_rejection_drains_while_upload_shutdown_is_backpressured() {
+    checked(async {
+        use crate::rustls_util::{create_server_config, load_certs, load_private_key};
+        use std::sync::Arc;
+
+        let identity = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(create_server_config(
+            load_certs(identity.cert.pem().as_bytes()),
+            &load_private_key(identity.signing_key.serialize_pem().as_bytes()),
+            vec![b"http/1.1".to_vec()], &[], &[],
+        )));
+        let (listener, address) = backend().await;
+        let (release, released) = tokio::sync::oneshot::channel();
+        let mut upstream = Task(tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let socket = socket2::SockRef::from(&stream);
+            socket.set_recv_buffer_size(4096).unwrap();
+            socket.set_send_buffer_size(4096).unwrap();
+            let mut stream = acceptor.accept(stream).await.unwrap();
+            head(&mut stream).await;
+            // Fill the proxy's upload buffers before sending a rejection larger than ours.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            stream.write_all(b"HTTP/1.1 413 Content Too Large\r\nContent-Length: 1048576\r\nConnection: close\r\n\r\n").await.unwrap();
+            stream.write_all(&vec![b'N'; 1048576]).await.unwrap();
+            stream.flush().await.unwrap();
+            // Do not drain the upload, even after the complete response has been sent.
+            let _ = released.await;
+        }));
+        let default = action(json!({"type": "forward", "location": {
+            "address": address.to_string(),
+            "client_tls": {"verify": false, "sni": "localhost", "alpn": "http/1.1"}
+        }}));
+        let (client, mut proxy) = session(default, Trie::new(), None);
+        let (mut reader, mut writer) = client.into_split();
+        let mut upload = Task(tokio::spawn(async move {
+            writer.write_all(b"POST / HTTP/1.1\r\nHost: a.test\r\nContent-Length: 99999999\r\n\r\n").await.unwrap();
+            for _ in 0..512 {
+                if writer.write_all(&[b'x'; 65536]).await.is_err() {
+                    break;
+                }
+            }
+        }));
+        assert!(head(&mut reader).await.starts_with("HTTP/1.1 413 "));
+        let mut body = vec![0; 1048576];
+        reader.read_exact(&mut body).await.unwrap();
+        assert_eq!(body, vec![b'N'; 1048576]);
+        (&mut proxy.0).await.unwrap().unwrap();
+        release.send(()).unwrap();
+        (&mut upstream.0).await.unwrap();
+        (&mut upload.0).await.unwrap();
+    }).await;
+}
+
+#[tokio::test]
 async fn header_patches_cannot_relabel_transfer_codings_or_upgrades() {
     checked(async {
         for (request_headers, request_patch, response, response_patch) in [
