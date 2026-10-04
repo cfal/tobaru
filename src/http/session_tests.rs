@@ -322,7 +322,7 @@ async fn directory_get_head_missing_and_query_behavior() {
     checked(async {
         let files = Files::new();
         std::fs::write(files.0.join("index.html"), "index").unwrap();
-        for (method, path, status, expected) in [("GET", "/", "200", "5\r\nindex\r\n0\r\n\r\n"), ("HEAD", "/", "200", ""), ("GET", "/index.html?x=1", "404", ""), ("POST", "/", "501", "")] {
+        for (method, path, status, expected) in [("GET", "/", "200", "5\r\nindex\r\n0\r\n\r\n"), ("HEAD", "/", "200", ""), ("GET", "/index.html?x=1", "200", "5\r\nindex\r\n0\r\n\r\n"), ("POST", "/", "501", "")] {
             let default = action(json!({"type": "serve-directory", "path": files.0, "response_headers": {"x-file": "yes"}}));
             let (mut client, task) = session(default, Trie::new(), None);
             client.write_all(format!("{method} {path} HTTP/1.1\r\nHost: a.test\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
@@ -362,6 +362,48 @@ async fn local_response_refactoring_preserves_empty_and_missing_wire_output() {
             task.finish().await;
         }
     }).await;
+}
+
+#[tokio::test]
+async fn static_paths_decode_filenames_but_reject_parent_segments() {
+    checked(async {
+        let files = Files::new();
+        std::fs::write(files.0.join("report..final name?.txt"), "file").unwrap();
+        for target in [
+            "/static/report..final%20name%3F.txt?v=1",
+            "/static/%2e%2e/private",
+            "/static/../private",
+            "/static/..%2fprivate",
+            "/static/%00",
+        ] {
+            let paths = Trie::from_iter([(
+                "/static/".into(),
+                vec![route(action(json!({
+                    "type": "serve-directory", "path": files.0,
+                })))],
+            )]);
+            let (mut client, mut task) = session(message("default"), paths, None);
+            client
+                .write_all(
+                    format!("GET {target} HTTP/1.1\r\nHost: a.test\r\nConnection: close\r\n\r\n")
+                        .as_bytes(),
+                )
+                .await
+                .unwrap();
+            if target.contains("report") {
+                assert!(head(&mut client).await.starts_with("HTTP/1.1 200"));
+                assert_eq!(rest(&mut client).await, b"4\r\nfile\r\n0\r\n\r\n");
+                task.finish().await;
+            } else {
+                assert!(rest(&mut client).await.is_empty());
+                assert_eq!(
+                    (&mut task.0).await.unwrap().unwrap_err().to_string(),
+                    "Invalid static file path"
+                );
+            }
+        }
+    })
+    .await;
 }
 
 #[tokio::test]

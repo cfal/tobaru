@@ -1,8 +1,7 @@
 use std::io;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 use log::info;
-use memchr::memmem;
 use mime_guess::MimeGuess;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -89,18 +88,12 @@ impl Session<'_> {
             write_all(&mut self.stream, response.as_bytes()).await?;
             return Ok(Outcome::Close);
         }
-        if memmem::find(request.path.as_bytes(), b"..").is_some() {
-            return Err(io::Error::other(format!(
-                "Ignoring request with possible base path escape: {}",
-                request.data.first_line()
-            )));
-        }
+        let file_path = static_file_path(path, &request.path, request.base_path)?;
         if request.data.headers().expect_100()? {
             write_all(&mut self.stream, b"HTTP/1.1 417 Expectation Failed\r\nConnection: close\r\nContent-Length: 0\r\n\r\n").await?;
             return Ok(Outcome::Close);
         }
         self.reader = Some(drain_request(&mut self.stream, request.data).await?);
-        let file_path = string_util::update_base_path(&request.path, request.base_path, path);
         let canonical_path = match resolve_file(path, &file_path).await {
             Ok(path) => path,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -207,7 +200,26 @@ async fn write_chunk<W: AsyncWrite + Unpin>(stream: &mut W, bytes: &[u8]) -> io:
     write_all(stream, b"\r\n").await
 }
 
-async fn resolve_file(root: &str, requested: &str) -> io::Result<PathBuf> {
+fn static_file_path(root: &str, target: &str, base_path: &str) -> io::Result<PathBuf> {
+    let target_path = target.split_once('?').map_or(target, |(path, _)| path);
+    let relative = string_util::update_base_path(target_path, base_path, "/");
+    let decoded = percent_encoding::percent_decode_str(&relative)
+        .decode_utf8()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    if Path::new(decoded.as_ref())
+        .components()
+        .any(|part| part == Component::ParentDir)
+        || decoded.contains('\0')
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Invalid static file path",
+        ));
+    }
+    Ok(Path::new(root).join(decoded.trim_start_matches('/')))
+}
+
+async fn resolve_file(root: &str, requested: &Path) -> io::Result<PathBuf> {
     let root = tokio::fs::canonicalize(root).await?;
     let mut path = tokio::fs::canonicalize(requested).await?;
     if !path.starts_with(&root) {
