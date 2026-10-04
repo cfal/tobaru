@@ -679,3 +679,142 @@ async fn framing_patches_cannot_change_how_received_bytes_are_consumed() {
         (&mut upstream.0).await.unwrap();
     }).await;
 }
+
+#[tokio::test]
+async fn round_robin_advances_only_when_an_action_opens_a_connection() {
+    checked(async {
+        let files = Files::new();
+        std::fs::write(files.0.join("index.html"), "local").unwrap();
+        let (a, address_a) = backend().await;
+        let (b, address_b) = backend().await;
+        let mut server_a = Task(tokio::spawn(async move {
+            let (mut stream, _) = a.accept().await.unwrap();
+            for _ in 0..2 {
+                head(&mut stream).await;
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nA")
+                    .await
+                    .unwrap();
+            }
+            assert!(rest(&mut stream).await.is_empty());
+        }));
+        let mut server_b = Task(tokio::spawn(async move {
+            let (mut stream, _) = b.accept().await.unwrap();
+            head(&mut stream).await;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\nB")
+                .await
+                .unwrap();
+        }));
+        let mut paths = Trie::new();
+        paths.insert(
+            "/local/".into(),
+            vec![route(action(
+                json!({"type": "serve-directory", "path": files.0}),
+            ))],
+        );
+        let default = action(
+            json!({"type": "forward", "locations": [address_a.to_string(), address_b.to_string()]}),
+        );
+        let (mut client, _task) = session(default, paths, None);
+        for (method, path, body) in [
+            ("GET", "/a", Some(b'A')),
+            ("GET", "/b", Some(b'A')),
+            ("HEAD", "/local/", None),
+            ("GET", "/c", Some(b'B')),
+        ] {
+            client
+                .write_all(format!("{method} {path} HTTP/1.1\r\nHost: a.test\r\n\r\n").as_bytes())
+                .await
+                .unwrap();
+            head(&mut client).await;
+            if let Some(body) = body {
+                assert_eq!(client.read_u8().await.unwrap(), body);
+            }
+        }
+        assert!(rest(&mut client).await.is_empty());
+        (&mut server_a.0).await.unwrap();
+        (&mut server_b.0).await.unwrap();
+    })
+    .await;
+}
+
+trait WireStream: AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + tokio::io::AsyncWrite + Unpin + Send> WireStream for T {}
+
+#[tokio::test]
+async fn transport_matrix_preserves_tls_pins_mtls_sni_and_alpn() {
+    checked(async {
+        use crate::async_stream::AsyncStream;
+        use crate::rustls_util::{create_client_config_with_cert, create_server_config, load_certs, load_private_key};
+        use std::sync::Arc;
+        let files = Files::new();
+        let identity = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert = identity.cert.pem().into_bytes();
+        let key = identity.signing_key.serialize_pem().into_bytes();
+        let pin: String = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, identity.cert.der())
+            .as_ref().iter().map(|byte| format!("{byte:02x}")).collect();
+        std::fs::write(files.0.join("cert.pem"), &cert).unwrap();
+        std::fs::write(files.0.join("key.pem"), &key).unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(create_server_config(
+            load_certs(&cert), &load_private_key(&key), vec![b"http/1.1".to_vec()], std::slice::from_ref(&pin), &[],
+        )));
+        let connector = tokio_rustls::TlsConnector::from(create_client_config_with_cert(
+            false, Some((cert, key)), vec![b"http/1.1".to_vec()], true, vec![pin.clone()],
+        ));
+        for frontend_tls in [false, true] {
+            for backend_tls in [false, true] {
+                for unix in [false, true] {
+                    let (tcp, address) = backend().await;
+                    let socket_path = files.0.join(format!("backend-{frontend_tls}-{backend_tls}-{unix}.sock"));
+                    let unix_listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+                    let acceptor_backend = acceptor.clone();
+                    let mut upstream = Task(tokio::spawn(async move {
+                        let stream: Box<dyn WireStream> = if unix {
+                            Box::new(unix_listener.accept().await.unwrap().0)
+                        } else {
+                            Box::new(tcp.accept().await.unwrap().0)
+                        };
+                        let mut stream: Box<dyn WireStream> = if backend_tls {
+                            let stream = acceptor_backend.accept(stream).await.unwrap();
+                            assert_eq!(stream.get_ref().1.server_name(), Some("localhost"));
+                            assert_eq!(stream.get_ref().1.alpn_protocol(), Some(b"http/1.1".as_slice()));
+                            assert!(stream.get_ref().1.peer_certificates().is_some());
+                            Box::new(stream)
+                        } else { stream };
+                        head(&mut stream).await;
+                        let mut body = vec![0; 65536];
+                        stream.read_exact(&mut body).await.unwrap();
+                        assert!(body.iter().all(|byte| *byte == b'x'));
+                        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 65536\r\nConnection: close\r\n\r\n").await.unwrap();
+                        stream.write_all(&body).await.unwrap();
+                        stream.shutdown().await.unwrap();
+                    }));
+                    let mut location = if unix { json!({"path": socket_path}) } else { json!({"address": address.to_string()}) };
+                    if backend_tls {
+                        location["client_tls"] = json!({"verify": false, "server_fingerprints": [pin], "sni": "localhost", "alpn": "http/1.1", "cert": files.0.join("cert.pem"), "key": files.0.join("key.pem")});
+                    }
+                    let default = action(json!({"type": "forward", "location": location}));
+                    let (client, server) = UnixStream::pair().unwrap();
+                    let acceptor_frontend = acceptor.clone();
+                    let mut proxy = Task(tokio::spawn(async move {
+                        let stream: Box<dyn AsyncStream> = if frontend_tls {
+                            Box::new(acceptor_frontend.accept(server).await.unwrap())
+                        } else { Box::new(server) };
+                        super::handle_http_stream(true, None, &Trie::new(), &default, stream, &"127.0.0.1:12345".parse().unwrap(), None).await.unwrap();
+                    }));
+                    let mut client: Box<dyn AsyncStream> = if frontend_tls {
+                        Box::new(connector.connect(rustls::pki_types::ServerName::try_from("localhost").unwrap(), client).await.unwrap())
+                    } else { Box::new(client) };
+                    client.write_all(b"POST / HTTP/1.1\r\nHost: a.test\r\nContent-Length: 65536\r\n\r\n").await.unwrap();
+                    client.write_all(&vec![b'x'; 65536]).await.unwrap();
+                    client.flush().await.unwrap();
+                    assert!(head(&mut client).await.starts_with("HTTP/1.1 200 "));
+                    assert_eq!(rest(&mut client).await, vec![b'x'; 65536]);
+                    (&mut upstream.0).await.unwrap();
+                    (&mut proxy.0).await.unwrap();
+                }
+            }
+        }
+    }).await;
+}
