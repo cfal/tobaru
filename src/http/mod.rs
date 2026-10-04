@@ -11,6 +11,8 @@ mod string_util;
 
 #[cfg(test)]
 mod session_tests;
+#[cfg(test)]
+mod test_io;
 
 use log::info;
 use radix_trie::Trie;

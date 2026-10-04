@@ -170,3 +170,88 @@ impl LineReader {
         self.start_offset == 0 && self.end_offset == self.buf.len()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::http::test_io::{ReadStep, ScriptedIo};
+    use std::io::ErrorKind;
+
+    #[tokio::test]
+    async fn lines_and_suffix_survive_every_split_and_pending_read() {
+        let wire = b"one\r\ntwo\r\nTAIL";
+        for split in 0..=wire.len() {
+            let mut stream = ScriptedIo::split(wire, split);
+            let mut reader = LineReader::new();
+            assert_eq!(reader.read_line(&mut stream).await.unwrap(), "one");
+            assert_eq!(reader.read_line(&mut stream).await.unwrap(), "two");
+            let mut suffix = reader.unparsed_data().to_vec();
+            stream.read_to_end(&mut suffix).await.unwrap();
+            assert_eq!(suffix, b"TAIL", "split {split}");
+        }
+    }
+
+    #[tokio::test]
+    async fn preload_compaction_and_buffer_boundaries_preserve_bytes() {
+        for length in [
+            BUFFER_SIZE - 1,
+            BUFFER_SIZE,
+            BUFFER_SIZE + 1,
+            2 * BUFFER_SIZE,
+        ] {
+            let data = vec![b'x'; length];
+            let mut stream = ScriptedIo::new([ReadStep::Data(data.clone())]);
+            let mut reader = LineReader::new_with_data(b"head\r\nPRE".to_vec());
+            assert_eq!(reader.read_line(&mut stream).await.unwrap(), "head");
+            let mut result = Vec::new();
+            loop {
+                let bytes = reader.unparsed_data();
+                result.extend_from_slice(bytes);
+                reader.consume(bytes.len());
+                if reader.read_more(&mut stream).await.unwrap() == 0 {
+                    break;
+                }
+            }
+            assert_eq!(result, [b"PRE".as_slice(), &data].concat());
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_lines_eof_and_io_errors_are_distinct() {
+        for (wire, kind) in [
+            (b"bad\n".as_slice(), ErrorKind::InvalidData),
+            (b"bad\rX\n", ErrorKind::InvalidData),
+            (b"\xff\r\n", ErrorKind::InvalidData),
+            (b"incomplete\r", ErrorKind::UnexpectedEof),
+        ] {
+            for split in 0..=wire.len() {
+                let error = LineReader::new()
+                    .read_line(&mut ScriptedIo::split(wire, split))
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.kind(), kind);
+            }
+        }
+        let mut stream = ScriptedIo::new([
+            ReadStep::Error(ErrorKind::Interrupted),
+            ReadStep::Pending,
+            ReadStep::Data(b"ok\r\n".to_vec()),
+            ReadStep::Error(ErrorKind::ConnectionReset),
+        ]);
+        let mut reader = LineReader::new();
+        assert_eq!(reader.read_line(&mut stream).await.unwrap(), "ok");
+        assert_eq!(
+            reader.read_line(&mut stream).await.unwrap_err().kind(),
+            ErrorKind::ConnectionReset
+        );
+        let mut full = ScriptedIo::new([ReadStep::Data(vec![b'x'; BUFFER_SIZE])]);
+        assert_eq!(
+            LineReader::new()
+                .read_line(&mut full)
+                .await
+                .unwrap_err()
+                .kind(),
+            ErrorKind::ConnectionAborted
+        );
+    }
+}

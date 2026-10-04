@@ -153,3 +153,187 @@ where
 
     Ok(reader)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::http::header_map::Headers;
+    use crate::http::test_io::{ReadStep, ScriptedIo};
+    use std::io::ErrorKind;
+    use tokio::io::AsyncReadExt;
+
+    fn headers(fields: &[(&str, &str)]) -> Headers {
+        let mut headers = Headers::default();
+        for (name, value) in fields {
+            headers.append((*name).into(), (*value).into());
+        }
+        headers
+    }
+
+    #[test]
+    fn request_framing_accepts_only_unambiguous_boundaries() {
+        for (fields, expected) in [
+            (vec![], Some(Framing::Empty)),
+            (vec![("content-length", "0")], Some(Framing::Empty)),
+            (
+                vec![("content-length", "3, 3"), ("Content-Length", "3")],
+                Some(Framing::Length(3)),
+            ),
+            (
+                vec![("transfer-encoding", "GZIP, Chunked")],
+                Some(Framing::Chunked),
+            ),
+            (vec![("content-length", "3"), ("content-length", "4")], None),
+            (vec![("content-length", "+3")], None),
+            (vec![("content-length", "-1")], None),
+            (vec![("content-length", "")], None),
+            (
+                vec![("content-length", "999999999999999999999999999999999999")],
+                None,
+            ),
+            (
+                vec![("content-length", "0"), ("transfer-encoding", "Chunked")],
+                None,
+            ),
+            (vec![("transfer-encoding", "chunked, gzip")], None),
+            (vec![("transfer-encoding", "chunked, chunked")], None),
+            (vec![("transfer-encoding", "gzip")], None),
+            (vec![("transfer-encoding", "chunked,")], None),
+        ] {
+            assert_eq!(
+                request_framing(&headers(&fields)).ok(),
+                expected,
+                "{fields:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn response_framing_respects_method_status_and_eof() {
+        for fields in [
+            vec![],
+            vec![("content-length", "99")],
+            vec![("transfer-encoding", "chunked")],
+        ] {
+            let headers = headers(&fields);
+            assert_eq!(
+                response_framing(&headers, "HEAD", 200).unwrap(),
+                Framing::Empty
+            );
+            for status in [100, 101, 103, 199, 204, 304] {
+                assert_eq!(
+                    response_framing(&headers, "GET", status).unwrap(),
+                    Framing::Empty
+                );
+            }
+        }
+        assert_eq!(
+            response_framing(&headers(&[]), "GET", 200).unwrap(),
+            Framing::UntilEof
+        );
+        assert_eq!(
+            response_framing(&headers(&[("transfer-encoding", "gzip")]), "GET", 200).unwrap(),
+            Framing::UntilEof
+        );
+        assert_eq!(
+            response_framing(&headers(&[("content-length", "3")]), "GET", 200).unwrap(),
+            Framing::Length(3)
+        );
+        assert!(response_framing(
+            &headers(&[("transfer-encoding", "chunked"), ("content-length", "3")]),
+            "GET",
+            200
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn every_body_split_and_short_write_preserves_payload_and_suffix() {
+        for (body, framing) in [
+            (b"".as_slice(), Framing::Empty),
+            (b"hello", Framing::Length(5)),
+            (
+                b"5;foo=bar\r\nhello\r\n0;end=yes\r\nX-End: one\r\nX-End: two\r\n\r\n",
+                Framing::Chunked,
+            ),
+        ] {
+            let wire = [body, b"NEXT"].concat();
+            for split in 0..=wire.len() {
+                let mut from = ScriptedIo::split(&wire, split);
+                let mut to = ScriptedIo::new([]).short_writes(2);
+                let reader = forward_body(
+                    &mut from,
+                    Some(&mut to),
+                    line_reader::LineReader::new(),
+                    framing,
+                )
+                .await
+                .unwrap();
+                assert_eq!(to.written, body, "split {split}, framing {framing:?}");
+                let mut suffix = reader.unparsed_data().to_vec();
+                from.read_to_end(&mut suffix).await.unwrap();
+                assert_eq!(suffix, b"NEXT");
+            }
+        }
+        let mut from = ScriptedIo::split(b"until-eof", 3);
+        let mut to = ScriptedIo::new([]).short_writes(1);
+        let reader = forward_body(
+            &mut from,
+            Some(&mut to),
+            line_reader::LineReader::new(),
+            Framing::UntilEof,
+        )
+        .await
+        .unwrap();
+        assert_eq!(to.written, b"until-eof");
+        assert!(reader.unparsed_data().is_empty());
+    }
+
+    #[tokio::test]
+    async fn truncation_and_transport_failures_never_complete_a_body() {
+        for (complete, framing) in [
+            (b"hello".as_slice(), Framing::Length(5)),
+            (b"1\r\nx\r\n0\r\nX-End: yes\r\n\r\n", Framing::Chunked),
+        ] {
+            for end in 0..complete.len() {
+                let mut from =
+                    ScriptedIo::new([ReadStep::Data(complete[..end].to_vec()), ReadStep::Eof]);
+                let result = forward_body(
+                    &mut from,
+                    None::<&mut tokio::io::Sink>,
+                    line_reader::LineReader::new(),
+                    framing,
+                )
+                .await;
+                assert!(
+                    result.err().unwrap().to_string().starts_with("Got EOF"),
+                    "end {end}"
+                );
+            }
+            let mut from = ScriptedIo::new([ReadStep::Error(ErrorKind::ConnectionReset)]);
+            let error = forward_body(
+                &mut from,
+                None::<&mut tokio::io::Sink>,
+                line_reader::LineReader::new(),
+                framing,
+            )
+            .await
+            .err()
+            .unwrap();
+            assert_eq!(error.kind(), ErrorKind::ConnectionReset);
+            let mut from = ScriptedIo::new([ReadStep::Data(complete.to_vec())]);
+            let mut to = ScriptedIo::new([]).short_writes(1).fail_writes_after(2);
+            let error = forward_body(
+                &mut from,
+                Some(&mut to),
+                line_reader::LineReader::new(),
+                framing,
+            )
+            .await
+            .err()
+            .unwrap();
+            assert_eq!(error.kind(), ErrorKind::BrokenPipe);
+            assert_eq!(to.written, complete[..2]);
+        }
+    }
+}
