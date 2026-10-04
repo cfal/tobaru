@@ -141,6 +141,7 @@ impl<'a> Session<'a> {
             request.data.into_reader(),
             target.reader,
             request_body,
+            self.timeouts.response_header_timeout_secs,
         )
         .await?;
         let upload_complete = reader.is_some();
@@ -254,6 +255,7 @@ async fn exchange(
     request_reader: LineReader,
     response_reader: LineReader,
     framing: Framing,
+    response_timeout_secs: Option<std::num::NonZeroU64>,
 ) -> io::Result<(Option<LineReader>, ParsedHttpData)> {
     let (mut client_read, mut client_write) = tokio::io::split(client);
     let (mut target_read, mut target_write) = tokio::io::split(target);
@@ -268,7 +270,11 @@ async fn exchange(
         target_write.flush().await?;
         Ok::<_, io::Error>(reader)
     };
-    let response = read_response(&mut target_read, &mut client_write, response_reader);
+    let response = crate::tokio_util::with_timeout(
+        response_timeout_secs,
+        "HTTP response headers",
+        read_response(&mut target_read, &mut client_write, response_reader),
+    );
     tokio::pin!(upload, response);
     tokio::select! {
         biased;

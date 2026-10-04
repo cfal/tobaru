@@ -15,6 +15,8 @@ mod idle_tests;
 mod session_tests;
 #[cfg(test)]
 mod test_io;
+#[cfg(test)]
+mod timeout_tests;
 
 use log::info;
 use radix_trie::Trie;
@@ -22,9 +24,10 @@ use rand::RngExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::async_stream::AsyncStream;
-use crate::config::TcpKeepaliveConfig;
+use crate::config::{HttpTimeouts, TcpKeepaliveConfig};
 use crate::copy_bidirectional::copy_bidirectional;
-use crate::tcp::{TargetHttpActionData, TargetHttpPathData};
+use crate::tcp::{HttpTargetData, TargetHttpActionData, TargetHttpPathData};
+use crate::tokio_util::with_timeout;
 use header_map::HeaderMap;
 use routing::find_matching_action;
 
@@ -41,6 +44,7 @@ struct Session<'a> {
     addr: &'a std::net::SocketAddr,
     tcp_nodelay: bool,
     tcp_keepalive: Option<TcpKeepaliveConfig>,
+    timeouts: HttpTimeouts,
 }
 
 enum Outcome {
@@ -104,12 +108,36 @@ impl<'a> Request<'a> {
 }
 
 impl<'a> Session<'a> {
-    async fn read_request(&mut self) -> std::io::Result<http_parser::ParsedHttpData> {
-        let reader = self
+    async fn read_request(
+        &mut self,
+        keepalive: bool,
+    ) -> std::io::Result<http_parser::ParsedHttpData> {
+        let mut reader = self
             .reader
             .take()
             .expect("continued session must retain its reader");
-        let request = http_parser::ParsedHttpData::parse(&mut self.stream, reader);
+        let request = async {
+            if keepalive && reader.unparsed_data().is_empty() {
+                let read = with_timeout(
+                    self.timeouts.keepalive_idle_timeout_secs,
+                    "HTTP keepalive idle",
+                    reader.read_more(&mut self.stream),
+                )
+                .await?;
+                if read == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "EOF while reading",
+                    ));
+                }
+            }
+            with_timeout(
+                self.timeouts.request_header_timeout_secs,
+                "HTTP request headers",
+                http_parser::ParsedHttpData::parse(&mut self.stream, reader),
+            )
+            .await
+        };
         tokio::pin!(request);
         if let Some(target) = &mut self.cached_target {
             let mut byte = [0];
@@ -145,8 +173,7 @@ impl<'a> Session<'a> {
 pub async fn handle_http_stream(
     tcp_nodelay: bool,
     tcp_keepalive: Option<TcpKeepaliveConfig>,
-    path_configs: &Trie<String, Vec<TargetHttpPathData>>,
-    default_action: &TargetHttpActionData,
+    http: &HttpTargetData,
     stream: Box<dyn AsyncStream>,
     addr: &std::net::SocketAddr,
     initial_data: Option<Vec<u8>>,
@@ -161,6 +188,7 @@ pub async fn handle_http_stream(
         addr,
         tcp_nodelay,
         tcp_keepalive,
+        timeouts: http.http_timeouts,
     };
     let stream_id = format!("{:x}", rand::rng().random::<u64>());
     let mut iteration = 0usize;
@@ -170,12 +198,12 @@ pub async fn handle_http_stream(
         if iteration > 1 {
             session.stream.flush().await?;
         }
-        let data = session.read_request().await?;
+        let data = session.read_request(iteration > 1).await?;
         let request = Request::new(
             data,
             format!("{}#{}", stream_id, iteration),
-            path_configs,
-            default_action,
+            &http.path_configs,
+            &http.default_http_action,
         )?;
         match session.dispatch(request).await? {
             Outcome::Continue => {}

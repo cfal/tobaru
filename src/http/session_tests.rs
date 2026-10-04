@@ -62,11 +62,15 @@ fn session(
 ) -> (UnixStream, Task<std::io::Result<()>>) {
     let (client, proxy) = UnixStream::pair().unwrap();
     let task = tokio::spawn(async move {
+        let http = crate::tcp::HttpTargetData {
+            path_configs: paths,
+            default_http_action: default,
+            http_timeouts: crate::config::HttpTimeouts::default(),
+        };
         super::handle_http_stream(
             true,
             None,
-            &paths,
-            &default,
+            &http,
             Box::new(proxy),
             &"127.0.0.1:12345".parse().unwrap(),
             initial,
@@ -1124,9 +1128,9 @@ async fn tls_early_rejection_drains_while_upload_shutdown_is_backpressured() {
             let mut session = super::Session {
                 stream: Box::new(frontend), reader: Some(super::line_reader::LineReader::new()),
                 cached_target: Some(super::CachedTarget { action: &default, stream: Box::new(target), reader: super::line_reader::LineReader::new() }),
-                addr: &address, tcp_nodelay: true, tcp_keepalive: None,
+                addr: &address, tcp_nodelay: true, tcp_keepalive: None, timeouts: crate::config::HttpTimeouts::default(),
             };
-            let data = session.read_request().await?;
+            let data = session.read_request(false).await?;
             let request = super::Request::new(data, "test#1".into(), &paths, &default)?;
             assert!(matches!(session.dispatch(request).await?, super::Outcome::Close));
             session.stream.shutdown().await
@@ -1341,7 +1345,8 @@ async fn transport_matrix_preserves_tls_pins_mtls_sni_and_alpn() {
                         let stream: Box<dyn AsyncStream> = if frontend_tls {
                             Box::new(acceptor_frontend.accept(server).await.unwrap())
                         } else { Box::new(server) };
-                        super::handle_http_stream(true, None, &Trie::new(), &default, stream, &"127.0.0.1:12345".parse().unwrap(), None).await.unwrap();
+                        let http = crate::tcp::HttpTargetData { path_configs: Trie::new(), default_http_action: default, http_timeouts: crate::config::HttpTimeouts::default() };
+                        super::handle_http_stream(true, None, &http, stream, &"127.0.0.1:12345".parse().unwrap(), None).await.unwrap();
                     }));
                     let mut client: Box<dyn AsyncStream> = if frontend_tls {
                         Box::new(connector.connect(rustls::pki_types::ServerName::try_from("localhost").unwrap(), client).await.unwrap())

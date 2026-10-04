@@ -21,6 +21,7 @@ fn session<'a>(
         addr: &ADDRESS,
         tcp_nodelay: true,
         tcp_keepalive: None,
+        timeouts: HttpTimeouts::default(),
     }
 }
 
@@ -37,7 +38,7 @@ async fn idle_event_wins_when_both_sides_are_ready() {
         )]);
         let mut session = session(&action, frontend, ScriptedIo::new([event]));
         assert_eq!(
-            session.read_request().await.unwrap().first_line(),
+            session.read_request(false).await.unwrap().first_line(),
             "GET / HTTP/1.1"
         );
         assert!(session.cached_target.is_none());
@@ -49,7 +50,7 @@ async fn a_quiet_backend_survives_frontend_progress() {
     let action = TargetHttpActionData::CloseConnection;
     let frontend = ScriptedIo::new([ReadStep::Data(b"GET / HTTP/1.1\r\n\r\n".to_vec())]);
     let mut session = session(&action, frontend, ScriptedIo::new([ReadStep::Pending]));
-    session.read_request().await.unwrap();
+    session.read_request(false).await.unwrap();
     assert!(session.cached_target.is_some());
 }
 
@@ -63,7 +64,7 @@ async fn backend_retirement_keeps_a_partially_parsed_frontend_head_and_body() {
     ]);
     let backend = ScriptedIo::new([ReadStep::Pending, ReadStep::Data(b"late response".to_vec())]);
     let mut session = session(&action, frontend, backend);
-    let data = session.read_request().await.unwrap();
+    let data = session.read_request(false).await.unwrap();
     assert_eq!(data.first_line(), "POST /second HTTP/1.1");
     assert_eq!(
         data.headers().header_values("host").collect::<Vec<_>>(),

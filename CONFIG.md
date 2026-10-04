@@ -394,6 +394,36 @@ target:
       - default-backend:8080
 ```
 
+### HTTP Timeouts
+
+Timeouts belong to the HTTP target and apply to all of its routes. All are
+disabled when omitted or `null`; configured values must be positive seconds.
+
+```yaml
+target:
+  allowlist: 127.0.0.1/32
+  http_timeouts:
+    request_header_timeout_secs: 15
+    response_header_timeout_secs: 30
+    keepalive_idle_timeout_secs: 60
+  default_http_action:
+    type: forward
+    location: 127.0.0.1:8080
+```
+
+- The request-header deadline starts when HTTP handling begins for the first
+  request, or when the first byte of a subsequent request is received. Partial
+  header progress does not reset it.
+- The response-header deadline starts after upstream request headers are sent
+  and lasts until final response headers arrive. Informational responses do not
+  reset it. It includes any concurrent request upload and backend processing;
+  choose a value suitable for those workloads or leave it disabled.
+- The keepalive idle deadline bounds waiting for the next request's first byte.
+  Once data arrives, the request-header deadline applies instead.
+
+Expiration closes the affected HTTP session. These are not body-transfer or
+whole-session deadlines; upgraded tunnels are not subject to them.
+
 ### Path Matching
 
 Paths are matched by longest prefix. A trailing `/` in the path key matches that prefix and everything below it.

@@ -38,6 +38,7 @@ socket2 = "*"
 
 [dev-dependencies]
 rcgen = { version = "*", default-features = false, features = ["aws_lc_rs", "pem"] }
+tokio = { version = "*", features = ["test-util"] }
 
 [profile.release]
 opt-level = 3

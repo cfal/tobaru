@@ -17,9 +17,9 @@ use tokio::time::{timeout, Duration};
 use crate::async_stream::AsyncStream;
 use crate::config::{
     AlpnValue, HttpForwardConfig, HttpHeaderPatch, HttpPathAction, HttpServeDirectoryConfig,
-    HttpServeMessageConfig, HttpTcpActionConfig, HttpValueMatch, IpMask, IpMaskSelection, Location,
-    NetLocation, NoneOrOne, RawTcpActionConfig, SniValue, TcpAction, TcpKeepaliveConfig,
-    TcpKeepaliveOption, TcpTargetConfig, TcpTargetLocation,
+    HttpServeMessageConfig, HttpTcpActionConfig, HttpTimeouts, HttpValueMatch, IpMask,
+    IpMaskSelection, Location, NetLocation, NoneOrOne, RawTcpActionConfig, SniValue, TcpAction,
+    TcpKeepaliveConfig, TcpKeepaliveOption, TcpTargetConfig, TcpTargetLocation,
 };
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::domain_trie::DomainTrie;
@@ -108,10 +108,13 @@ pub enum TargetActionData {
         location_data: Vec<TargetLocationData>,
         next_address_index: AtomicUsize,
     },
-    Http {
-        path_configs: Box<Trie<String, Vec<TargetHttpPathData>>>,
-        default_http_action: TargetHttpActionData,
-    },
+    Http(Box<HttpTargetData>),
+}
+
+pub struct HttpTargetData {
+    pub path_configs: Trie<String, Vec<TargetHttpPathData>>,
+    pub default_http_action: TargetHttpActionData,
+    pub http_timeouts: HttpTimeouts,
 }
 
 pub struct TargetHttpPathData {
@@ -334,6 +337,7 @@ pub async fn prepare_tcp_server(
                 next_address_index: AtomicUsize::new(0),
             },
             TcpAction::Http(HttpTcpActionConfig {
+                http_timeouts,
                 http_paths,
                 default_http_action,
             }) => {
@@ -350,10 +354,11 @@ pub async fn prepare_tcp_server(
                         .collect::<std::io::Result<_>>()?;
                     path_configs.insert(path, path_data_vec);
                 }
-                TargetActionData::Http {
-                    path_configs: Box::new(path_configs),
+                TargetActionData::Http(Box::new(HttpTargetData {
+                    path_configs,
                     default_http_action: default_http_action.try_into()?,
-                }
+                    http_timeouts,
+                }))
             }
         };
 
@@ -766,7 +771,7 @@ async fn handle_passthrough_stream(
                 &location_data[0]
             }
         }
-        TargetActionData::Http { .. } => {
+        TargetActionData::Http(_) => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "HTTP action not supported with TLS passthrough mode",
@@ -981,15 +986,11 @@ async fn run_stream_action(
 
             Ok(())
         }
-        TargetActionData::Http {
-            path_configs,
-            default_http_action,
-        } => {
+        TargetActionData::Http(http) => {
             handle_http_stream(
                 target_data.tcp_nodelay,
                 target_data.tcp_keepalive,
-                path_configs,
-                default_http_action,
+                http,
                 source_stream,
                 addr,
                 initial_data,

@@ -133,4 +133,31 @@ mod tests {
             assert!(serde_json::from_value::<super::super::TcpTargetLocation>(value).is_ok());
         }
     }
+
+    #[test]
+    fn http_timeouts_are_opt_in_and_positive() {
+        let config = |timeouts| {
+            serde_json::from_value::<super::super::HttpTcpActionConfig>(json!({
+                "default_http_action":"close", "http_timeouts": timeouts,
+            }))
+        };
+        for value in [
+            json!({}),
+            json!({"request_header_timeout_secs":null}),
+            json!({"request_header_timeout_secs":15, "response_header_timeout_secs":30, "keepalive_idle_timeout_secs":60}),
+        ] {
+            assert!(config(value).is_ok());
+        }
+        for value in [
+            json!({"request_header_timeout_secs":0}),
+            json!({"response_header_timeout_secs":-1}),
+            json!({"keepalive_idle_timeout_secs":1.5}),
+            json!({"typo":1}),
+        ] {
+            assert!(config(value).is_err());
+        }
+        let config: super::super::HttpTcpActionConfig =
+            serde_json::from_value(json!({"default_http_action":"close"})).unwrap();
+        assert!(config.http_timeouts.request_header_timeout_secs.is_none());
+    }
 }

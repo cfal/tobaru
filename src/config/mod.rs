@@ -379,8 +379,18 @@ pub struct RawTcpActionConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct HttpTcpActionConfig {
     #[serde(default)]
+    pub http_timeouts: HttpTimeouts,
+    #[serde(default)]
     pub http_paths: HashMap<String, OneOrSome<HttpPathConfig>>,
     pub default_http_action: HttpPathAction,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpTimeouts {
+    pub request_header_timeout_secs: Option<std::num::NonZeroU64>,
+    pub response_header_timeout_secs: Option<std::num::NonZeroU64>,
+    pub keepalive_idle_timeout_secs: Option<std::num::NonZeroU64>,
 }
 
 #[derive(Debug, Clone)]
