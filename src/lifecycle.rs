@@ -102,7 +102,8 @@ impl ConfigWatcher {
         }
         *self.paths.lock() = paths;
         for parent in self.parents.difference(&parents) {
-            self.watcher.unwatch(parent).map_err(io::Error::other)?;
+            // Deleted target directories may have already lost their OS watch.
+            let _ = self.watcher.unwatch(parent);
         }
         self.parents = parents;
         Ok(())
@@ -342,6 +343,7 @@ mod tests {
         let replacement = files.0.join("replacement.json");
         std::os::unix::fs::symlink(&second, &replacement).unwrap();
         std::fs::rename(replacement, &link).unwrap();
+        std::fs::remove_dir_all(files.0.join("a")).unwrap();
         watcher.refresh(&paths).unwrap();
         assert_eq!(*watcher.paths.lock(), HashSet::from([link, second.clone()]));
         assert_eq!(
