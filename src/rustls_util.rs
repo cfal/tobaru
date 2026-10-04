@@ -5,6 +5,9 @@ use std::sync::OnceLock;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 
+#[cfg(test)]
+mod tests;
+
 fn get_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
     static INSTANCE: OnceLock<Arc<rustls::crypto::CryptoProvider>> = OnceLock::new();
     INSTANCE
@@ -227,13 +230,9 @@ impl rustls::client::danger::ServerCertVerifier for ServerFingerprintVerifier {
 }
 
 pub fn load_certs(cert_bytes: &[u8]) -> Vec<CertificateDer<'static>> {
-    let mut reader = std::io::Cursor::new(cert_bytes);
-    let mut certs = vec![];
-    for item in std::iter::from_fn(|| rustls_pemfile::read_one(&mut reader).transpose()) {
-        if let rustls_pemfile::Item::X509Certificate(cert) = item.unwrap() {
-            certs.push(cert.into_owned());
-        }
-    }
+    let certs: Vec<_> = CertificateDer::pem_slice_iter(cert_bytes)
+        .collect::<Result<_, _>>()
+        .unwrap();
     if certs.is_empty() {
         panic!("No certs found");
     }

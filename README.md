@@ -55,7 +55,7 @@ Download from [GitHub Releases](https://github.com/cfal/tobaru/releases) for:
 
 ### Build from Source
 
-Requires Rust 1.70+ and cargo:
+Requires Rust 1.88+ and cargo:
 
 ```bash
 cargo install tobaru

@@ -2,6 +2,7 @@
 name = "tobaru"
 version = "0.9.5"
 edition = "2021"
+rust-version = "1.88"
 license = "MIT"
 description = "Port forwarding CLI utility written in Rust with allowlists, TLS SNI and ALPN routing, HTTP forwarding, load balancing, IP-to-destination mapping, and iptables support."
 homepage = "https://github.com/cfal/tobaru/"
@@ -20,7 +21,6 @@ log = { version = "*", features = ["release_max_level_info"] }
 parking_lot = "*"
 percent-encoding = "*"
 rustls = { version = "*", default-features = false, features = ["aws_lc_rs", "std", "logging", "tls12"] }
-rustls-pemfile = { version = "*" }
 serde = { version = "*", features = ["derive", "std"] }
 serde_json = "*"
 serde_yaml = "*"
@@ -35,6 +35,9 @@ rand = "*"
 memchr = "*"
 mime_guess = "*"
 socket2 = "*"
+
+[dev-dependencies]
+rcgen = { version = "*", default-features = false, features = ["aws_lc_rs", "pem"] }
 
 [profile.release]
 opt-level = 3
