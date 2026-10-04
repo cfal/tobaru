@@ -377,3 +377,40 @@ async fn same_prefix_host_actions_and_default_use_the_selected_backend() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn directory_checks_index_symlinks_and_canonicalizes_the_root() {
+    checked(async {
+        let files = Files::new();
+        let root = files.0.join("static");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(files.0.join("outside.txt"), "private").unwrap();
+        std::os::unix::fs::symlink(files.0.join("outside.txt"), root.join("sub/index.html"))
+            .unwrap();
+        std::fs::write(root.join("index.html"), "public").unwrap();
+        let alias = files.0.join("alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        for path in ["/sub/", "/sub/index.html"] {
+            let default = action(json!({"type": "serve-directory", "path": alias}));
+            let (mut client, mut task) = session(default, Trie::new(), None);
+            client
+                .write_all(
+                    format!("GET {path} HTTP/1.1\r\nHost: a.test\r\nConnection: close\r\n\r\n")
+                        .as_bytes(),
+                )
+                .await
+                .unwrap();
+            assert!(rest(&mut client).await.is_empty());
+            assert!((&mut task.0).await.unwrap().is_err());
+        }
+        let default = action(json!({"type": "serve-directory", "path": alias}));
+        let (mut client, _task) = session(default, Trie::new(), None);
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: a.test\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        assert!(head(&mut client).await.starts_with("HTTP/1.1 200"));
+        assert_eq!(rest(&mut client).await, b"6\r\npublic\r\n0\r\n\r\n");
+    })
+    .await;
+}

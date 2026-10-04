@@ -104,103 +104,88 @@ impl Session<'_> {
                     )));
                 }
                 let file_path = string_util::update_base_path(&request_path, base_path, path);
-                match tokio::fs::canonicalize(file_path).await {
-                    Ok(mut canonical_path) => {
-                        // We filter out '..' from requests, so can this still occur?
-                        if !canonical_path.starts_with(path) {
-                            return Err(std::io::Error::other(format!(
-                                "Canonical path ({}) does not start with serve path ({})",
-                                canonical_path.display(),
-                                path
-                            )));
-                        }
+                match resolve_file(path, &file_path).await {
+                    Ok(canonical_path) => match tokio::fs::metadata(&canonical_path).await {
+                        Ok(m) if m.is_file() => {
+                            let mime_type =
+                                MimeGuess::from_path(&canonical_path).first_or_octet_stream();
+                            let mut file = File::open(canonical_path).await?;
+                            let mut buf = allocate_vec(4096);
 
-                        if canonical_path.is_dir() {
-                            canonical_path.push("index.html");
-                        }
+                            let mut ok_response = format!("HTTP/1.1 200\r\ntransfer-encoding: chunked\r\ncontent-type: {}\r\n", mime_type.essence_str());
+                            response_headers.append_headers_to_string(&mut ok_response);
+                            if let Some(header_name) = response_id_header_name {
+                                (header_name, &request_id)
+                                    .append_header_to_string(&mut ok_response);
+                            }
 
-                        match tokio::fs::metadata(&canonical_path).await {
-                            Ok(m) if m.is_file() => {
-                                let mime_type =
-                                    MimeGuess::from_path(&canonical_path).first_or_octet_stream();
-                                let mut file = File::open(canonical_path).await?;
-                                let mut buf = allocate_vec(4096);
+                            let request_connection_close =
+                                request_data.headers().connection_close();
+                            if request_connection_close {
+                                ok_response.push_str("connection: close\r\n");
+                            } else {
+                                ok_response.push_str("connection: keep-alive\r\n");
+                            };
 
-                                let mut ok_response = format!("HTTP/1.1 200\r\ntransfer-encoding: chunked\r\ncontent-type: {}\r\n", mime_type.essence_str());
-                                response_headers.append_headers_to_string(&mut ok_response);
-                                if let Some(header_name) = response_id_header_name {
-                                    (header_name, &request_id)
-                                        .append_header_to_string(&mut ok_response);
-                                }
+                            ok_response.push_str("\r\n");
+                            write_all(&mut stream, &ok_response.into_bytes()).await?;
 
-                                let request_connection_close =
-                                    request_data.headers().connection_close();
-                                if request_connection_close {
-                                    ok_response.push_str("connection: close\r\n");
-                                } else {
-                                    ok_response.push_str("connection: keep-alive\r\n");
-                                };
-
-                                ok_response.push_str("\r\n");
-                                write_all(&mut stream, &ok_response.into_bytes()).await?;
-
-                                if verb == "GET" {
-                                    loop {
-                                        let read_len = file.read(&mut buf).await?;
-                                        if read_len == 0 {
-                                            break;
-                                        }
-                                        write_all(
-                                            &mut stream,
-                                            &format!("{:X}\r\n", read_len).into_bytes(),
-                                        )
-                                        .await?;
-                                        write_all(&mut stream, &buf[0..read_len]).await?;
-                                        write_all(&mut stream, b"\r\n").await?;
+                            if verb == "GET" {
+                                loop {
+                                    let read_len = file.read(&mut buf).await?;
+                                    if read_len == 0 {
+                                        break;
                                     }
-                                    stream.write_all(b"0\r\n\r\n").await?;
+                                    write_all(
+                                        &mut stream,
+                                        &format!("{:X}\r\n", read_len).into_bytes(),
+                                    )
+                                    .await?;
+                                    write_all(&mut stream, &buf[0..read_len]).await?;
+                                    write_all(&mut stream, b"\r\n").await?;
                                 }
-
-                                info!(
-                                    "[{}] {} {} [serve file: {}]",
-                                    LOG_PREFIX,
-                                    verb,
-                                    request_path,
-                                    mime_type.essence_str()
-                                );
-
-                                if request_connection_close {
-                                    return Ok(Outcome::Close);
-                                }
+                                stream.write_all(b"0\r\n\r\n").await?;
                             }
-                            _ => {
-                                let mut not_found_response =
-                                    String::from("HTTP/1.1 404\r\ncontent-length: 0\r\n");
-                                let request_connection_close =
-                                    request_data.headers().connection_close();
-                                if request_connection_close {
-                                    not_found_response.push_str("connection: close\r\n");
-                                } else {
-                                    not_found_response.push_str("connection: keep-alive\r\n");
-                                };
-                                if let Some(header_name) = response_id_header_name {
-                                    (header_name, &request_id)
-                                        .append_header_to_string(&mut not_found_response);
-                                }
-                                not_found_response.push_str("\r\n");
-                                write_all(&mut stream, &not_found_response.into_bytes()).await?;
 
-                                info!(
-                                    "[{}] {} {} [serve file: invalid, not a file]",
-                                    LOG_PREFIX, verb, request_path
-                                );
+                            info!(
+                                "[{}] {} {} [serve file: {}]",
+                                LOG_PREFIX,
+                                verb,
+                                request_path,
+                                mime_type.essence_str()
+                            );
 
-                                if request_connection_close {
-                                    return Ok(Outcome::Close);
-                                }
+                            if request_connection_close {
+                                return Ok(Outcome::Close);
                             }
                         }
-                    }
+                        _ => {
+                            let mut not_found_response =
+                                String::from("HTTP/1.1 404\r\ncontent-length: 0\r\n");
+                            let request_connection_close =
+                                request_data.headers().connection_close();
+                            if request_connection_close {
+                                not_found_response.push_str("connection: close\r\n");
+                            } else {
+                                not_found_response.push_str("connection: keep-alive\r\n");
+                            };
+                            if let Some(header_name) = response_id_header_name {
+                                (header_name, &request_id)
+                                    .append_header_to_string(&mut not_found_response);
+                            }
+                            not_found_response.push_str("\r\n");
+                            write_all(&mut stream, &not_found_response.into_bytes()).await?;
+
+                            info!(
+                                "[{}] {} {} [serve file: invalid, not a file]",
+                                LOG_PREFIX, verb, request_path
+                            );
+
+                            if request_connection_close {
+                                return Ok(Outcome::Close);
+                            }
+                        }
+                    },
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                         let mut not_found_response =
                             String::from("HTTP/1.1 404\r\ncontent-length: 0\r\n");
@@ -243,4 +228,20 @@ impl Session<'_> {
         }
         Ok(Outcome::Continue)
     }
+}
+
+async fn resolve_file(root: &str, requested: &str) -> std::io::Result<std::path::PathBuf> {
+    let root = tokio::fs::canonicalize(root).await?;
+    let mut path = tokio::fs::canonicalize(requested).await?;
+    if !path.starts_with(&root) {
+        return Err(std::io::Error::other("File is outside the serving root"));
+    }
+    if tokio::fs::metadata(&path).await?.is_dir() {
+        path = tokio::fs::canonicalize(path.join("index.html")).await?;
+    }
+    // The index may itself be a symlink. Check the final target, not just its directory.
+    if !path.starts_with(&root) {
+        return Err(std::io::Error::other("Index is outside the serving root"));
+    }
+    Ok(path)
 }
