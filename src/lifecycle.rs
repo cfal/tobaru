@@ -4,9 +4,11 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::Arc;
 
 use log::{error, info};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use parking_lot::Mutex;
 use tokio::sync::mpsc::{channel, Receiver};
 use tokio::sync::oneshot;
 use tokio::task::JoinSet;
@@ -71,34 +73,60 @@ fn relevant_event(event: &Event, paths: &HashSet<PathBuf>) -> bool {
     ) && event.paths.iter().any(|path| paths.contains(path))
 }
 
-fn watch_configs(config_paths: &[String]) -> io::Result<(RecommendedWatcher, Receiver<()>)> {
-    let mut paths = HashSet::new();
-    let mut parents = HashSet::new();
-    for config_path in config_paths {
-        let path = std::path::absolute(config_path)?;
-        let parent = path.parent().unwrap_or(Path::new("/"));
-        let parent = std::fs::canonicalize(parent)?;
-        let name = path
-            .file_name()
-            .ok_or_else(|| io::Error::other("Invalid config path"))?;
-        paths.insert(parent.join(name));
-        parents.insert(parent);
+struct ConfigWatcher {
+    watcher: RecommendedWatcher,
+    parents: HashSet<PathBuf>,
+    paths: Arc<Mutex<HashSet<PathBuf>>>,
+}
+
+impl ConfigWatcher {
+    fn refresh(&mut self, config_paths: &[String]) -> io::Result<()> {
+        let mut paths = HashSet::new();
+        for config_path in config_paths {
+            let path = std::path::absolute(config_path)?;
+            let parent = std::fs::canonicalize(path.parent().unwrap_or(Path::new("/")))?;
+            let name = path
+                .file_name()
+                .ok_or_else(|| io::Error::other("Invalid config path"))?;
+            paths.insert(parent.join(name));
+            paths.insert(std::fs::canonicalize(&path)?);
+        }
+        let parents: HashSet<_> = paths
+            .iter()
+            .filter_map(|path| path.parent().map(Path::to_path_buf))
+            .collect();
+        for parent in parents.difference(&self.parents) {
+            self.watcher
+                .watch(parent, RecursiveMode::NonRecursive)
+                .map_err(io::Error::other)?;
+        }
+        *self.paths.lock() = paths;
+        for parent in self.parents.difference(&parents) {
+            self.watcher.unwatch(parent).map_err(io::Error::other)?;
+        }
+        self.parents = parents;
+        Ok(())
     }
+}
+
+fn watch_configs(config_paths: &[String]) -> io::Result<(ConfigWatcher, Receiver<()>)> {
     let (tx, rx) = channel(1);
-    let mut watcher =
-        notify::recommended_watcher(move |result: notify::Result<Event>| match result {
-            Ok(event) if relevant_event(&event, &paths) => {
-                let _ = tx.try_send(());
-            }
-            Ok(_) => {}
-            Err(error) => error!("Config watch error: {error}"),
-        })
-        .map_err(io::Error::other)?;
-    for parent in parents {
-        watcher
-            .watch(&parent, RecursiveMode::NonRecursive)
-            .map_err(io::Error::other)?;
-    }
+    let paths = Arc::new(Mutex::new(HashSet::new()));
+    let event_paths = paths.clone();
+    let watcher = notify::recommended_watcher(move |result: notify::Result<Event>| match result {
+        Ok(event) if relevant_event(&event, &event_paths.lock()) => {
+            let _ = tx.try_send(());
+        }
+        Ok(_) => {}
+        Err(error) => error!("Config watch error: {error}"),
+    })
+    .map_err(io::Error::other)?;
+    let mut watcher = ConfigWatcher {
+        watcher,
+        paths,
+        parents: HashSet::new(),
+    };
+    watcher.refresh(config_paths)?;
     Ok((watcher, rx))
 }
 
@@ -186,6 +214,11 @@ pub async fn run(
         info!("iptables cleared of all tobaru rules");
         return Ok(());
     }
+    let watch = if quick.is_none() {
+        Some(watch_configs(&paths)?)
+    } else {
+        None
+    };
     let configs = config::load_server_configs(paths.clone(), urls.clone()).await?;
     if configs.is_empty() {
         return Err(io::Error::other("No server configs found"));
@@ -200,7 +233,8 @@ pub async fn run(
         info!("Dry run complete");
         return Ok(());
     }
-    let (_watcher, mut changes) = watch_configs(&paths)?;
+    let (mut watcher, mut changes) =
+        watch.expect("normal startup installs config watches before loading");
     clear_rules(&firewall).await?;
     let mut servers = JoinSet::new();
     let mut stops = start_servers(tasks, &mut servers);
@@ -215,6 +249,7 @@ pub async fn run(
         let replacement = supervise_until(&mut servers, async {
             sleep(Duration::from_secs(3)).await;
             while changes.try_recv().is_ok() {}
+            watcher.refresh(&paths)?;
             let configs = config::load_server_configs(paths.clone(), urls.clone()).await?;
             if configs.is_empty() {
                 return Err(io::Error::other("No server configs found"));
@@ -243,6 +278,85 @@ pub async fn run(
 mod tests {
     use super::*;
     use notify::event::{CreateKind, ModifyKind, RemoveKind};
+
+    struct WatchFiles(PathBuf);
+
+    impl WatchFiles {
+        fn new() -> Self {
+            let suffix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root = PathBuf::from(std::env::var_os("HOME").unwrap())
+                .join("tmp")
+                .join(format!("tobaru-watch-{}-{suffix}", std::process::id()));
+            std::fs::create_dir_all(root.join("a")).unwrap();
+            std::fs::create_dir_all(root.join("b")).unwrap();
+            Self(std::fs::canonicalize(root).unwrap())
+        }
+    }
+
+    impl Drop for WatchFiles {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn config_watches_capture_changes_before_the_first_load() {
+        let files = WatchFiles::new();
+        let path = files.0.join("config.json");
+        std::fs::write(&path, "old").unwrap();
+        let (_watcher, mut changes) = watch_configs(&[path.to_str().unwrap().into()]).unwrap();
+        let replacement = files.0.join("replacement.json");
+        std::fs::write(&replacement, "new").unwrap();
+        std::fs::rename(replacement, &path).unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), changes.recv())
+                .await
+                .unwrap(),
+            Some(())
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "new");
+    }
+
+    #[tokio::test]
+    async fn config_watches_follow_symlink_targets_and_retargeted_links() {
+        let files = WatchFiles::new();
+        let first = files.0.join("a/config.json");
+        let second = files.0.join("b/config.json");
+        let link = files.0.join("config.json");
+        std::fs::write(&first, "first").unwrap();
+        std::fs::write(&second, "second").unwrap();
+        std::os::unix::fs::symlink(&first, &link).unwrap();
+        let paths = [link.to_str().unwrap().into()];
+        let (mut watcher, mut changes) = watch_configs(&paths).unwrap();
+        std::fs::write(&first, "updated").unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), changes.recv())
+                .await
+                .unwrap(),
+            Some(())
+        );
+
+        let replacement = files.0.join("replacement.json");
+        std::os::unix::fs::symlink(&second, &replacement).unwrap();
+        std::fs::rename(replacement, &link).unwrap();
+        watcher.refresh(&paths).unwrap();
+        assert_eq!(*watcher.paths.lock(), HashSet::from([link, second.clone()]));
+        assert_eq!(
+            watcher.parents,
+            HashSet::from([files.0.clone(), files.0.join("b")])
+        );
+        while changes.try_recv().is_ok() {}
+        std::fs::write(&second, "retargeted").unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), changes.recv())
+                .await
+                .unwrap(),
+            Some(())
+        );
+    }
 
     #[tokio::test(start_paused = true)]
     async fn listener_failures_interrupt_reload_work() {
