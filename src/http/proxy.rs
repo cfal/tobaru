@@ -1,7 +1,9 @@
 use std::io;
+use std::pin::Pin;
+use std::task::Poll;
 
 use log::info;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use super::body::{forward_body, request_framing, response_framing, write_head, Framing};
 use super::header_map::HeaderMap;
@@ -45,12 +47,10 @@ impl<'a> Session<'a> {
         &mut self,
         action: &'a TargetHttpActionData,
     ) -> io::Result<CachedTarget<'a>> {
-        if self
-            .cached_target
-            .as_ref()
-            .is_some_and(|target| std::ptr::eq(target.action, action))
-        {
-            return Ok(self.cached_target.take().unwrap());
+        if let Some(target) = &mut self.cached_target {
+            if std::ptr::eq(target.action, action) && transport_is_idle(&mut target.stream).await {
+                return Ok(self.cached_target.take().unwrap());
+            }
         }
         self.close_target().await;
         let TargetHttpActionData::Forward {
@@ -219,6 +219,20 @@ impl<'a> Session<'a> {
             Ok(Outcome::Continue)
         }
     }
+}
+
+async fn transport_is_idle<R: AsyncRead + Unpin>(stream: &mut R) -> bool {
+    // With no outstanding request, ready bytes, EOF, and errors all forbid reuse.
+    std::future::poll_fn(|cx| {
+        let mut byte = [0];
+        let mut buffer = ReadBuf::new(&mut byte);
+        Poll::Ready(
+            Pin::new(&mut *stream)
+                .poll_read(cx, &mut buffer)
+                .is_pending(),
+        )
+    })
+    .await
 }
 
 async fn exchange(

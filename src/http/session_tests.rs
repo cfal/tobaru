@@ -817,6 +817,49 @@ async fn surplus_after_a_final_response_is_never_reused() {
 }
 
 #[tokio::test]
+async fn surplus_beyond_the_reader_buffer_is_not_reused() {
+    checked(async {
+        let (listener, address) = backend().await;
+        let mut upstream = Task(tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            head(&mut first).await;
+            let mut response = b"HTTP/1.1 200 OK\r\nContent-Length: 32726\r\n\r\n".to_vec();
+            response.extend(vec![b'A'; 32726]);
+            assert_eq!(response.len(), 32768);
+            response.extend_from_slice(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nFAKE");
+            first.write_all(&response).await.unwrap();
+            assert!(rest(&mut first).await.is_empty());
+            let (mut second, _) = listener.accept().await.unwrap();
+            head(&mut second).await;
+            second
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nREAL")
+                .await
+                .unwrap();
+        }));
+        let (mut client, _task) = session(forward(address), Trie::new(), None);
+        client
+            .write_all(b"GET /first HTTP/1.1\r\nHost: a.test\r\n\r\n")
+            .await
+            .unwrap();
+        head(&mut client).await;
+        let mut body = vec![0; 32726];
+        client.read_exact(&mut body).await.unwrap();
+        assert_eq!(body, vec![b'A'; 32726]);
+        client
+            .write_all(b"GET /second HTTP/1.1\r\nHost: a.test\r\n\r\n")
+            .await
+            .unwrap();
+        head(&mut client).await;
+        let mut second_body = [0; 4];
+        client.read_exact(&mut second_body).await.unwrap();
+        assert_eq!(&second_body, b"REAL");
+        assert!(rest(&mut client).await.is_empty());
+        (&mut upstream.0).await.unwrap();
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn early_eof_delimited_rejection_receives_request_eof() {
     checked(async {
         let (listener, address) = backend().await;
