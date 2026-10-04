@@ -3,6 +3,7 @@ mod ip_mask;
 mod location;
 mod option_util;
 mod sni_value;
+mod validation;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -412,7 +413,7 @@ impl<'de> Deserialize<'de> for TcpAction {
         let protocol = map
             .get("protocol")
             .and_then(serde_json::Value::as_str)
-            .unwrap();
+            .ok_or_else(|| serde::de::Error::custom("protocol must be a string"))?;
 
         match protocol {
             "raw" => {
@@ -639,20 +640,26 @@ impl<'de> Deserialize<'de> for HttpPathAction {
                             serde_json::Value::Object(json_map),
                         )
                         .map_err(serde::de::Error::custom)?;
-                        Ok(HttpPathAction::ServeMessage(config))
+                        let action = HttpPathAction::ServeMessage(config);
+                        action.validate().map_err(serde::de::Error::custom)?;
+                        Ok(action)
                     }
                     "serve-directory" => {
                         let config = HttpServeDirectoryConfig::deserialize(
                             serde_json::Value::Object(json_map),
                         )
                         .map_err(serde::de::Error::custom)?;
-                        Ok(HttpPathAction::ServeDirectory(config))
+                        let action = HttpPathAction::ServeDirectory(config);
+                        action.validate().map_err(serde::de::Error::custom)?;
+                        Ok(action)
                     }
                     "forward" => {
                         let config =
                             HttpForwardConfig::deserialize(serde_json::Value::Object(json_map))
                                 .map_err(serde::de::Error::custom)?;
-                        Ok(HttpPathAction::Forward(config))
+                        let action = HttpPathAction::Forward(config);
+                        action.validate().map_err(serde::de::Error::custom)?;
+                        Ok(action)
                     }
                     _ => Err(serde::de::Error::unknown_variant(
                         action_type,
