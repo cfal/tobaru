@@ -2,8 +2,8 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import net from 'node:net';
 import { once } from 'node:events';
-import { spawn } from 'node:child_process';
-import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { spawn, spawnSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, writeFileSync, renameSync, rmSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -14,7 +14,7 @@ const binary = resolve(process.argv[2] ?? join(root, 'target/release/tobaru'));
 const scratch = join(homedir(), 'tmp');
 mkdirSync(scratch, { recursive: true });
 const directory = mkdtempSync(join(scratch, 'tobaru-http-smoke-'));
-const signal = AbortSignal.timeout(15_000);
+const signal = AbortSignal.timeout(30_000);
 const sockets = new Set();
 const agent = new http.Agent({ keepAlive: true, maxSockets: 1 });
 let connections = 0;
@@ -50,6 +50,13 @@ async function listen(server) {
 async function close(server) {
   if (server.listening) {
     await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+  }
+}
+
+async function waitForLog(message) {
+  while (!logs.includes(message)) {
+    if (child.exitCode !== null || child.signalCode !== null) throw new Error('Proxy exited during reload');
+    await delay(25, undefined, { signal });
   }
 }
 
@@ -137,7 +144,45 @@ try {
   assert.equal((wire.match(/HTTP\/1\.1 200/g) ?? []).length, 2);
   assert.equal((wire.match(/working/g) ?? []).length, 2);
   assert.equal(connections, 2, 'Each frontend connection owns its backend');
-  console.log('HTTP CLI smoke passed: config/TCP dispatch, backend reuse, HEAD, ordered cookies, Expect, 128 KiB echo, pipelining.');
+
+  const failurePath = join(directory, 'invalid.json');
+  const assertFailure = args => {
+    const failed = spawnSync(binary, ['-t', '1', ...args], { timeout: 5000, encoding: 'utf8' });
+    assert.equal(failed.error, undefined);
+    assert.equal(failed.status, 1, failed.stderr);
+    assert.doesNotMatch(failed.stderr, /panicked/);
+  };
+  assertFailure([join(directory, 'missing.json')]);
+  writeFileSync(failurePath, JSON.stringify([{ ...config[0], address: `0.0.0.0:${backendPort}` }]));
+  assertFailure([failurePath]);
+  writeFileSync(failurePath, JSON.stringify([{ ...config[0], target: { allowlist: '127.0.0.1/32', location: 'backend:abc' } }]));
+  assertFailure(['--dry-run', failurePath]);
+
+  writeFileSync(configPath, '{invalid');
+  await waitForLog('Config reload rejected');
+  assert.equal((await request(port, 'GET', '/')).body.toString(), 'working');
+  logs = '';
+  writeFileSync(configPath, JSON.stringify([{ ...config[0], target: {
+    allowlist: '127.0.0.1/32', location: `127.0.0.1:${backendPort}`,
+    server_tls: { cert: join(directory, 'missing.pem'), key: join(directory, 'missing.key') },
+  } }]));
+  await waitForLog('Config reload rejected');
+  assert.equal((await request(port, 'GET', '/')).body.toString(), 'working');
+  for (const content of ['atomic-one', 'atomic-two']) {
+    logs = '';
+    const replacement = [{ ...config[0], target: {
+      allowlist: '127.0.0.1/32',
+      default_http_action: { type: 'serve-message', status_code: 200, content },
+    } }];
+    const staged = join(directory, 'replacement.json');
+    writeFileSync(staged, JSON.stringify(replacement));
+    renameSync(staged, configPath);
+    await waitForLog('Config reload complete');
+    // Established TCP sessions intentionally keep their old configuration.
+    agent.destroy();
+    assert.equal((await request(port, 'GET', '/')).body.toString(), content);
+  }
+  console.log('HTTP CLI smoke passed: dispatch, reuse, HEAD, ordered cookies, Expect, echo, pipelining, last-good reload, repeated atomic saves.');
 } catch (error) {
   console.error(logs);
   throw error;

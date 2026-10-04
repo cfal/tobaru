@@ -36,11 +36,11 @@ fn get_timestamp_secs() -> u32 {
     SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs() as u32
 }
 
-pub async fn run_udp_server(
+pub fn prepare_udp_server(
     server_address: SocketAddr,
     use_iptables: bool,
     target_configs: Vec<UdpTargetConfig>,
-) -> std::io::Result<()> {
+) -> std::io::Result<impl std::future::Future<Output = std::io::Result<()>> + Send> {
     let mut lookup_table = IpLookupTable::new();
     let associations: Arc<Mutex<HashMap<SocketAddr, Association>>> =
         Arc::new(Mutex::new(HashMap::new()));
@@ -76,91 +76,93 @@ pub async fn run_udp_server(
                 .insert(addr, masklen, target_data.clone())
                 .is_some()
             {
-                panic!(
+                return Err(std::io::Error::other(format!(
                     "Address {}/{} is duplicated in another target.",
                     addr, masklen
-                );
+                )));
             }
         }
     }
 
-    if lookup_table.is_empty() {
-        warn!(
-            "Server does not accept any addresses, skipping: {}",
-            server_address
-        );
-        return Ok(());
-    }
-
-    if use_iptables {
-        let ip_masks: Vec<IpMask> = lookup_table
-            .iter()
-            .map(|(addr, masklen, _)| IpMask(addr, masklen))
-            .collect();
-        configure_iptables(Protocol::Udp, server_address, &ip_masks).await;
-    }
-
-    for entry in lookup_table.iter() {
-        debug!("Lookup table entry: {:?} (masklen {})", entry.0, entry.1);
-    }
-
-    let server_socket = Arc::new(UdpSocket::bind(&server_address).await?);
-    println!("Listening (UDP): {}", server_address);
-
-    let mut buf = [0u8; MAX_UDP_PACKET_SIZE];
-
-    let _cleanup_drop_guard = TaskDropGuard(start_cleanup_task(
-        associations.clone(),
-        min_association_timeout_secs,
-    ));
-
-    loop {
-        let (len, addr) = server_socket.recv_from(&mut buf).await?;
-
-        let ip = match addr.ip() {
-            IpAddr::V4(a) => a.to_ipv6_mapped(),
-            IpAddr::V6(a) => a,
-        };
-
-        let target_data = match lookup_table.longest_match(ip) {
-            Some((_, _, d)) => d,
-            None => {
-                // Not allowed.
-                warn!("Unknown address, ignoring: {}", addr.ip());
-                continue;
-            }
-        };
-
-        let copied_msg = buf[0..len].to_vec().into_boxed_slice();
-
-        let send_result = match associations.lock().entry(addr) {
-            Entry::Occupied(o) => o.get().try_send(copied_msg),
-            Entry::Vacant(v) => {
-                let target_address = if target_data.addresses.len() > 1 {
-                    // fetch_add wraps around on overflow.
-                    let index = target_data
-                        .next_address_index
-                        .fetch_add(1, Ordering::Relaxed);
-                    &target_data.addresses[index % target_data.addresses.len()]
-                } else {
-                    &target_data.addresses[0]
-                };
-                debug!("Creating new association: {} -> {}", addr, target_address);
-                let new_assoc = Association::new(
-                    addr,
-                    server_socket.clone(),
-                    target_address.clone(),
-                    target_data.association_timeout_secs,
-                );
-                v.insert(new_assoc).try_send(copied_msg)
-            }
-        };
-
-        // Sends can fail if the channel is full.
-        if let Err(e) = send_result {
-            error!("Failed to send: {}", e);
+    Ok(async move {
+        if lookup_table.is_empty() {
+            warn!(
+                "Server does not accept any addresses, skipping: {}",
+                server_address
+            );
+            return Ok(());
         }
-    }
+
+        let server_socket = Arc::new(UdpSocket::bind(&server_address).await?);
+        if use_iptables {
+            let ip_masks: Vec<IpMask> = lookup_table
+                .iter()
+                .map(|(addr, masklen, _)| IpMask(addr, masklen))
+                .collect();
+            configure_iptables(Protocol::Udp, server_address, &ip_masks).await?;
+        }
+
+        for entry in lookup_table.iter() {
+            debug!("Lookup table entry: {:?} (masklen {})", entry.0, entry.1);
+        }
+
+        println!("Listening (UDP): {}", server_address);
+
+        let mut buf = [0u8; MAX_UDP_PACKET_SIZE];
+
+        let _cleanup_drop_guard = TaskDropGuard(start_cleanup_task(
+            associations.clone(),
+            min_association_timeout_secs,
+        ));
+
+        loop {
+            let (len, addr) = server_socket.recv_from(&mut buf).await?;
+
+            let ip = match addr.ip() {
+                IpAddr::V4(a) => a.to_ipv6_mapped(),
+                IpAddr::V6(a) => a,
+            };
+
+            let target_data = match lookup_table.longest_match(ip) {
+                Some((_, _, d)) => d,
+                None => {
+                    // Not allowed.
+                    warn!("Unknown address, ignoring: {}", addr.ip());
+                    continue;
+                }
+            };
+
+            let copied_msg = buf[0..len].to_vec().into_boxed_slice();
+
+            let send_result = match associations.lock().entry(addr) {
+                Entry::Occupied(o) => o.get().try_send(copied_msg),
+                Entry::Vacant(v) => {
+                    let target_address = if target_data.addresses.len() > 1 {
+                        // fetch_add wraps around on overflow.
+                        let index = target_data
+                            .next_address_index
+                            .fetch_add(1, Ordering::Relaxed);
+                        &target_data.addresses[index % target_data.addresses.len()]
+                    } else {
+                        &target_data.addresses[0]
+                    };
+                    debug!("Creating new association: {} -> {}", addr, target_address);
+                    let new_assoc = Association::new(
+                        addr,
+                        server_socket.clone(),
+                        target_address.clone(),
+                        target_data.association_timeout_secs,
+                    );
+                    v.insert(new_assoc).try_send(copied_msg)
+                }
+            };
+
+            // Sends can fail if the channel is full.
+            if let Err(e) = send_result {
+                error!("Failed to send: {}", e);
+            }
+        }
+    })
 }
 
 struct TaskDropGuard<T>(JoinHandle<T>);

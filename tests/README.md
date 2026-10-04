@@ -20,4 +20,6 @@ Omitting the argument selects `target/release/tobaru` relative to the repository
 With a custom `CARGO_TARGET_DIR`, pass that directory's binary explicitly.
 Temporary listeners use ephemeral ports and localhost-only allowlists. Fixtures
 are created beneath `$HOME/tmp` and removed on completion or failure. The test
-has a 15-second deadline and cleans up its child process and sockets.
+has a 30-second deadline and cleans up its child process and sockets. It also
+checks that invalid reloads retain the last-good configuration and repeated
+atomic file replacements remain observable.

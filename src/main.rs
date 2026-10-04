@@ -5,6 +5,7 @@ mod domain_trie;
 mod hostname_util;
 mod http;
 mod iptables_util;
+mod lifecycle;
 mod rustls_util;
 mod socket_util;
 mod tcp;
@@ -15,78 +16,9 @@ mod udp;
 mod util;
 
 use std::io::Write;
-use std::path::Path;
 
 use log::{debug, error};
-use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::runtime::Builder;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
-
-use crate::config::{ServerConfig, TargetConfigs};
-use crate::tcp::run_tcp_server;
-use crate::udp::run_udp_server;
-
-#[derive(Debug)]
-struct ConfigChanged;
-
-fn start_notify_thread(
-    config_paths: Vec<String>,
-) -> (RecommendedWatcher, UnboundedReceiver<ConfigChanged>) {
-    let (tx, rx) = unbounded_channel();
-
-    let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| match res {
-        Ok(event) => {
-            if matches!(event.kind, EventKind::Modify(..)) {
-                tx.send(ConfigChanged {}).unwrap();
-            }
-        }
-        Err(e) => println!("watch error: {:?}", e),
-    })
-    .unwrap();
-
-    for config_path in config_paths {
-        watcher
-            .watch(Path::new(&config_path), RecursiveMode::NonRecursive)
-            .unwrap();
-    }
-
-    (watcher, rx)
-}
-
-async fn run(server_config: ServerConfig) {
-    let ServerConfig {
-        address,
-        use_iptables,
-        target_configs,
-    } = server_config;
-
-    match target_configs {
-        TargetConfigs::Tcp {
-            tcp_nodelay,
-            tcp_keepalive,
-            targets,
-        } => {
-            // TODO: restart or panic?
-            if let Err(e) = run_tcp_server(
-                address,
-                use_iptables,
-                tcp_nodelay,
-                tcp_keepalive,
-                targets.into_vec(),
-            )
-            .await
-            {
-                error!("TCP forwarder finished with error: {}", e);
-            }
-        }
-        TargetConfigs::Udp { targets } => {
-            // TODO: restart or panic?
-            if let Err(e) = run_udp_server(address, use_iptables, targets.into_vec()).await {
-                error!("UDP forwarder finished with error: {}", e);
-            }
-        }
-    }
-}
 
 fn help_str(command: &str) -> String {
     const HELP_STR: &str = "USAGE:
@@ -104,6 +36,9 @@ OPTIONS:
     --clear-iptables-matching
         Clear tobaru-created rules for the addresses specified in the specified
         config files and exit immediately.
+
+    --dry-run
+        Load and validate configuration, including TLS files, without binding listeners.
 
     -h, --help
         Show this help screen.
@@ -224,7 +159,10 @@ fn main() {
         }
     }
 
-    if config_urls.is_empty() && config_paths.is_empty() {
+    if config_urls.is_empty()
+        && config_paths.is_empty()
+        && quick_action != Some(QuickAction::ClearIptablesAll)
+    {
         print_help(&command, Some("No config URLs or config paths specified"));
     }
 
@@ -250,62 +188,8 @@ fn main() {
         .build()
         .expect("Could not build tokio runtime");
 
-    runtime.block_on(async move {
-        if matches!(quick_action, Some(QuickAction::ClearIptablesAll)) {
-            iptables_util::clear_all_iptables().await;
-            println!("iptables cleared of all tobaru rules, exiting.");
-            return;
-        }
-
-        let (_watcher, mut config_rx) = start_notify_thread(config_paths.clone());
-        loop {
-            let server_configs: Vec<ServerConfig> =
-                config::load_server_configs(config_paths.clone(), config_urls.clone())
-                    .await
-                    .unwrap();
-
-            if server_configs.is_empty() {
-                error!("No server configs found.");
-                return;
-            }
-
-            debug!("Loaded server configs: {:#?}", server_configs);
-            if matches!(quick_action, Some(QuickAction::DryRun)) {
-                println!("Dry run complete, exiting.");
-                return;
-            }
-
-            let is_clear_matching =
-                matches!(quick_action, Some(QuickAction::ClearIptablesMatching));
-
-            for server_config in server_configs.iter() {
-                if server_config.use_iptables || is_clear_matching {
-                    iptables_util::clear_matching_iptables(server_config.address).await;
-                }
-            }
-
-            if is_clear_matching {
-                println!("iptables cleared of matching server rules, exiting.");
-                return;
-            }
-
-            let join_handles: Vec<_> = server_configs
-                .into_iter()
-                .map(|sc| tokio::spawn(run(sc)))
-                .collect();
-
-            config_rx.recv().await.unwrap();
-
-            println!("Configs changed, restarting servers in 3 seconds..");
-
-            for join_handle in join_handles {
-                join_handle.abort();
-            }
-
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-
-            // Remove any extra events
-            while config_rx.try_recv().is_ok() {}
-        }
-    });
+    if let Err(error) = runtime.block_on(lifecycle::run(config_paths, config_urls, quick_action)) {
+        error!("{error}");
+        std::process::exit(1);
+    }
 }

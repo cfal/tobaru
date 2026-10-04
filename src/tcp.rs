@@ -288,13 +288,13 @@ fn build_rustls_configs(
     }
 }
 
-pub async fn run_tcp_server(
+pub async fn prepare_tcp_server(
     server_address: SocketAddr,
     use_iptables: bool,
     tcp_nodelay: bool,
     tcp_keepalive: TcpKeepaliveOption,
     target_configs: Vec<TcpTargetConfig>,
-) -> std::io::Result<()> {
+) -> std::io::Result<impl std::future::Future<Output = std::io::Result<()>> + Send> {
     let mut non_tls_lookup_table: IpLookupTable<Ipv6Addr, Arc<TargetData>> = IpLookupTable::new();
 
     let mut tls_lookup_table: IpLookupTable<Ipv6Addr, bool> = IpLookupTable::new();
@@ -428,10 +428,10 @@ pub async fn run_tcp_server(
 
                     // .. but shouldn't be duplicated in a single config.
                     if config_lookup_table.insert(*addr, *masklen, true).is_some() {
-                        panic!(
+                        return Err(std::io::Error::other(format!(
                             "Address {}/{} is duplicated in the TLS config.",
                             addr, masklen
-                        );
+                        )));
                     }
                 }
 
@@ -479,10 +479,10 @@ pub async fn run_tcp_server(
                     .insert(*addr, *masklen, target_data.clone())
                     .is_some()
                 {
-                    panic!(
+                    return Err(std::io::Error::other(format!(
                         "Address {}/{} is duplicated in another non-tls target.",
                         addr, masklen
-                    );
+                    )));
                 }
             }
         }
@@ -490,88 +490,90 @@ pub async fn run_tcp_server(
         iptable_masks.extend(allowlist);
     }
 
-    if use_iptables {
-        configure_iptables(Protocol::Tcp, server_address, &iptable_masks).await;
-    }
-
     let sni_trie = Arc::new(sni_trie);
     let no_sni_targets = Arc::new(no_sni_targets);
 
-    let listener = TcpListener::bind(server_address).await.unwrap();
-    println!("Listening (TCP): {}", listener.local_addr().unwrap());
+    Ok(async move {
+        let listener = TcpListener::bind(server_address).await?;
+        if use_iptables {
+            configure_iptables(Protocol::Tcp, server_address, &iptable_masks).await?;
+        }
+        println!("Listening (TCP): {}", listener.local_addr()?);
 
-    loop {
-        let (stream, addr) = match listener.accept().await {
-            Ok(v) => v,
-            Err(e) => {
-                error!("Accept failed: {:?}", e);
+        loop {
+            let (stream, addr) = match listener.accept().await {
+                Ok(v) => v,
+                Err(e) => {
+                    error!("Accept failed: {:?}", e);
+                    continue;
+                }
+            };
+
+            let ip = match addr.ip() {
+                IpAddr::V4(a) => a.to_ipv6_mapped(),
+                IpAddr::V6(a) => a,
+            };
+
+            let non_tls_data = non_tls_lookup_table
+                .longest_match(ip)
+                .map(|(_, _, m)| m.clone());
+            let has_tls_data = tls_lookup_table.longest_match(ip).is_some();
+
+            if non_tls_data.is_none() && !has_tls_data {
+                warn!("Unknown address, not allowing: {}", addr.ip());
                 continue;
             }
-        };
 
-        let ip = match addr.ip() {
-            IpAddr::V4(a) => a.to_ipv6_mapped(),
-            IpAddr::V6(a) => a,
-        };
+            if tcp_nodelay {
+                if let Err(e) = stream.set_nodelay(true) {
+                    error!("Failed to set tcp_nodelay on server stream: {}", e);
+                }
+            }
 
-        let non_tls_data = non_tls_lookup_table
-            .longest_match(ip)
-            .map(|(_, _, m)| m.clone());
-        let has_tls_data = tls_lookup_table.longest_match(ip).is_some();
+            // Apply TCP keepalive on server-side (client-facing) connection
+            if let Some(keepalive_config) = tcp_keepalive.resolve_for_server() {
+                if let Err(e) = crate::socket_util::set_tcp_keepalive(
+                    &stream,
+                    Duration::from_secs(keepalive_config.idle_secs),
+                    Duration::from_secs(keepalive_config.interval_secs),
+                ) {
+                    error!("Failed to set tcp_keepalive on server stream: {}", e);
+                }
+            }
 
-        if non_tls_data.is_none() && !has_tls_data {
-            warn!("Unknown address, not allowing: {}", addr.ip());
-            continue;
-        }
-
-        if tcp_nodelay {
-            if let Err(e) = stream.set_nodelay(true) {
-                error!("Failed to set tcp_nodelay on server stream: {}", e);
+            if has_tls_data {
+                let cloned_sni_trie = sni_trie.clone();
+                let cloned_no_sni = no_sni_targets.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = process_tls_stream(
+                        stream,
+                        &addr,
+                        ip,
+                        non_tls_data,
+                        cloned_sni_trie,
+                        cloned_no_sni,
+                    )
+                    .await
+                    {
+                        error!("{} finished with error: {:?}", addr, e);
+                    } else {
+                        debug!("{} finished successfully", addr);
+                    }
+                });
+            } else {
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        run_stream_action(Box::new(stream), &addr, non_tls_data.unwrap(), None)
+                            .await
+                    {
+                        error!("{} finished with error: {:?}", addr, e);
+                    } else {
+                        debug!("{} finished successfully", addr);
+                    }
+                });
             }
         }
-
-        // Apply TCP keepalive on server-side (client-facing) connection
-        if let Some(keepalive_config) = tcp_keepalive.resolve_for_server() {
-            if let Err(e) = crate::socket_util::set_tcp_keepalive(
-                &stream,
-                Duration::from_secs(keepalive_config.idle_secs),
-                Duration::from_secs(keepalive_config.interval_secs),
-            ) {
-                error!("Failed to set tcp_keepalive on server stream: {}", e);
-            }
-        }
-
-        if has_tls_data {
-            let cloned_sni_trie = sni_trie.clone();
-            let cloned_no_sni = no_sni_targets.clone();
-            tokio::spawn(async move {
-                if let Err(e) = process_tls_stream(
-                    stream,
-                    &addr,
-                    ip,
-                    non_tls_data,
-                    cloned_sni_trie,
-                    cloned_no_sni,
-                )
-                .await
-                {
-                    error!("{} finished with error: {:?}", addr, e);
-                } else {
-                    debug!("{} finished successfully", addr);
-                }
-            });
-        } else {
-            tokio::spawn(async move {
-                if let Err(e) =
-                    run_stream_action(Box::new(stream), &addr, non_tls_data.unwrap(), None).await
-                {
-                    error!("{} finished with error: {:?}", addr, e);
-                } else {
-                    debug!("{} finished successfully", addr);
-                }
-            });
-        }
-    }
+    })
 }
 
 /// Resolves SNI candidates and computes ALPN hashes from a parsed ClientHello.

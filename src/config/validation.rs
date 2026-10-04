@@ -117,4 +117,20 @@ mod tests {
     fn non_string_protocol_is_a_config_error() {
         assert!(serde_json::from_value::<super::super::TcpAction>(json!({"protocol":3})).is_err());
     }
+
+    #[test]
+    fn malformed_network_locations_do_not_fall_back_to_unix_paths() {
+        for value in ["backend:abc", "backend:99999", "[::1]:invalid"] {
+            assert!(
+                serde_json::from_value::<super::super::TcpTargetLocation>(json!(value)).is_err()
+            );
+        }
+        for value in [
+            json!("/tmp/backend:socket"),
+            json!("backend.sock"),
+            json!({"path":"backend:socket"}),
+        ] {
+            assert!(serde_json::from_value::<super::super::TcpTargetLocation>(value).is_ok());
+        }
+    }
 }

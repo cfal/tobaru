@@ -719,12 +719,11 @@ impl<'de> Deserialize<'de> for TcpTargetLocation {
             where
                 E: serde::de::Error,
             {
-                // Try to parse as NetLocation
-                if let Ok(net_location) = NetLocation::try_from(value) {
-                    return Ok(TcpTargetLocation::OnlyAddress(net_location));
+                if value.contains(':') && !value.contains('/') {
+                    return NetLocation::try_from(value)
+                        .map(TcpTargetLocation::OnlyAddress)
+                        .map_err(serde::de::Error::custom);
                 }
-
-                // If not NetLocation, treat as PathBuf
                 Ok(TcpTargetLocation::OnlyPath(PathBuf::from(value)))
             }
 
@@ -1180,7 +1179,10 @@ pub async fn load_server_configs(
 
     for config_path in config_paths {
         let config_str = tokio::fs::read_to_string(&config_path).await?;
-        let configs = deserialize_configs(config_str, &config_path)?;
+        let configs =
+            tokio::task::spawn_blocking(move || deserialize_configs(config_str, &config_path))
+                .await
+                .map_err(std::io::Error::other)??;
         for config in configs {
             match config {
                 Config::ServerConfig(server_config) => {
