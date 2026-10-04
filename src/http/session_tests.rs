@@ -15,6 +15,12 @@ use crate::tcp::{TargetHttpActionData, TargetHttpPathData};
 
 struct Task<T>(JoinHandle<T>);
 
+impl Task<std::io::Result<()>> {
+    async fn finish(mut self) {
+        (&mut self.0).await.unwrap().unwrap();
+    }
+}
+
 impl<T> Drop for Task<T> {
     fn drop(&mut self) {
         self.0.abort();
@@ -146,7 +152,7 @@ async fn local_message_and_head_preserve_headers_and_ids() {
                 "response_headers": {"x-local": "yes"},
                 "response_id_header_name": "x-request-id"
             }));
-            let (mut client, _task) = session(default, Trie::new(), None);
+            let (mut client, task) = session(default, Trie::new(), None);
             client
                 .write_all(format!("{method} / HTTP/1.1\r\nHost: a.test\r\n\r\n").as_bytes())
                 .await
@@ -156,6 +162,7 @@ async fn local_message_and_head_preserve_headers_and_ids() {
             assert_eq!(values(&response, "x-local"), ["yes"]);
             assert!(values(&response, "x-request-id")[0].ends_with("#1"));
             let body = rest(&mut client).await;
+            task.finish().await;
             assert_eq!(
                 body,
                 if method == "HEAD" {
@@ -188,7 +195,7 @@ async fn initial_bytes_and_raw_routing_semantics_are_preserved() {
                 .insert("x-key".into(), HttpValueMatch::Single("secret".into()));
             paths.insert("/parent/child/".into(), vec![child]);
             let raw = format!("GET {target} HTTP/1.1\r\nHost: a.test\r\n\r\n");
-            let (mut client, _task) = session(
+            let (mut client, task) = session(
                 message("default"),
                 paths,
                 Some(raw.as_bytes()[..7].to_vec()),
@@ -199,6 +206,7 @@ async fn initial_bytes_and_raw_routing_semantics_are_preserved() {
                 rest(&mut client).await,
                 format!("{:X}\r\n{expected}\r\n0\r\n\r\n", expected.len()).as_bytes()
             );
+            task.finish().await;
         }
     })
     .await;
@@ -225,12 +233,13 @@ async fn forward_rewrites_patches_and_correlates_ids() {
             "request_header_patch": {"remove_headers": ["x-remove"], "overwrite_headers": {"x-existing": "overwritten"}, "default_headers": {"x-existing": "ignored", "x-default": "added"}},
             "response_header_patch": {"default_headers": {"x-response": "yes"}}
         })))]);
-        let (mut client, _task) = session(message("default"), paths, None);
+        let (mut client, task) = session(message("default"), paths, None);
         client.write_all(b"GET /public/file?x=1 HTTP/1.1\r\nHost: a.test\r\nX-Existing: original\r\nX-Remove: gone\r\n\r\n").await.unwrap();
         let response = head(&mut client).await;
         assert_eq!(values(&response, "location"), ["/public/next"]);
         assert_eq!(values(&response, "x-response"), ["yes"]);
         assert!(rest(&mut client).await.is_empty());
+        task.finish().await;
         let mut upstream = upstream;
         let request = (&mut upstream.0).await.unwrap();
         assert_eq!(values(&response, "x-response-id"), values(&request, "x-request-id"));
@@ -256,7 +265,7 @@ async fn fixed_length_large_body_and_sequential_reuse() {
                 stream.write_all(&received).await.unwrap();
             }
         }));
-        let (mut client, _task) = session(forward(address), Trie::new(), None);
+        let (mut client, task) = session(forward(address), Trie::new(), None);
         for _ in 0..2 {
             client.write_all(format!("POST / HTTP/1.1\r\nHost: a.test\r\nContent-Length: {}\r\n\r\n", body.len()).as_bytes()).await.unwrap();
             client.write_all(&body).await.unwrap();
@@ -266,6 +275,7 @@ async fn fixed_length_large_body_and_sequential_reuse() {
             assert_eq!(received, body);
         }
         assert!(rest(&mut client).await.is_empty());
+        task.finish().await;
         (&mut upstream.0).await.unwrap();
     }).await;
 }
@@ -291,7 +301,7 @@ async fn raw_chunk_extensions_and_trailers_survive_both_directions() {
                 stream.write_all(&[*byte]).await.unwrap();
             }
         }));
-        let (mut client, _task) = session(forward(address), Trie::new(), None);
+        let (mut client, task) = session(forward(address), Trie::new(), None);
         client
             .write_all(b"POST / HTTP/1.1\r\nHost: a.test\r\nTransfer-Encoding: chunked\r\n\r\n")
             .await
@@ -301,6 +311,7 @@ async fn raw_chunk_extensions_and_trailers_survive_both_directions() {
         }
         head(&mut client).await;
         assert_eq!(rest(&mut client).await, chunks);
+        task.finish().await;
         (&mut upstream.0).await.unwrap();
     })
     .await;
@@ -313,7 +324,7 @@ async fn directory_get_head_missing_and_query_behavior() {
         std::fs::write(files.0.join("index.html"), "index").unwrap();
         for (method, path, status, expected) in [("GET", "/", "200", "5\r\nindex\r\n0\r\n\r\n"), ("HEAD", "/", "200", ""), ("GET", "/index.html?x=1", "404", ""), ("POST", "/", "501", "")] {
             let default = action(json!({"type": "serve-directory", "path": files.0, "response_headers": {"x-file": "yes"}}));
-            let (mut client, _task) = session(default, Trie::new(), None);
+            let (mut client, task) = session(default, Trie::new(), None);
             client.write_all(format!("{method} {path} HTTP/1.1\r\nHost: a.test\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
             let response = head(&mut client).await;
             assert!(response.starts_with(&format!("HTTP/1.1 {status}")));
@@ -322,6 +333,7 @@ async fn directory_get_head_missing_and_query_behavior() {
                 assert_eq!(values(&response, "content-type"), ["text/html"]);
             }
             assert_eq!(rest(&mut client).await, expected.as_bytes());
+            task.finish().await;
         }
     }).await;
 }
@@ -329,15 +341,16 @@ async fn directory_get_head_missing_and_query_behavior() {
 #[tokio::test]
 async fn local_response_refactoring_preserves_empty_and_missing_wire_output() {
     checked(async {
-        let (mut client, _task) = session(message(""), Trie::new(), None);
+        let (mut client, task) = session(message(""), Trie::new(), None);
         client.write_all(b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n").await.unwrap();
         assert_eq!(rest(&mut client).await, b"HTTP/1.1 200\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n0\r\n\r\n");
+        task.finish().await;
 
         let files = Files::new();
         std::fs::create_dir_all(files.0.join("not-file/index.html")).unwrap();
         for path in ["/missing", "/not-file/"] {
             let default = action(json!({"type": "serve-directory", "path": files.0, "response_headers": {"x-file": "yes"}, "response_id_header_name": "x-id"}));
-            let (mut client, _task) = session(default, Trie::new(), None);
+            let (mut client, task) = session(default, Trie::new(), None);
             for (index, connection) in [(1, "keep-alive"), (2, "close")] {
                 client.write_all(format!("GET {path} HTTP/1.1\r\nHost: a.test\r\nConnection: {connection}\r\n\r\n").as_bytes()).await.unwrap();
                 let response = head(&mut client).await;
@@ -346,6 +359,7 @@ async fn local_response_refactoring_preserves_empty_and_missing_wire_output() {
                 assert_eq!(response, format!("HTTP/1.1 404\r\ncontent-length: 0\r\nconnection: {connection}\r\nx-id: {id}\r\n\r\n"));
             }
             assert!(rest(&mut client).await.is_empty());
+            task.finish().await;
         }
     }).await;
 }
@@ -353,13 +367,15 @@ async fn local_response_refactoring_preserves_empty_and_missing_wire_output() {
 #[tokio::test]
 async fn close_action_and_local_expect_rejection() {
     checked(async {
-        let (mut client, _task) = session(TargetHttpActionData::CloseConnection, Trie::new(), None);
+        let (mut client, task) = session(TargetHttpActionData::CloseConnection, Trie::new(), None);
         client.write_all(b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n").await.unwrap();
         assert!(rest(&mut client).await.is_empty());
-        let (mut client, _task) = session(message("hello"), Trie::new(), None);
+        task.finish().await;
+        let (mut client, task) = session(message("hello"), Trie::new(), None);
         client.write_all(b"POST / HTTP/1.1\r\nHost: a.test\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n").await.unwrap();
         assert!(head(&mut client).await.starts_with("HTTP/1.1 417 "));
         assert!(rest(&mut client).await.is_empty());
+        task.finish().await;
     }).await;
 }
 
@@ -400,7 +416,7 @@ async fn same_prefix_host_actions_and_default_use_the_selected_backend() {
                 alternatives.push(route(forward(address_b)));
             }
             paths.insert("/".into(), alternatives);
-            let (mut client, _task) = session(forward(address_b), paths, None);
+            let (mut client, task) = session(forward(address_b), paths, None);
             for (host, expected) in [("a.test", b'A'), ("b.test", b'B')] {
                 client
                     .write_all(format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
@@ -410,6 +426,7 @@ async fn same_prefix_host_actions_and_default_use_the_selected_backend() {
                 assert_eq!(client.read_u8().await.unwrap(), expected);
             }
             assert!(rest(&mut client).await.is_empty());
+            task.finish().await;
             (&mut server_a.0).await.unwrap();
             (&mut server_b.0).await.unwrap();
         }
@@ -429,7 +446,10 @@ async fn directory_checks_index_symlinks_and_canonicalizes_the_root() {
         std::fs::write(root.join("index.html"), "public").unwrap();
         let alias = files.0.join("alias");
         std::os::unix::fs::symlink(&root, &alias).unwrap();
-        for path in ["/sub/", "/sub/index.html"] {
+        for (path, expected) in [
+            ("/sub/", "Index is outside the serving root"),
+            ("/sub/index.html", "File is outside the serving root"),
+        ] {
             let default = action(json!({"type": "serve-directory", "path": alias}));
             let (mut client, mut task) = session(default, Trie::new(), None);
             client
@@ -440,16 +460,20 @@ async fn directory_checks_index_symlinks_and_canonicalizes_the_root() {
                 .await
                 .unwrap();
             assert!(rest(&mut client).await.is_empty());
-            assert!((&mut task.0).await.unwrap().is_err());
+            assert_eq!(
+                (&mut task.0).await.unwrap().unwrap_err().to_string(),
+                format!("Could not canonicalize path: {expected}")
+            );
         }
         let default = action(json!({"type": "serve-directory", "path": alias}));
-        let (mut client, _task) = session(default, Trie::new(), None);
+        let (mut client, task) = session(default, Trie::new(), None);
         client
             .write_all(b"GET / HTTP/1.1\r\nHost: a.test\r\nConnection: close\r\n\r\n")
             .await
             .unwrap();
         assert!(head(&mut client).await.starts_with("HTTP/1.1 200"));
         assert_eq!(rest(&mut client).await, b"6\r\npublic\r\n0\r\n\r\n");
+        task.finish().await;
     })
     .await;
 }
@@ -467,11 +491,12 @@ async fn duplicate_fields_and_mixed_case_patches_survive_forwarding() {
             stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\nSet-Cookie: a=1\r\nSet-Cookie: a=2\r\n\r\n").await.unwrap();
         }));
         let default = action(json!({"type": "forward", "location": address.to_string(), "request_header_patch": {"remove_headers": ["X-Remove"], "overwrite_headers": {"Host": "replacement.test"}}}));
-        let (mut client, _task) = session(default, Trie::new(), None);
+        let (mut client, task) = session(default, Trie::new(), None);
         client.write_all(b"GET / HTTP/1.1\r\nHost: original.test\r\nX-Repeat: first\r\nx-repeat: second\r\nX-Remove: gone\r\n\r\n").await.unwrap();
         let response = head(&mut client).await;
         assert_eq!(values(&response, "set-cookie"), ["a=1", "a=2"]);
         assert!(rest(&mut client).await.is_empty());
+        task.finish().await;
         (&mut upstream.0).await.unwrap();
     }).await;
 }
@@ -491,12 +516,13 @@ async fn pipelining_preserves_surplus_after_every_request_framing() {
                 assert!(head(&mut stream).await.starts_with("GET /two "));
                 stream.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n1\r\nB\r\n0\r\n\r\n").await.unwrap();
             }));
-            let (mut client, _task) = session(forward(address), Trie::new(), None);
+            let (mut client, task) = session(forward(address), Trie::new(), None);
             client.write_all(format!("POST /one HTTP/1.1\r\nHost: a.test\r\n{framing}\r\n{body}GET /two HTTP/1.1\r\nHost: a.test\r\n\r\n").as_bytes()).await.unwrap();
             head(&mut client).await;
             assert_eq!(client.read_u8().await.unwrap(), b'A');
             head(&mut client).await;
             assert_eq!(rest(&mut client).await, b"1\r\nB\r\n0\r\n\r\n");
+            task.finish().await;
             (&mut upstream.0).await.unwrap();
         }
     }).await;
@@ -508,11 +534,12 @@ async fn static_requests_drain_bodies_without_losing_the_next_request() {
         let files = Files::new();
         std::fs::write(files.0.join("index.html"), "hello").unwrap();
         let default = action(json!({"type": "serve-directory", "path": files.0}));
-        let (mut client, _task) = session(default, Trie::new(), None);
+        let (mut client, task) = session(default, Trie::new(), None);
         client.write_all(b"HEAD / HTTP/1.1\r\nHost: a.test\r\nContent-Length: 3\r\n\r\nabcGET / HTTP/1.1\r\nHost: a.test\r\nConnection: close\r\n\r\n").await.unwrap();
         assert!(head(&mut client).await.starts_with("HTTP/1.1 200"));
         assert!(head(&mut client).await.starts_with("HTTP/1.1 200"));
         assert_eq!(rest(&mut client).await, b"5\r\nhello\r\n0\r\n\r\n");
+        task.finish().await;
     }).await;
 }
 
@@ -530,7 +557,7 @@ async fn upgrade_replays_both_sides_read_ahead_and_continues_tunneling() {
             stream.write_all(b"ECHO").await.unwrap();
             assert!(rest(&mut stream).await.is_empty());
         }));
-        let (mut client, _task) = session(forward(address), Trie::new(), None);
+        let (mut client, task) = session(forward(address), Trie::new(), None);
         client.write_all(b"GET / HTTP/1.1\r\nHost: a.test\r\nConnection: keep-alive, Upgrade\r\nUpgrade: websocket\r\n\r\nCLIENT").await.unwrap();
         assert!(head(&mut client).await.starts_with("HTTP/1.1 101 "));
         let mut data = [0; 10];
@@ -538,12 +565,13 @@ async fn upgrade_replays_both_sides_read_ahead_and_continues_tunneling() {
         assert_eq!(&data, b"SERVERECHO");
         client.shutdown().await.unwrap();
         assert!(rest(&mut client).await.is_empty());
+        task.finish().await;
         (&mut upstream.0).await.unwrap();
     }).await;
 }
 
 #[tokio::test]
-async fn head_and_304_send_headers_and_allow_the_following_request() {
+async fn head_and_bodyless_statuses_allow_the_following_request() {
     checked(async {
         let (listener, address) = backend().await;
         let mut upstream = Task(tokio::spawn(async move {
@@ -551,14 +579,20 @@ async fn head_and_304_send_headers_and_allow_the_following_request() {
             for response in [
                 b"HTTP/1.1 200 OK\r\nContent-Length: 99\r\n\r\n".as_slice(),
                 b"HTTP/1.1 304 Not Modified\r\nContent-Length: 99\r\n\r\n",
+                b"HTTP/1.1 204 No Content\r\n\r\n",
                 b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK",
             ] {
                 head(&mut stream).await;
                 stream.write_all(response).await.unwrap();
             }
         }));
-        let (mut client, _task) = session(forward(address), Trie::new(), None);
-        for (method, status) in [("HEAD", "200"), ("GET", "304"), ("GET", "200")] {
+        let (mut client, task) = session(forward(address), Trie::new(), None);
+        for (method, status) in [
+            ("HEAD", "200"),
+            ("GET", "304"),
+            ("GET", "204"),
+            ("GET", "200"),
+        ] {
             client
                 .write_all(format!("{method} / HTTP/1.1\r\nHost: a.test\r\n\r\n").as_bytes())
                 .await
@@ -568,6 +602,7 @@ async fn head_and_304_send_headers_and_allow_the_following_request() {
                 .starts_with(&format!("HTTP/1.1 {status}")));
         }
         assert_eq!(rest(&mut client).await, b"OK");
+        task.finish().await;
         (&mut upstream.0).await.unwrap();
     })
     .await;
@@ -587,7 +622,7 @@ async fn expect_and_informational_responses_progress_without_losing_read_ahead()
             assert_eq!(&body, b"hello");
             stream.write_all(b"HTTP/1.1 103 Early Hints\r\nLink: </after>\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK").await.unwrap();
         }));
-        let (mut client, _task) = session(forward(address), Trie::new(), None);
+        let (mut client, task) = session(forward(address), Trie::new(), None);
         client.write_all(b"POST / HTTP/1.1\r\nHost: a.test\r\nContent-Length: 5\r\nExpect: 100-Continue\r\n\r\n").await.unwrap();
         assert!(head(&mut client).await.starts_with("HTTP/1.1 103 "));
         let continuation = head(&mut client).await;
@@ -597,6 +632,7 @@ async fn expect_and_informational_responses_progress_without_losing_read_ahead()
         assert!(head(&mut client).await.starts_with("HTTP/1.1 103 "));
         assert!(head(&mut client).await.starts_with("HTTP/1.1 200 "));
         assert_eq!(rest(&mut client).await, b"OK");
+        task.finish().await;
         (&mut upstream.0).await.unwrap();
     }).await;
 }
@@ -615,7 +651,7 @@ async fn early_final_responses_cancel_incomplete_uploads_and_close() {
                     .unwrap();
                 let _ = rest(&mut stream).await;
             }));
-            let (mut client, _task) = session(forward(address), Trie::new(), None);
+            let (mut client, task) = session(forward(address), Trie::new(), None);
             client
                 .write_all(
                     format!(
@@ -629,6 +665,7 @@ async fn early_final_responses_cancel_incomplete_uploads_and_close() {
             assert!(response.starts_with("HTTP/1.1 413 "));
             assert_eq!(values(&response, "connection"), ["close"]);
             assert_eq!(rest(&mut client).await, b"NO");
+            task.finish().await;
             (&mut upstream.0).await.unwrap();
         }
     })
@@ -656,7 +693,7 @@ async fn eof_delimited_responses_and_client_close_tokens_end_the_session() {
                 head(&mut stream).await;
                 stream.write_all(response).await.unwrap();
             }));
-            let (mut client, _task) = session(forward(address), Trie::new(), None);
+            let (mut client, task) = session(forward(address), Trie::new(), None);
             client
                 .write_all(
                     b"GET / HTTP/1.1\r\nHost: a.test\r\nConnection: keep-alive, Close\r\n\r\n",
@@ -665,6 +702,7 @@ async fn eof_delimited_responses_and_client_close_tokens_end_the_session() {
                 .unwrap();
             assert_eq!(values(&head(&mut client).await, "connection"), ["close"]);
             assert_eq!(rest(&mut client).await, expected);
+            task.finish().await;
             (&mut upstream.0).await.unwrap();
         }
     })
@@ -674,13 +712,31 @@ async fn eof_delimited_responses_and_client_close_tokens_end_the_session() {
 #[tokio::test]
 async fn ambiguous_request_framing_is_rejected_before_upstream_io() {
     checked(async {
-        for headers in [
-            "Transfer-Encoding: Chunked\r\nContent-Length: 5\r\n",
-            "Content-Length: 3\r\nContent-Length: 5\r\n",
-            "Transfer-Encoding: chunked, gzip\r\n",
-            "Transfer-Encoding: chunked, chunked\r\n",
-            "Transfer-Encoding: gzip\r\n",
-            "Host: conflicting.test\r\n",
+        for (headers, expected) in [
+            (
+                "Transfer-Encoding: Chunked\r\nContent-Length: 5\r\n",
+                "Ambiguous HTTP body framing",
+            ),
+            (
+                "Content-Length: 3\r\nContent-Length: 5\r\n",
+                "Conflicting content lengths",
+            ),
+            (
+                "Transfer-Encoding: chunked, gzip\r\n",
+                "Chunked must be the final request transfer coding",
+            ),
+            (
+                "Transfer-Encoding: chunked, chunked\r\n",
+                "Chunked must be the final request transfer coding",
+            ),
+            (
+                "Transfer-Encoding: gzip\r\n",
+                "Chunked must be the final request transfer coding",
+            ),
+            (
+                "Host: conflicting.test\r\n",
+                "Multiple Host fields are not allowed",
+            ),
         ] {
             let (_listener, address) = backend().await;
             let (mut client, mut task) = session(forward(address), Trie::new(), None);
@@ -689,7 +745,10 @@ async fn ambiguous_request_framing_is_rejected_before_upstream_io() {
                 .await
                 .unwrap();
             assert!(rest(&mut client).await.is_empty());
-            assert!((&mut task.0).await.unwrap().is_err());
+            assert_eq!(
+                (&mut task.0).await.unwrap().unwrap_err().to_string(),
+                expected
+            );
         }
     })
     .await;
@@ -703,7 +762,7 @@ async fn framing_patches_cannot_change_how_received_bytes_are_consumed() {
         let (mut client, mut task) = session(default, Trie::new(), None);
         client.write_all(b"POST / HTTP/1.1\r\nHost: a.test\r\nContent-Length: 3\r\n\r\nabc").await.unwrap();
         assert!(rest(&mut client).await.is_empty());
-        assert!((&mut task.0).await.unwrap().is_err());
+        assert_eq!((&mut task.0).await.unwrap().unwrap_err().to_string(), "Request header patch changes body framing");
         let (listener, address) = backend().await;
         let mut upstream = Task(tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
@@ -714,7 +773,7 @@ async fn framing_patches_cannot_change_how_received_bytes_are_consumed() {
         let (mut client, mut task) = session(default, Trie::new(), None);
         client.write_all(b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n").await.unwrap();
         assert!(rest(&mut client).await.is_empty());
-        assert!((&mut task.0).await.unwrap().is_err());
+        assert_eq!((&mut task.0).await.unwrap().unwrap_err().to_string(), "Response header patch changes body framing");
         (&mut upstream.0).await.unwrap();
     }).await;
 }
@@ -755,7 +814,7 @@ async fn round_robin_advances_only_when_an_action_opens_a_connection() {
         let default = action(
             json!({"type": "forward", "locations": [address_a.to_string(), address_b.to_string()]}),
         );
-        let (mut client, _task) = session(default, paths, None);
+        let (mut client, task) = session(default, paths, None);
         for (method, path, body) in [
             ("GET", "/a", Some(b'A')),
             ("GET", "/b", Some(b'A')),
@@ -772,6 +831,7 @@ async fn round_robin_advances_only_when_an_action_opens_a_connection() {
             }
         }
         assert!(rest(&mut client).await.is_empty());
+        task.finish().await;
         (&mut server_a.0).await.unwrap();
         (&mut server_b.0).await.unwrap();
     })
@@ -810,7 +870,7 @@ async fn surplus_after_a_final_response_is_never_reused() {
                     .await
                     .unwrap();
             }));
-            let (mut client, _task) = session(forward(address), Trie::new(), None);
+            let (mut client, task) = session(forward(address), Trie::new(), None);
             client
                 .write_all(b"GET /first HTTP/1.1\r\nHost: a.test\r\n\r\n")
                 .await
@@ -825,6 +885,7 @@ async fn surplus_after_a_final_response_is_never_reused() {
                 .unwrap();
             head(&mut client).await;
             assert_eq!(rest(&mut client).await, b"REAL");
+            task.finish().await;
             (&mut upstream.0).await.unwrap();
         }
     })
@@ -855,7 +916,7 @@ async fn surplus_beyond_the_reader_buffer_is_not_reused() {
                 .await
                 .unwrap();
                 }));
-            let (mut client, _task) = session(forward(address), Trie::new(), None);
+            let (mut client, task) = session(forward(address), Trie::new(), None);
             client
                 .write_all(b"GET /first HTTP/1.1\r\nHost: a.test\r\n\r\n")
                 .await
@@ -873,6 +934,7 @@ async fn surplus_beyond_the_reader_buffer_is_not_reused() {
             client.read_exact(&mut second_body).await.unwrap();
             assert_eq!(&second_body, b"REAL");
             assert!(rest(&mut client).await.is_empty());
+            task.finish().await;
             (&mut upstream.0).await.unwrap();
         }
     })
@@ -967,13 +1029,14 @@ async fn early_eof_delimited_rejection_receives_request_eof() {
             let _ = rest(&mut stream).await;
             stream.shutdown().await.unwrap();
         }));
-        let (mut client, _task) = session(forward(address), Trie::new(), None);
+        let (mut client, task) = session(forward(address), Trie::new(), None);
         client
             .write_all(b"POST / HTTP/1.1\r\nHost: a.test\r\nContent-Length: 99999\r\n\r\nx")
             .await
             .unwrap();
         assert!(head(&mut client).await.starts_with("HTTP/1.1 413 "));
         assert_eq!(rest(&mut client).await, b"NO");
+        task.finish().await;
         (&mut upstream.0).await.unwrap();
     })
     .await;
@@ -982,7 +1045,7 @@ async fn early_eof_delimited_rejection_receives_request_eof() {
 #[tokio::test]
 async fn tls_early_rejection_drains_while_upload_shutdown_is_backpressured() {
     checked(async {
-        use crate::rustls_util::{create_server_config, load_certs, load_private_key};
+        use crate::rustls_util::{create_client_config_with_cert, create_server_config, load_certs, load_private_key};
         use std::sync::Arc;
 
         let identity = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
@@ -991,28 +1054,40 @@ async fn tls_early_rejection_drains_while_upload_shutdown_is_backpressured() {
             &load_private_key(identity.signing_key.serialize_pem().as_bytes()),
             vec![b"http/1.1".to_vec()], &[], &[],
         )));
-        let (listener, address) = backend().await;
+        let connector = tokio_rustls::TlsConnector::from(create_client_config_with_cert(false, None, vec![b"http/1.1".to_vec()], true, vec![]));
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let (client_tls, server_tls) = tokio::join!(
+            connector.connect(rustls::pki_types::ServerName::try_from("localhost").unwrap(), client_io),
+            acceptor.accept(server_io),
+        );
+        let (blocked, blockage) = tokio::sync::oneshot::channel();
+        let target = super::test_io::ObserveWrite::new(client_tls.unwrap(), blocked);
         let (release, released) = tokio::sync::oneshot::channel();
         let mut upstream = Task(tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let socket = socket2::SockRef::from(&stream);
-            socket.set_recv_buffer_size(4096).unwrap();
-            socket.set_send_buffer_size(4096).unwrap();
-            let mut stream = acceptor.accept(stream).await.unwrap();
+            let mut stream = server_tls.unwrap();
             head(&mut stream).await;
-            // Fill the proxy's upload buffers before sending a rejection larger than ours.
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            blockage.await.unwrap();
             stream.write_all(b"HTTP/1.1 413 Content Too Large\r\nContent-Length: 1048576\r\nConnection: close\r\n\r\n").await.unwrap();
             stream.write_all(&vec![b'N'; 1048576]).await.unwrap();
             stream.flush().await.unwrap();
             // Do not drain the upload, even after the complete response has been sent.
             let _ = released.await;
         }));
-        let default = action(json!({"type": "forward", "location": {
-            "address": address.to_string(),
-            "client_tls": {"verify": false, "sni": "localhost", "alpn": "http/1.1"}
-        }}));
-        let (client, mut proxy) = session(default, Trie::new(), None);
+        let (client, frontend) = UnixStream::pair().unwrap();
+        let proxy = Task(tokio::spawn(async move {
+            let default = forward("127.0.0.1:1".parse().unwrap());
+            let paths = Trie::new();
+            let address = "127.0.0.1:12345".parse().unwrap();
+            let mut session = super::Session {
+                stream: Box::new(frontend), reader: Some(super::line_reader::LineReader::new()),
+                cached_target: Some(super::CachedTarget { action: &default, stream: Box::new(target), reader: super::line_reader::LineReader::new() }),
+                addr: &address, tcp_nodelay: true, tcp_keepalive: None,
+            };
+            let data = session.read_request().await?;
+            let request = super::Request::new(data, "test#1".into(), &paths, &default)?;
+            assert!(matches!(session.dispatch(request).await?, super::Outcome::Close));
+            session.stream.shutdown().await
+        }));
         let (mut reader, mut writer) = client.into_split();
         let mut upload = Task(tokio::spawn(async move {
             writer.write_all(b"POST / HTTP/1.1\r\nHost: a.test\r\nContent-Length: 99999999\r\n\r\n").await.unwrap();
@@ -1026,7 +1101,7 @@ async fn tls_early_rejection_drains_while_upload_shutdown_is_backpressured() {
         let mut body = vec![0; 1048576];
         reader.read_exact(&mut body).await.unwrap();
         assert_eq!(body, vec![b'N'; 1048576]);
-        (&mut proxy.0).await.unwrap().unwrap();
+        proxy.finish().await;
         release.send(()).unwrap();
         (&mut upstream.0).await.unwrap();
         (&mut upload.0).await.unwrap();
@@ -1064,9 +1139,100 @@ async fn header_patches_cannot_relabel_transfer_codings_or_upgrades() {
             if response.is_empty() {
                 assert_eq!(error.to_string(), "Request header patch changes body framing");
             } else {
+                let expected = if response.starts_with("HTTP/1.1 101 ") { "Invalid upstream protocol upgrade" } else { "Response header patch changes body framing" };
+                assert_eq!(error.to_string(), expected);
                 (&mut upstream.0).await.unwrap();
             }
         }
+    }).await;
+}
+
+#[tokio::test]
+async fn declined_upgrades_remain_http_and_reuse_the_backend() {
+    checked(async {
+        let (listener, address) = backend().await;
+        let mut upstream = Task(tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            assert_eq!(values(&head(&mut stream).await, "upgrade"), ["websocket"]);
+            stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 2\r\n\r\nNO").await.unwrap();
+            assert!(head(&mut stream).await.starts_with("GET /ordinary "));
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK").await.unwrap();
+        }));
+        let (mut client, task) = session(forward(address), Trie::new(), None);
+        client.write_all(b"GET /upgrade HTTP/1.1\r\nHost: a.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n").await.unwrap();
+        assert!(head(&mut client).await.starts_with("HTTP/1.1 400 "));
+        let mut body = [0; 2];
+        client.read_exact(&mut body).await.unwrap();
+        assert_eq!(&body, b"NO");
+        client.write_all(b"GET /ordinary HTTP/1.1\r\nHost: a.test\r\n\r\n").await.unwrap();
+        assert!(head(&mut client).await.starts_with("HTTP/1.1 200 "));
+        assert_eq!(rest(&mut client).await, b"OK");
+        task.finish().await;
+        (&mut upstream.0).await.unwrap();
+    }).await;
+}
+
+#[tokio::test]
+async fn frontend_eof_releases_the_cached_backend_without_another_request() {
+    checked(async {
+        let (listener, address) = backend().await;
+        let mut upstream = Task(tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            head(&mut stream).await;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            assert_retired(&mut stream).await;
+        }));
+        let (mut client, mut task) = session(forward(address), Trie::new(), None);
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n")
+            .await
+            .unwrap();
+        head(&mut client).await;
+        client.shutdown().await.unwrap();
+        assert!(rest(&mut client).await.is_empty());
+        let error = (&mut task.0).await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+        (&mut upstream.0).await.unwrap();
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn upgraded_streams_progress_bidirectionally_under_backpressure() {
+    checked(async {
+        let (listener, address) = backend().await;
+        let (blocked, blockage) = tokio::sync::oneshot::channel();
+        let mut upstream = Task(tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            socket2::SockRef::from(&stream).set_send_buffer_size(4096).unwrap();
+            head(&mut stream).await;
+            let stream = super::test_io::ObserveWrite::new(stream, blocked);
+            let (mut reader, mut writer) = tokio::io::split(stream);
+            tokio::join!(async {
+                let mut response = b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n".to_vec();
+                response.extend(vec![b'S'; 1024 * 1024]);
+                writer.write_all(&response).await.unwrap();
+                writer.shutdown().await.unwrap();
+            }, async {
+                assert_eq!(rest(&mut reader).await, vec![b'C'; 1024 * 1024]);
+            });
+        }));
+        let (mut client, task) = session(forward(address), Trie::new(), None);
+        client.write_all(b"GET / HTTP/1.1\r\nHost: a.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n").await.unwrap();
+        let (mut reader, mut writer) = client.into_split();
+        let mut upload = Task(tokio::spawn(async move {
+            writer.write_all(&vec![b'C'; 1024 * 1024]).await.unwrap();
+            writer.shutdown().await.unwrap();
+        }));
+        assert!(head(&mut reader).await.starts_with("HTTP/1.1 101 "));
+        blockage.await.unwrap();
+        assert_eq!(rest(&mut reader).await, vec![b'S'; 1024 * 1024]);
+        task.finish().await;
+        (&mut upload.0).await.unwrap();
+        (&mut upstream.0).await.unwrap();
     }).await;
 }
 

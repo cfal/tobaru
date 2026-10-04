@@ -135,3 +135,71 @@ impl crate::async_stream::AsyncStream for ScriptedIo {
         Ok(())
     }
 }
+
+pub(super) struct ObserveWrite<T> {
+    inner: T,
+    written: usize,
+    blocked: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl<T> ObserveWrite<T> {
+    pub fn new(inner: T, blocked: tokio::sync::oneshot::Sender<()>) -> Self {
+        Self {
+            inner,
+            written: 0,
+            blocked: Some(blocked),
+        }
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for ObserveWrite<T> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buffer)
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for ObserveWrite<T> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let result = Pin::new(&mut self.inner).poll_write(cx, bytes);
+        match result {
+            Poll::Ready(Ok(length)) => self.written += length,
+            Poll::Pending if self.written >= 4096 => {
+                if let Some(blocked) = self.blocked.take() {
+                    let _ = blocked.send(());
+                }
+            }
+            _ => {}
+        }
+        result
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+#[async_trait::async_trait]
+impl<T: crate::async_stream::AsyncStream> crate::async_stream::AsyncStream for ObserveWrite<T> {
+    async fn try_shutdown(&mut self) -> io::Result<()> {
+        self.inner.try_shutdown().await
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::async_stream::AsyncStream for tokio::io::DuplexStream {
+    async fn try_shutdown(&mut self) -> io::Result<()> {
+        tokio::io::AsyncWriteExt::shutdown(self).await
+    }
+}
