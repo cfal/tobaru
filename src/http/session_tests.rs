@@ -36,7 +36,8 @@ async fn checked(test: impl Future<Output = ()>) {
 fn action(value: Value) -> TargetHttpActionData {
     serde_json::from_value::<HttpPathAction>(value)
         .unwrap()
-        .into()
+        .try_into()
+        .unwrap()
 }
 
 fn message(content: &str) -> TargetHttpActionData {
@@ -991,10 +992,10 @@ async fn idle_data_and_closure_retire_tcp_unix_and_tls_backends_before_the_next_
         let files = Files::new();
         let identity = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(create_server_config(
-            load_certs(identity.cert.pem().as_bytes()),
-            &load_private_key(identity.signing_key.serialize_pem().as_bytes()),
+            load_certs(identity.cert.pem().as_bytes()).unwrap(),
+            &load_private_key(identity.signing_key.serialize_pem().as_bytes()).unwrap(),
             vec![b"http/1.1".to_vec()], &[], &[],
-        )));
+        ).unwrap()));
         for transport in ["tcp", "unix", "tls"] {
             for send_data in [false, true] {
                 let (tcp, address) = backend().await;
@@ -1092,11 +1093,11 @@ async fn tls_early_rejection_drains_while_upload_shutdown_is_backpressured() {
 
         let identity = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(create_server_config(
-            load_certs(identity.cert.pem().as_bytes()),
-            &load_private_key(identity.signing_key.serialize_pem().as_bytes()),
+            load_certs(identity.cert.pem().as_bytes()).unwrap(),
+            &load_private_key(identity.signing_key.serialize_pem().as_bytes()).unwrap(),
             vec![b"http/1.1".to_vec()], &[], &[],
-        )));
-        let connector = tokio_rustls::TlsConnector::from(create_client_config_with_cert(false, None, vec![b"http/1.1".to_vec()], true, vec![]));
+        ).unwrap()));
+        let connector = tokio_rustls::TlsConnector::from(create_client_config_with_cert(false, None, vec![b"http/1.1".to_vec()], true, vec![]).unwrap());
         let (client_io, server_io) = tokio::io::duplex(4096);
         let (client_tls, server_tls) = tokio::join!(
             connector.connect(rustls::pki_types::ServerName::try_from("localhost").unwrap(), client_io),
@@ -1296,11 +1297,11 @@ async fn transport_matrix_preserves_tls_pins_mtls_sni_and_alpn() {
         std::fs::write(files.0.join("cert.pem"), &cert).unwrap();
         std::fs::write(files.0.join("key.pem"), &key).unwrap();
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(create_server_config(
-            load_certs(&cert), &load_private_key(&key), vec![b"http/1.1".to_vec()], std::slice::from_ref(&pin), &[],
-        )));
+            load_certs(&cert).unwrap(), &load_private_key(&key).unwrap(), vec![b"http/1.1".to_vec()], std::slice::from_ref(&pin), &[],
+        ).unwrap()));
         let connector = tokio_rustls::TlsConnector::from(create_client_config_with_cert(
             false, Some((cert, key)), vec![b"http/1.1".to_vec()], true, vec![pin.clone()],
-        ));
+        ).unwrap());
         for frontend_tls in [false, true] {
             for backend_tls in [false, true] {
                 for unix in [false, true] {

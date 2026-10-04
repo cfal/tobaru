@@ -36,8 +36,10 @@ pub struct TargetLocationData {
     pub sni_hostname: NoneOrOne<String>,
 }
 
-impl From<TcpTargetLocation> for TargetLocationData {
-    fn from(tcp_target_location: TcpTargetLocation) -> Self {
+impl TryFrom<TcpTargetLocation> for TargetLocationData {
+    type Error = std::io::Error;
+
+    fn try_from(tcp_target_location: TcpTargetLocation) -> std::io::Result<Self> {
         let (location, client_tls) = tcp_target_location.into_components();
 
         // Load client certificate if specified
@@ -47,10 +49,8 @@ impl From<TcpTargetLocation> for TargetLocationData {
 
             // Read cert and key files synchronously during initialization
             // This is OK since we're in the setup phase
-            let cert_bytes = std::fs::read(cert_path)
-                .unwrap_or_else(|e| panic!("Failed to read client cert {}: {}", cert_path, e));
-            let key_bytes = std::fs::read(key_path)
-                .unwrap_or_else(|e| panic!("Failed to read client key {}: {}", key_path, e));
+            let cert_bytes = std::fs::read(cert_path)?;
+            let key_bytes = std::fs::read(key_path)?;
 
             Some((cert_bytes, key_bytes))
         } else {
@@ -76,7 +76,7 @@ impl From<TcpTargetLocation> for TargetLocationData {
         // Only disable SNI when explicitly set to None (via YAML null)
         let enable_sni = !matches!(sni_hostname, NoneOrOne::None);
 
-        Self {
+        Ok(Self {
             location,
             tls_connector: if client_tls.is_enabled() {
                 Some(
@@ -86,14 +86,14 @@ impl From<TcpTargetLocation> for TargetLocationData {
                         alpn_protocols,
                         enable_sni,
                         server_fingerprints,
-                    )
+                    )?
                     .into(),
                 )
             } else {
                 None
             },
             sni_hostname,
-        }
+        })
     }
 }
 
@@ -148,9 +148,11 @@ pub enum TargetHttpActionData {
     },
 }
 
-impl From<HttpPathAction> for TargetHttpActionData {
-    fn from(http_path_action: HttpPathAction) -> Self {
-        match http_path_action {
+impl TryFrom<HttpPathAction> for TargetHttpActionData {
+    type Error = std::io::Error;
+
+    fn try_from(http_path_action: HttpPathAction) -> std::io::Result<Self> {
+        Ok(match http_path_action {
             HttpPathAction::CloseConnection => TargetHttpActionData::CloseConnection,
             HttpPathAction::ServeMessage(HttpServeMessageConfig {
                 status_code,
@@ -184,8 +186,8 @@ impl From<HttpPathAction> for TargetHttpActionData {
             }) => TargetHttpActionData::Forward {
                 location_data: locations
                     .into_iter()
-                    .map(TargetLocationData::from)
-                    .collect(),
+                    .map(TargetLocationData::try_from)
+                    .collect::<std::io::Result<_>>()?,
                 next_address_index: AtomicUsize::new(0),
                 replacement_path,
                 request_header_patch,
@@ -193,7 +195,7 @@ impl From<HttpPathAction> for TargetHttpActionData {
                 request_id_header_name,
                 response_id_header_name,
             },
-        }
+        })
     }
 }
 
@@ -253,7 +255,7 @@ fn build_rustls_configs(
     alpn_protocols: &crate::config::NoneOrSome<AlpnValue>,
     client_fingerprints: &crate::config::NoneOrSome<String>,
     client_ca_certs: &[Vec<u8>],
-) -> (Arc<rustls::ServerConfig>, Arc<rustls::ServerConfig>) {
+) -> std::io::Result<(Arc<rustls::ServerConfig>, Arc<rustls::ServerConfig>)> {
     let mut alpn_protocol_bytes = vec![];
     for proto in alpn_protocols.iter() {
         if let AlpnValue::Specified(s) = proto {
@@ -270,8 +272,8 @@ fn build_rustls_configs(
             alpn_protocol_bytes,
             &client_fingerprint_vec,
             client_ca_certs,
-        ));
-        (tls_config.clone(), tls_config)
+        )?);
+        Ok((tls_config.clone(), tls_config))
     } else {
         let alpn_tls_config = create_server_config(
             certs,
@@ -279,10 +281,10 @@ fn build_rustls_configs(
             alpn_protocol_bytes.clone(),
             &client_fingerprint_vec,
             client_ca_certs,
-        );
+        )?;
         let mut no_alpn_tls_config = alpn_tls_config.clone();
         no_alpn_tls_config.alpn_protocols = vec![];
-        (Arc::new(alpn_tls_config), Arc::new(no_alpn_tls_config))
+        Ok((Arc::new(alpn_tls_config), Arc::new(no_alpn_tls_config)))
     }
 }
 
@@ -318,17 +320,17 @@ pub async fn run_tcp_server(
 
         // Validate passthrough + client_tls combination BEFORE moving action
         if let Some(ref tls_config) = server_tls {
-            if let Err(e) = tls_config.validate_with_action(&action) {
-                panic!("Invalid TLS configuration: {}", e);
-            }
+            tls_config
+                .validate_with_action(&action)
+                .map_err(std::io::Error::other)?;
         }
 
         let action_data = match action {
             TcpAction::Raw(RawTcpActionConfig { locations }) => TargetActionData::Raw {
                 location_data: locations
                     .into_iter()
-                    .map(TargetLocationData::from)
-                    .collect(),
+                    .map(TargetLocationData::try_from)
+                    .collect::<std::io::Result<_>>()?,
                 next_address_index: AtomicUsize::new(0),
             },
             TcpAction::Http(HttpTcpActionConfig {
@@ -339,16 +341,18 @@ pub async fn run_tcp_server(
                 for (path, path_config_vec) in http_paths {
                     let path_data_vec = path_config_vec
                         .into_iter()
-                        .map(|path_config| TargetHttpPathData {
-                            required_request_headers: path_config.required_request_headers,
-                            http_action: path_config.http_action.into(),
+                        .map(|path_config| {
+                            Ok(TargetHttpPathData {
+                                required_request_headers: path_config.required_request_headers,
+                                http_action: path_config.http_action.try_into()?,
+                            })
                         })
-                        .collect();
+                        .collect::<std::io::Result<_>>()?;
                     path_configs.insert(path, path_data_vec);
                 }
                 TargetActionData::Http {
                     path_configs: Box::new(path_configs),
-                    default_http_action: default_http_action.into(),
+                    default_http_action: default_http_action.try_into()?,
                 }
             }
         };
@@ -387,12 +391,12 @@ pub async fn run_tcp_server(
                     let mut cert_file = File::open(cert).await?;
                     let mut cert_bytes = vec![];
                     cert_file.read_to_end(&mut cert_bytes).await?;
-                    let certs = load_certs(&cert_bytes);
+                    let certs = load_certs(&cert_bytes)?;
 
                     let mut key_file = File::open(key).await?;
                     let mut key_bytes = vec![];
                     key_file.read_to_end(&mut key_bytes).await?;
-                    let private_key = load_private_key(&key_bytes);
+                    let private_key = load_private_key(&key_bytes)?;
 
                     let mut ca_cert_bytes_vec = vec![];
                     for ca_path in tls_config.client_ca_certs.iter() {
@@ -408,7 +412,7 @@ pub async fn run_tcp_server(
                         &tls_config.alpn_protocols,
                         &tls_config.client_fingerprints,
                         &ca_cert_bytes_vec,
-                    );
+                    )?;
 
                     TlsMode::Terminate {
                         alpn_tls_config,

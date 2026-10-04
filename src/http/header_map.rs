@@ -244,7 +244,7 @@ response_header_patch:
             request_header_patch,
             response_header_patch,
             ..
-        } = config.into()
+        } = config.try_into().unwrap()
         else {
             panic!("expected forwarding action");
         };
@@ -278,7 +278,7 @@ response_header_patch:
                 request_header_patch,
                 response_header_patch,
                 ..
-            } = config.into()
+            } = config.try_into().unwrap()
             else {
                 panic!("expected forwarding action");
             };
