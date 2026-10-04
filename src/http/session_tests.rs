@@ -312,6 +312,30 @@ async fn directory_get_head_missing_and_query_behavior() {
 }
 
 #[tokio::test]
+async fn local_response_refactoring_preserves_empty_and_missing_wire_output() {
+    checked(async {
+        let (mut client, _task) = session(message(""), Trie::new(), None);
+        client.write_all(b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n").await.unwrap();
+        assert_eq!(rest(&mut client).await, b"HTTP/1.1 200\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n0\r\n\r\n");
+
+        let files = Files::new();
+        std::fs::create_dir_all(files.0.join("not-file/index.html")).unwrap();
+        for path in ["/missing", "/not-file/"] {
+            let default = action(json!({"type": "serve-directory", "path": files.0, "response_headers": {"x-file": "yes"}, "response_id_header_name": "x-id"}));
+            let (mut client, _task) = session(default, Trie::new(), None);
+            for (index, connection) in [(1, "keep-alive"), (2, "close")] {
+                client.write_all(format!("GET {path} HTTP/1.1\r\nHost: a.test\r\nConnection: {connection}\r\n\r\n").as_bytes()).await.unwrap();
+                let response = head(&mut client).await;
+                let id = values(&response, "x-id")[0];
+                assert!(id.ends_with(&format!("#{index}")));
+                assert_eq!(response, format!("HTTP/1.1 404\r\ncontent-length: 0\r\nconnection: {connection}\r\nx-id: {id}\r\n\r\n"));
+            }
+            assert!(rest(&mut client).await.is_empty());
+        }
+    }).await;
+}
+
+#[tokio::test]
 async fn close_action_and_local_expect_rejection() {
     checked(async {
         let (mut client, _task) = session(TargetHttpActionData::CloseConnection, Trie::new(), None);
@@ -818,8 +842,6 @@ async fn early_eof_delimited_rejection_receives_request_eof() {
     .await;
 }
 
-trait WireStream: AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
-
 #[tokio::test]
 async fn header_patches_cannot_relabel_transfer_codings_or_upgrades() {
     checked(async {
@@ -849,6 +871,8 @@ async fn header_patches_cannot_relabel_transfer_codings_or_upgrades() {
         }
     }).await;
 }
+
+trait WireStream: AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + tokio::io::AsyncWrite + Unpin + Send> WireStream for T {}
 
 #[tokio::test]

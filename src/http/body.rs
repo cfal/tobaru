@@ -11,7 +11,7 @@ pub(super) enum Framing {
     UntilEof,
 }
 
-fn framing(headers: &impl HeaderMap, response: bool) -> std::io::Result<Framing> {
+fn framing(headers: &impl HeaderMap, is_response: bool) -> std::io::Result<Framing> {
     let length = headers.content_length()?;
     let codings: Vec<_> = headers
         .header_values("transfer-encoding")
@@ -22,14 +22,14 @@ fn framing(headers: &impl HeaderMap, response: bool) -> std::io::Result<Framing>
         if length.is_some() || codings.iter().any(|coding| coding.is_empty()) {
             return Err(std::io::Error::other("Ambiguous HTTP body framing"));
         }
-        let chunked = codings
+        let chunked_count = codings
             .iter()
             .filter(|coding| coding.eq_ignore_ascii_case("chunked"))
             .count();
-        if chunked == 1 && codings.last().unwrap().eq_ignore_ascii_case("chunked") {
+        if chunked_count == 1 && codings.last().unwrap().eq_ignore_ascii_case("chunked") {
             return Ok(Framing::Chunked);
         }
-        if chunked != 0 || !response {
+        if chunked_count != 0 || !is_response {
             return Err(std::io::Error::other(
                 "Chunked must be the final request transfer coding",
             ));
@@ -39,7 +39,7 @@ fn framing(headers: &impl HeaderMap, response: bool) -> std::io::Result<Framing>
     Ok(match length {
         Some(0) => Framing::Empty,
         Some(length) => Framing::Length(length),
-        None if response => Framing::UntilEof,
+        None if is_response => Framing::UntilEof,
         None => Framing::Empty,
     })
 }
@@ -66,24 +66,14 @@ pub(super) async fn write_head<W: AsyncWrite + Unpin>(
     write_all(stream, string_util::create_message(data).as_bytes()).await
 }
 
-pub(super) async fn forward_message<R, W>(
-    from_stream: &mut R,
-    mut maybe_to_stream: Option<&mut W>,
+pub(super) async fn drain_request<R: AsyncRead + Unpin>(
+    stream: &mut R,
     http_data: http_parser::ParsedHttpData,
-) -> std::io::Result<line_reader::LineReader>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
+) -> std::io::Result<line_reader::LineReader> {
     let framing = request_framing(http_data.headers())?;
-
-    if let Some(ref mut to_stream) = maybe_to_stream {
-        write_head(to_stream, &http_data).await?;
-    }
-
     forward_body(
-        from_stream,
-        maybe_to_stream,
+        stream,
+        None::<&mut tokio::io::Sink>,
         http_data.into_reader(),
         framing,
     )

@@ -66,28 +66,15 @@ impl<'a> Request<'a> {
                 "Multiple Host fields are not allowed",
             ));
         }
-        let mut first_line = data.first_line().to_string();
-
-        if !first_line.ends_with(" HTTP/1.1") {
-            return Err(std::io::Error::other(format!(
-                "Not a http/1.1 request: {}",
+        let first_line = data.first_line().strip_suffix(" HTTP/1.1").ok_or_else(|| {
+            std::io::Error::other(format!("Not a http/1.1 request: {}", data.first_line()))
+        })?;
+        let (verb, request_path) = first_line.split_once(' ').ok_or_else(|| {
+            std::io::Error::other(format!(
+                "Invalid http request directive: {}",
                 data.first_line()
-            )));
-        }
-
-        first_line.truncate(first_line.len() - 9);
-
-        let space_index = match first_line.find(' ') {
-            Some(i) => i,
-            None => {
-                return Err(std::io::Error::other(format!(
-                    "Invalid http request directive: {}",
-                    data.first_line()
-                )));
-            }
-        };
-
-        let request_path = first_line.split_off(space_index + 1);
+            ))
+        })?;
         if !request_path.starts_with('/') {
             return Err(std::io::Error::other(format!(
                 "Invalid http request path: {}",
@@ -95,9 +82,8 @@ impl<'a> Request<'a> {
             )));
         }
 
-        let mut verb = first_line;
-        verb.truncate(verb.len() - 1);
-        verb.make_ascii_uppercase();
+        let verb = verb.to_ascii_uppercase();
+        let request_path = request_path.to_owned();
 
         let (base_path, path_action) =
             find_matching_action(path_configs, default_action, &request_path, &data)?;
@@ -126,8 +112,8 @@ impl<'a> Session<'a> {
                 info!("[http] {} {} [close]", request.verb, request.path);
                 Ok(Outcome::Close)
             }
-            TargetHttpActionData::ServeMessage { .. }
-            | TargetHttpActionData::ServeDirectory { .. } => self.serve_local(request).await,
+            TargetHttpActionData::ServeMessage { .. } => self.serve_message(request).await,
+            TargetHttpActionData::ServeDirectory { .. } => self.serve_directory(request).await,
             TargetHttpActionData::Forward { .. } => self.forward(request).await,
         }
     }
