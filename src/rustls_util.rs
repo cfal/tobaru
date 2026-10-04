@@ -35,7 +35,7 @@ fn create_client_config(
     verify: bool,
     client_cert: Option<(Vec<u8>, Vec<u8>)>,
     server_fingerprints: Vec<String>,
-) -> rustls::ClientConfig {
+) -> std::io::Result<rustls::ClientConfig> {
     let builder = rustls::ClientConfig::builder_with_provider(get_crypto_provider())
         .with_safe_default_protocol_versions()
         .unwrap();
@@ -52,7 +52,7 @@ fn create_client_config(
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(ServerFingerprintVerifier {
                     supported_algs: get_supported_algorithms(),
-                    server_fingerprints: process_fingerprints(&server_fingerprints).unwrap(),
+                    server_fingerprints: process_fingerprints(&server_fingerprints)?,
                     webpki_verifier: Some(Arc::into_inner(webpki_verifier).unwrap()),
                 }))
         } else {
@@ -63,7 +63,7 @@ fn create_client_config(
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(ServerFingerprintVerifier {
                 supported_algs: get_supported_algorithms(),
-                server_fingerprints: process_fingerprints(&server_fingerprints).unwrap(),
+                server_fingerprints: process_fingerprints(&server_fingerprints)?,
                 webpki_verifier: None,
             }))
     } else {
@@ -73,13 +73,13 @@ fn create_client_config(
     };
 
     if let Some((cert_bytes, key_bytes)) = client_cert {
-        let certs = load_certs(&cert_bytes);
-        let private_key = load_private_key(&key_bytes);
+        let certs = load_certs(&cert_bytes)?;
+        let private_key = load_private_key(&key_bytes)?;
         builder
             .with_client_auth_cert(certs, private_key)
-            .expect("Could not parse client certificate")
+            .map_err(std::io::Error::other)
     } else {
-        builder.with_no_client_auth()
+        Ok(builder.with_no_client_auth())
     }
 }
 
@@ -89,11 +89,11 @@ pub fn create_client_config_with_cert(
     alpn_protocols: Vec<Vec<u8>>,
     enable_sni: bool,
     server_fingerprints: Vec<String>,
-) -> Arc<rustls::ClientConfig> {
-    let mut config = create_client_config(verify, client_cert, server_fingerprints);
+) -> std::io::Result<Arc<rustls::ClientConfig>> {
+    let mut config = create_client_config(verify, client_cert, server_fingerprints)?;
     config.alpn_protocols = alpn_protocols;
     config.enable_sni = enable_sni;
-    Arc::new(config)
+    Ok(Arc::new(config))
 }
 
 #[derive(Debug)]
@@ -215,18 +215,18 @@ impl rustls::client::danger::ServerCertVerifier for ServerFingerprintVerifier {
     }
 }
 
-pub fn load_certs(cert_bytes: &[u8]) -> Vec<CertificateDer<'static>> {
+pub fn load_certs(cert_bytes: &[u8]) -> std::io::Result<Vec<CertificateDer<'static>>> {
     let certs: Vec<_> = CertificateDer::pem_slice_iter(cert_bytes)
         .collect::<Result<_, _>>()
-        .unwrap();
+        .map_err(std::io::Error::other)?;
     if certs.is_empty() {
-        panic!("No certs found");
+        return Err(std::io::Error::other("No certs found"));
     }
-    certs
+    Ok(certs)
 }
 
-pub fn load_private_key(key_bytes: &[u8]) -> PrivateKeyDer<'static> {
-    PrivateKeyDer::from_pem_slice(key_bytes).unwrap()
+pub fn load_private_key(key_bytes: &[u8]) -> std::io::Result<PrivateKeyDer<'static>> {
+    PrivateKeyDer::from_pem_slice(key_bytes).map_err(std::io::Error::other)
 }
 
 #[derive(Debug)]
@@ -247,20 +247,21 @@ pub fn create_server_config(
     alpn_protocols: Vec<Vec<u8>>,
     client_fingerprints: &[String],
     client_ca_certs: &[Vec<u8>],
-) -> rustls::ServerConfig {
+) -> std::io::Result<rustls::ServerConfig> {
     let signing_key = get_crypto_provider()
         .key_provider
         .load_private_key(private_key.clone_key())
-        .unwrap();
+        .map_err(std::io::Error::other)?;
     let certified_key = Arc::new(rustls::sign::CertifiedKey::new(certs, signing_key));
+    certified_key.keys_match().map_err(std::io::Error::other)?;
 
     let webpki_verifier = if client_ca_certs.is_empty() {
         None
     } else {
         let mut store = rustls::RootCertStore::empty();
         for ca_bytes in client_ca_certs {
-            for cert in load_certs(ca_bytes) {
-                store.add(cert).unwrap();
+            for cert in load_certs(ca_bytes)? {
+                store.add(cert).map_err(std::io::Error::other)?;
             }
         }
         Some(
@@ -269,7 +270,7 @@ pub fn create_server_config(
                 get_crypto_provider(),
             )
             .build()
-            .unwrap(),
+            .map_err(std::io::Error::other)?,
         )
     };
 
@@ -284,16 +285,17 @@ pub fn create_server_config(
     } else {
         builder.with_client_cert_verifier(Arc::new(ClientFingerprintVerifier {
             supported_algs: get_supported_algorithms(),
-            client_fingerprints: process_fingerprints(client_fingerprints).unwrap(),
+            client_fingerprints: process_fingerprints(client_fingerprints)?,
             webpki_verifier,
         }))
     };
 
     let mut config = builder.with_cert_resolver(Arc::new(AlwaysResolvesServerCert(certified_key)));
     config.alpn_protocols = alpn_protocols;
-    config.max_early_data_size = u32::MAX;
+    // The stream adapter does not consume rustls's separate early-data buffer.
+    config.max_early_data_size = 0;
     config.ignore_client_order = true;
-    config
+    Ok(config)
 }
 
 pub fn get_dummy_server_name() -> ServerName<'static> {
@@ -307,13 +309,13 @@ pub fn process_fingerprints(client_fingerprints: &[String]) -> std::io::Result<B
     let mut result = BTreeSet::new();
 
     for fingerprint in client_fingerprints {
-        // Remove any colons and whitespace
+        // Accept the compact and colon/space-separated SHA256 forms.
         let clean_fp = fingerprint.replace(":", "").replace(" ", "");
 
-        if clean_fp.len() % 2 != 0 {
+        if clean_fp.len() != 64 || !clean_fp.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                format!("Invalid client fingerprint, odd number of hex chars: {fingerprint}"),
+                format!("Invalid SHA256 fingerprint: expected exactly 64 hexadecimal digits: {fingerprint}"),
             ));
         }
 

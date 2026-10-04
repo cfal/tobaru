@@ -31,12 +31,13 @@ fn server_config(
 ) -> rustls::ServerConfig {
     let (cert, key) = pem(identity);
     create_server_config(
-        load_certs(&cert),
-        &load_private_key(&key),
+        load_certs(&cert).unwrap(),
+        &load_private_key(&key).unwrap(),
         vec![b"http/1.1".to_vec()],
         fingerprints,
         ca_certs,
     )
+    .unwrap()
 }
 
 async fn exchange(
@@ -92,25 +93,83 @@ fn loads_certificate_chain_from_mixed_pem() {
         second.cert.pem()
     );
     assert_eq!(
-        load_certs(bundle.as_bytes()),
+        load_certs(bundle.as_bytes()).unwrap(),
         vec![first.cert.der().clone(), second.cert.der().clone()]
     );
     assert_eq!(
-        load_private_key(bundle.as_bytes()).secret_der(),
+        load_private_key(bundle.as_bytes()).unwrap().secret_der(),
         first.signing_key.serialize_der()
     );
 }
 
 #[test]
-#[should_panic(expected = "No certs found")]
-fn rejects_pem_without_certificates() {
-    load_certs(identity().signing_key.serialize_pem().as_bytes());
+fn fingerprints_require_a_full_sha256_digest() {
+    for value in [
+        "".to_owned(),
+        "00".repeat(31),
+        "00".repeat(33),
+        "gg".repeat(32),
+        "\u{20ac}".repeat(22),
+    ] {
+        assert_eq!(
+            process_fingerprints(&[value]).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
+    for value in [
+        "AB".repeat(32),
+        vec!["ab"; 32].join(":"),
+        vec!["aB"; 32].join(" "),
+    ] {
+        assert_eq!(
+            process_fingerprints(&[value]).unwrap(),
+            BTreeSet::from([vec![0xab; 32]])
+        );
+    }
 }
 
 #[test]
-#[should_panic]
+fn rejects_pem_without_certificates() {
+    assert_eq!(
+        load_certs(identity().signing_key.serialize_pem().as_bytes())
+            .unwrap_err()
+            .to_string(),
+        "No certs found"
+    );
+}
+
+#[test]
 fn rejects_malformed_certificate_pem() {
-    load_certs(b"-----BEGIN CERTIFICATE-----\n!invalid!\n-----END CERTIFICATE-----\n");
+    assert!(
+        load_certs(b"-----BEGIN CERTIFICATE-----\n!invalid!\n-----END CERTIFICATE-----\n").is_err()
+    );
+    assert!(load_private_key(b"not a key").is_err());
+}
+
+#[test]
+fn tls_configuration_errors_are_recoverable() {
+    let first = identity();
+    let second = identity();
+    assert!(create_server_config(
+        load_certs(first.cert.pem().as_bytes()).unwrap(),
+        &load_private_key(second.signing_key.serialize_pem().as_bytes()).unwrap(),
+        vec![],
+        &[],
+        &[],
+    )
+    .is_err());
+    assert!(create_client_config(false, None, vec!["abcd".into()]).is_err());
+    assert!(create_client_config(
+        false,
+        Some((b"invalid".to_vec(), b"invalid".to_vec())),
+        vec![]
+    )
+    .is_err());
+}
+
+#[test]
+fn terminated_tls_does_not_accept_unconsumed_early_data() {
+    assert_eq!(server_config(&identity(), &[], &[]).max_early_data_size, 0);
 }
 
 #[test]
@@ -153,7 +212,7 @@ async fn server_verification_and_pinning() {
             (vec![fingerprint(&server)], true),
             (vec!["00".repeat(32)], false),
         ] {
-            let client = create_client_config(verify, None, pins.clone());
+            let client = create_client_config(verify, None, pins.clone()).unwrap();
             let result = exchange(client, server_config(&server, &[], &[])).await;
             assert_eq!(
                 result.is_ok(),
@@ -220,7 +279,7 @@ async fn client_auth_accepts_ca_or_pin_but_rejects_unknown_and_anonymous() {
         .into_iter()
         .zip(expected)
         {
-            let client = create_client_config(false, client_identity.map(pem), vec![]);
+            let client = create_client_config(false, client_identity.map(pem), vec![]).unwrap();
             let result = exchange(client, server_config(&server, &pins, &ca_certs)).await;
             assert_eq!(
                 result.is_ok(),

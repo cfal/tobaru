@@ -266,6 +266,21 @@ Matching priority: exact match > deepest wildcard > shallower wildcard.
 
 Hostnames are case-insensitive. Trailing dots are stripped.
 
+### TLS Handshake Timeout
+
+TLS termination accepts an optional positive `server_tls.handshake_timeout_secs`.
+It bounds handshake completion after ClientHello routing, independently of the
+existing ClientHello read timeout. Omitted or `null` disables the additional
+deadline. It is invalid for passthrough, where the backend owns the handshake.
+Terminated TLS does not accept 0-RTT early data.
+
+```yaml
+server_tls:
+  cert: server.crt
+  key: server.key
+  handshake_timeout_secs: 10
+```
+
 ### ALPN Protocol Matching
 
 In passthrough mode, ALPN protocols from the ClientHello are matched against the configured list. In terminate mode, the configured protocols are advertised in the ServerHello.
@@ -278,6 +293,11 @@ alpn_protocols:                    # Multiple protocols
 alpn_protocols: any                # Match any ALPN
 alpn_protocols: none               # Match only when no ALPN
 ```
+
+`any` controls matching, not protocol negotiation. Termination advertises only
+explicit protocol names; `any` without explicit names negotiates no ALPN.
+Passthrough leaves negotiation to the backend. HTTP actions only support
+HTTP/1.1; do not advertise `h2` for them.
 
 ### Client Certificate Authentication
 
@@ -307,7 +327,8 @@ server_tls:
     - "1122334455667788990011223344556677889900112233445566778899001122"
 ```
 
-Fingerprints accept both colon-separated and plain hex formats.
+Fingerprints require 32 bytes (64 hexadecimal digits), with optional colons or
+spaces. Invalid fingerprints are rejected when loading configuration.
 
 ```bash
 # Generate a CA and client certificate
@@ -357,6 +378,10 @@ client_tls:
 
 `client_tls` cannot be used with passthrough mode (would cause TLS-in-TLS).
 
+`verify: false` and `no-verify` disable WebPKI certificate verification. Without
+configured certificate pins, an active attacker can impersonate the backend;
+use verification or explicit SHA256 pins for untrusted networks.
+
 ### Server Certificate Pinning
 
 ```yaml
@@ -394,15 +419,50 @@ target:
       - default-backend:8080
 ```
 
+### HTTP Timeouts
+
+Timeouts belong to the HTTP target and apply to all of its routes. All are
+disabled when omitted or `null`; configured values must be positive seconds.
+
+```yaml
+target:
+  allowlist: 127.0.0.1/32
+  http_timeouts:
+    request_header_timeout_secs: 15
+    response_header_timeout_secs: 30
+    keepalive_idle_timeout_secs: 60
+  default_http_action:
+    type: forward
+    location: 127.0.0.1:8080
+```
+
+- The request-header deadline starts when HTTP handling begins for the first
+  request, or when the first byte of a subsequent request is received. Partial
+  header progress does not reset it.
+- The response-header deadline starts after upstream request headers are sent
+  and lasts until final response headers arrive. Informational responses do not
+  reset it. It includes any concurrent request upload and backend processing;
+  choose a value suitable for those workloads or leave it disabled.
+- The keepalive idle deadline bounds waiting for the next request's first byte.
+  Once data arrives, the request-header deadline applies instead.
+
+Expiration closes the affected HTTP session. These are not body-transfer or
+whole-session deadlines; upgraded tunnels are not subject to them.
+
 ### Path Matching
 
-Paths are matched by longest prefix. A trailing `/` in the path key matches that prefix and everything below it.
+Paths use raw longest-prefix matching, including the query string. Keys without
+a trailing `/` are not exact matches. A trailing `/` provides a subtree boundary;
+the bare mount also matches when it has no query string.
 
 ```yaml
 http_paths:
-  /api/:     # matches /api/, /api/users, /api/v2/foo, etc.
-  /health:   # matches /health exactly
+  /api/:     # matches /api, /api/, /api/users; not /apiculture or /api?x=1
+  /health:   # matches /health, /health?x=1, and /healthcheck
 ```
+
+Only the longest matching key is considered. If its required headers do not
+match, `default_http_action` is used, not a shorter configured prefix.
 
 ### Required Request Headers
 
@@ -488,6 +548,28 @@ http_action:
 
 The `address`, `addresses`, and `location` field names are accepted as aliases for `locations`.
 
+Backend reuse is local to a client connection and the selected HTTP action.
+Changing Host/header rules to select another action opens a different backend
+connection, even when the path prefix is unchanged. Round-robin selection occurs
+when a backend connection is opened, not on every request.
+
+Header names in patches are case-insensitive. Repeated received fields retain
+their value order; an overwrite replaces all values for that name. Patches must
+not change the received body's framing (for example, changing Content-Length or
+removing chunked Transfer-Encoding). Such requests/responses are rejected and the
+connection is closed; body bytes are not rewritten to match a patched length or
+transfer-coding stack. Transfer-Encoding fields with parameters must remain
+unchanged; their quoted values are not normalized. Patches also cannot manufacture
+or relabel a successful protocol upgrade: the original and forwarded handshakes
+must agree, including the case-sensitive protocol version when present.
+
+Forwarding supports HEAD/bodyless responses, informational responses including
+100 Continue and 103 Early Hints, and close-delimited response bodies. An early
+final response during an unfinished upload is forwarded and both connections are
+closed rather than reused. HTTP mode still accepts only origin-form HTTP/1.1
+requests; it does not implement CONNECT or HTTP/2. For HTTP actions, configure TLS
+ALPN as `http/1.1`, not `h2`.
+
 ### serve-message
 
 Returns a static HTTP response.
@@ -506,6 +588,13 @@ http_action:
 ### serve-directory
 
 Serves static files from a directory. MIME types are automatically detected.
+
+After route selection, the query is removed and the file path is percent-decoded.
+Decoded parent-directory segments and NUL bytes are rejected; names such as
+`report..final.txt` are allowed. Both the requested file and a directory's
+`index.html` must resolve inside the canonical serving root. Keep serving trees
+immutable or trusted: canonicalization does not eliminate concurrent symlink
+replacement races.
 
 ```yaml
 http_action:
@@ -532,9 +621,15 @@ http_action: close
 
 UDP forwarding with round-robin load balancing and stateful association tracking.
 
+The optional listener-level `udp_max_associations` caps the total across all
+targets. Omitted or `null` means unlimited; configured values must be positive
+integers. At capacity, packets for new client addresses are dropped, while
+existing associations continue forwarding. Idle cleanup frees capacity.
+
 ```yaml
 - address: 0.0.0.0:53
   transport: udp
+  udp_max_associations: 4096  # Optional, shared by all targets on this listener
   target:
     addresses: [string]            # Backend address(es) -- round-robin
     allowlist: string | [string]   # IP masks or group names
@@ -610,10 +705,20 @@ tobaru [OPTIONS] <CONFIG PATH or CONFIG URL> [CONFIG PATH or CONFIG URL] ...
 
 OPTIONS:
   -t, --threads NUM           Worker threads (default: auto-detected from CPU count)
+  --dry-run                  Validate config, routing, and TLS files without binding listeners
   --clear-iptables-all        Clear all tobaru iptables rules and exit
   --clear-iptables-matching   Clear iptables rules for specified config files and exit
   -h, --help                  Show help
 ```
+
+Configuration file changes, including atomic replacements, are debounced for
+three seconds while current listeners continue serving. Invalid replacement
+configuration retains the last-good listeners. Valid replacements stop and await
+old listener tasks before rebinding, so reload is not gapless. Existing TCP
+sessions keep their old configuration until completion; UDP associations restart.
+Unexpected listener errors or panics exit the process nonzero. Bind and firewall
+failures also exit nonzero, including during reload. `--dry-run` does not verify
+that ports can be bound or firewall commands can succeed.
 
 ### Examples
 

@@ -6,8 +6,8 @@ use tokio::process::Command;
 
 use crate::config::IpMask;
 
-const IPTABLES_PATH: &str = "/usr/sbin/iptables";
-const IP6TABLES_PATH: &str = "/usr/sbin/ip6tables";
+const IPTABLES_PATH: &str = "iptables";
+const IP6TABLES_PATH: &str = "ip6tables";
 
 pub enum Protocol {
     Tcp,
@@ -23,32 +23,30 @@ impl Protocol {
     }
 }
 
-async fn run(program: &str, args: &[&str]) -> Vec<String> {
+async fn run(program: &str, args: &[&str]) -> std::io::Result<Vec<String>> {
     debug!("Running {} with arguments: {:?}", program, args);
     let Output {
         status,
         stdout,
         stderr,
-    } = Command::new(program)
-        .args(args)
-        .output()
-        .await
-        .expect("Failed to run iptables.");
+    } = Command::new(program).args(args).output().await?;
 
     if !stderr.is_empty() {
-        let stderr_str = String::from_utf8(stderr).expect("Failed to parse stderr");
+        let stderr_str = String::from_utf8_lossy(&stderr);
         error!("iptables error messages: {}", stderr_str);
     }
 
     if !status.success() {
-        panic!("iptables exited with status {}", status.code().unwrap());
+        return Err(std::io::Error::other(format!(
+            "{program} exited with {status}"
+        )));
     }
 
-    String::from_utf8(stdout)
-        .expect("Failed to parse stdout")
+    Ok(String::from_utf8(stdout)
+        .map_err(std::io::Error::other)?
         .split('\n')
         .map(|s| s.to_string())
-        .collect()
+        .collect())
 }
 
 fn create_comment(socket_addr: &SocketAddr) -> String {
@@ -64,7 +62,11 @@ fn format_ipv6(addr: &Ipv6Addr) -> String {
         .join(":")
 }
 
-pub async fn configure_iptables(protocol: Protocol, socket_addr: SocketAddr, ip_masks: &[IpMask]) {
+pub async fn configure_iptables(
+    protocol: Protocol,
+    socket_addr: SocketAddr,
+    ip_masks: &[IpMask],
+) -> std::io::Result<()> {
     let comment = create_comment(&socket_addr);
     let port_str = socket_addr.port().to_string();
 
@@ -100,7 +102,7 @@ pub async fn configure_iptables(protocol: Protocol, socket_addr: SocketAddr, ip_
                 &comment,
             ],
         )
-        .await;
+        .await?;
     }
 
     for chunk in ipv4_masks.chunks(50) {
@@ -125,7 +127,7 @@ pub async fn configure_iptables(protocol: Protocol, socket_addr: SocketAddr, ip_
                 &comment,
             ],
         )
-        .await;
+        .await?;
     }
 
     for program in &[IPTABLES_PATH, IP6TABLES_PATH] {
@@ -148,34 +150,71 @@ pub async fn configure_iptables(protocol: Protocol, socket_addr: SocketAddr, ip_
                 &comment,
             ],
         )
-        .await;
+        .await?;
     }
+    Ok(())
 }
 
-pub async fn clear_matching_iptables(socket_addr: SocketAddr) {
+pub async fn clear_matching_iptables(socket_addr: SocketAddr) -> std::io::Result<()> {
     let comment = create_comment(&socket_addr);
     clear_iptables(&comment).await
 }
 
-pub async fn clear_all_iptables() {
+pub async fn clear_all_iptables() -> std::io::Result<()> {
     clear_iptables("tobaru-rs").await
 }
 
-async fn clear_iptables(comment: &str) {
+async fn clear_iptables(comment: &str) -> std::io::Result<()> {
     for program in &[IPTABLES_PATH, IP6TABLES_PATH] {
         // Iterate through line backwards so that rule numbers don't change as we remove them.
         for line in run(
             program,
             &["--wait", "5", "-n", "-L", "INPUT", "--line-numbers"],
         )
-        .await
+        .await?
         .into_iter()
         .rev()
         {
-            if line.contains(comment) {
+            if matches_comment(&line, comment) {
                 let rule_number = line.trim_start().split(' ').next().unwrap();
-                run(program, &["--wait", "5", "-D", "INPUT", rule_number]).await;
+                run(program, &["--wait", "5", "-D", "INPUT", rule_number]).await?;
             }
         }
+    }
+    Ok(())
+}
+
+fn matches_comment(line: &str, expected: &str) -> bool {
+    let Some((_, tail)) = line.split_once("/*") else {
+        return false;
+    };
+    let Some((comment, _)) = tail.split_once("*/") else {
+        return false;
+    };
+    let comment = comment.trim();
+    comment == expected || (expected == "tobaru-rs" && comment.starts_with("tobaru-rs@"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cleanup_matches_complete_rule_ownership() {
+        let line = "1 DROP tcp /* tobaru-rs@127.0.0.1:8080 */";
+        assert!(matches_comment(line, "tobaru-rs@127.0.0.1:8080"));
+        assert!(matches_comment(line, "tobaru-rs"));
+        assert!(!matches_comment(line, "tobaru-rs@127.0.0.1:80"));
+        assert!(!matches_comment(
+            "1 DROP /* unrelated-tobaru-rs */",
+            "tobaru-rs"
+        ));
+    }
+
+    #[tokio::test]
+    async fn command_failures_are_errors_not_panics() {
+        assert!(run("/does/not/exist", &[]).await.is_err());
+        assert!(run("/bin/sh", &["-c", "exit 1"]).await.is_err());
+        assert_eq!(run("/bin/sh", &["-c", "printf ok"]).await.unwrap(), ["ok"]);
     }
 }

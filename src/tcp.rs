@@ -17,9 +17,9 @@ use tokio::time::{timeout, Duration};
 use crate::async_stream::AsyncStream;
 use crate::config::{
     AlpnValue, HttpForwardConfig, HttpHeaderPatch, HttpPathAction, HttpServeDirectoryConfig,
-    HttpServeMessageConfig, HttpTcpActionConfig, HttpValueMatch, IpMask, IpMaskSelection, Location,
-    NetLocation, NoneOrOne, RawTcpActionConfig, SniValue, TcpAction, TcpKeepaliveConfig,
-    TcpKeepaliveOption, TcpTargetConfig, TcpTargetLocation,
+    HttpServeMessageConfig, HttpTcpActionConfig, HttpTimeouts, HttpValueMatch, IpMask,
+    IpMaskSelection, Location, NetLocation, NoneOrOne, RawTcpActionConfig, SniValue, TcpAction,
+    TcpKeepaliveConfig, TcpKeepaliveOption, TcpTargetConfig, TcpTargetLocation,
 };
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::domain_trie::DomainTrie;
@@ -36,8 +36,10 @@ pub struct TargetLocationData {
     pub sni_hostname: NoneOrOne<String>,
 }
 
-impl From<TcpTargetLocation> for TargetLocationData {
-    fn from(tcp_target_location: TcpTargetLocation) -> Self {
+impl TryFrom<TcpTargetLocation> for TargetLocationData {
+    type Error = std::io::Error;
+
+    fn try_from(tcp_target_location: TcpTargetLocation) -> std::io::Result<Self> {
         let (location, client_tls) = tcp_target_location.into_components();
 
         // Load client certificate if specified
@@ -47,10 +49,8 @@ impl From<TcpTargetLocation> for TargetLocationData {
 
             // Read cert and key files synchronously during initialization
             // This is OK since we're in the setup phase
-            let cert_bytes = std::fs::read(cert_path)
-                .unwrap_or_else(|e| panic!("Failed to read client cert {}: {}", cert_path, e));
-            let key_bytes = std::fs::read(key_path)
-                .unwrap_or_else(|e| panic!("Failed to read client key {}: {}", key_path, e));
+            let cert_bytes = std::fs::read(cert_path)?;
+            let key_bytes = std::fs::read(key_path)?;
 
             Some((cert_bytes, key_bytes))
         } else {
@@ -76,7 +76,7 @@ impl From<TcpTargetLocation> for TargetLocationData {
         // Only disable SNI when explicitly set to None (via YAML null)
         let enable_sni = !matches!(sni_hostname, NoneOrOne::None);
 
-        Self {
+        Ok(Self {
             location,
             tls_connector: if client_tls.is_enabled() {
                 Some(
@@ -86,14 +86,14 @@ impl From<TcpTargetLocation> for TargetLocationData {
                         alpn_protocols,
                         enable_sni,
                         server_fingerprints,
-                    )
+                    )?
                     .into(),
                 )
             } else {
                 None
             },
             sni_hostname,
-        }
+        })
     }
 }
 
@@ -108,10 +108,13 @@ pub enum TargetActionData {
         location_data: Vec<TargetLocationData>,
         next_address_index: AtomicUsize,
     },
-    Http {
-        path_configs: Box<Trie<String, Vec<TargetHttpPathData>>>,
-        default_http_action: TargetHttpActionData,
-    },
+    Http(Box<HttpTargetData>),
+}
+
+pub struct HttpTargetData {
+    pub path_configs: Trie<String, Vec<TargetHttpPathData>>,
+    pub default_http_action: TargetHttpActionData,
+    pub http_timeouts: HttpTimeouts,
 }
 
 pub struct TargetHttpPathData {
@@ -148,9 +151,11 @@ pub enum TargetHttpActionData {
     },
 }
 
-impl From<HttpPathAction> for TargetHttpActionData {
-    fn from(http_path_action: HttpPathAction) -> Self {
-        match http_path_action {
+impl TryFrom<HttpPathAction> for TargetHttpActionData {
+    type Error = std::io::Error;
+
+    fn try_from(http_path_action: HttpPathAction) -> std::io::Result<Self> {
+        Ok(match http_path_action {
             HttpPathAction::CloseConnection => TargetHttpActionData::CloseConnection,
             HttpPathAction::ServeMessage(HttpServeMessageConfig {
                 status_code,
@@ -184,8 +189,8 @@ impl From<HttpPathAction> for TargetHttpActionData {
             }) => TargetHttpActionData::Forward {
                 location_data: locations
                     .into_iter()
-                    .map(TargetLocationData::from)
-                    .collect(),
+                    .map(TargetLocationData::try_from)
+                    .collect::<std::io::Result<_>>()?,
                 next_address_index: AtomicUsize::new(0),
                 replacement_path,
                 request_header_patch,
@@ -193,7 +198,7 @@ impl From<HttpPathAction> for TargetHttpActionData {
                 request_id_header_name,
                 response_id_header_name,
             },
-        }
+        })
     }
 }
 
@@ -206,6 +211,7 @@ enum TlsMode {
 }
 
 struct TlsTargetData {
+    pub handshake_timeout_secs: Option<std::num::NonZeroU64>,
     pub allow_no_alpn: bool,
     pub allow_any_alpn: bool,
     pub alpn_protocol_hashes: HashSet<u64>,
@@ -253,7 +259,7 @@ fn build_rustls_configs(
     alpn_protocols: &crate::config::NoneOrSome<AlpnValue>,
     client_fingerprints: &crate::config::NoneOrSome<String>,
     client_ca_certs: &[Vec<u8>],
-) -> (Arc<rustls::ServerConfig>, Arc<rustls::ServerConfig>) {
+) -> std::io::Result<(Arc<rustls::ServerConfig>, Arc<rustls::ServerConfig>)> {
     let mut alpn_protocol_bytes = vec![];
     for proto in alpn_protocols.iter() {
         if let AlpnValue::Specified(s) = proto {
@@ -270,8 +276,8 @@ fn build_rustls_configs(
             alpn_protocol_bytes,
             &client_fingerprint_vec,
             client_ca_certs,
-        ));
-        (tls_config.clone(), tls_config)
+        )?);
+        Ok((tls_config.clone(), tls_config))
     } else {
         let alpn_tls_config = create_server_config(
             certs,
@@ -279,20 +285,20 @@ fn build_rustls_configs(
             alpn_protocol_bytes.clone(),
             &client_fingerprint_vec,
             client_ca_certs,
-        );
+        )?;
         let mut no_alpn_tls_config = alpn_tls_config.clone();
         no_alpn_tls_config.alpn_protocols = vec![];
-        (Arc::new(alpn_tls_config), Arc::new(no_alpn_tls_config))
+        Ok((Arc::new(alpn_tls_config), Arc::new(no_alpn_tls_config)))
     }
 }
 
-pub async fn run_tcp_server(
+pub async fn prepare_tcp_server(
     server_address: SocketAddr,
     use_iptables: bool,
     tcp_nodelay: bool,
     tcp_keepalive: TcpKeepaliveOption,
     target_configs: Vec<TcpTargetConfig>,
-) -> std::io::Result<()> {
+) -> std::io::Result<impl std::future::Future<Output = std::io::Result<()>> + Send> {
     let mut non_tls_lookup_table: IpLookupTable<Ipv6Addr, Arc<TargetData>> = IpLookupTable::new();
 
     let mut tls_lookup_table: IpLookupTable<Ipv6Addr, bool> = IpLookupTable::new();
@@ -318,20 +324,21 @@ pub async fn run_tcp_server(
 
         // Validate passthrough + client_tls combination BEFORE moving action
         if let Some(ref tls_config) = server_tls {
-            if let Err(e) = tls_config.validate_with_action(&action) {
-                panic!("Invalid TLS configuration: {}", e);
-            }
+            tls_config
+                .validate_with_action(&action)
+                .map_err(std::io::Error::other)?;
         }
 
         let action_data = match action {
             TcpAction::Raw(RawTcpActionConfig { locations }) => TargetActionData::Raw {
                 location_data: locations
                     .into_iter()
-                    .map(TargetLocationData::from)
-                    .collect(),
+                    .map(TargetLocationData::try_from)
+                    .collect::<std::io::Result<_>>()?,
                 next_address_index: AtomicUsize::new(0),
             },
             TcpAction::Http(HttpTcpActionConfig {
+                http_timeouts,
                 http_paths,
                 default_http_action,
             }) => {
@@ -339,17 +346,20 @@ pub async fn run_tcp_server(
                 for (path, path_config_vec) in http_paths {
                     let path_data_vec = path_config_vec
                         .into_iter()
-                        .map(|path_config| TargetHttpPathData {
-                            required_request_headers: path_config.required_request_headers,
-                            http_action: path_config.http_action.into(),
+                        .map(|path_config| {
+                            Ok(TargetHttpPathData {
+                                required_request_headers: path_config.required_request_headers,
+                                http_action: path_config.http_action.try_into()?,
+                            })
                         })
-                        .collect();
+                        .collect::<std::io::Result<_>>()?;
                     path_configs.insert(path, path_data_vec);
                 }
-                TargetActionData::Http {
-                    path_configs: Box::new(path_configs),
-                    default_http_action: default_http_action.into(),
-                }
+                TargetActionData::Http(Box::new(HttpTargetData {
+                    path_configs,
+                    default_http_action: default_http_action.try_into()?,
+                    http_timeouts,
+                }))
             }
         };
 
@@ -387,12 +397,12 @@ pub async fn run_tcp_server(
                     let mut cert_file = File::open(cert).await?;
                     let mut cert_bytes = vec![];
                     cert_file.read_to_end(&mut cert_bytes).await?;
-                    let certs = load_certs(&cert_bytes);
+                    let certs = load_certs(&cert_bytes)?;
 
                     let mut key_file = File::open(key).await?;
                     let mut key_bytes = vec![];
                     key_file.read_to_end(&mut key_bytes).await?;
-                    let private_key = load_private_key(&key_bytes);
+                    let private_key = load_private_key(&key_bytes)?;
 
                     let mut ca_cert_bytes_vec = vec![];
                     for ca_path in tls_config.client_ca_certs.iter() {
@@ -408,7 +418,7 @@ pub async fn run_tcp_server(
                         &tls_config.alpn_protocols,
                         &tls_config.client_fingerprints,
                         &ca_cert_bytes_vec,
-                    );
+                    )?;
 
                     TlsMode::Terminate {
                         alpn_tls_config,
@@ -424,15 +434,16 @@ pub async fn run_tcp_server(
 
                     // .. but shouldn't be duplicated in a single config.
                     if config_lookup_table.insert(*addr, *masklen, true).is_some() {
-                        panic!(
+                        return Err(std::io::Error::other(format!(
                             "Address {}/{} is duplicated in the TLS config.",
                             addr, masklen
-                        );
+                        )));
                     }
                 }
 
                 // Create unified TlsTargetData
                 let tls_target_data = Arc::new(TlsTargetData {
+                    handshake_timeout_secs: tls_config.handshake_timeout_secs,
                     allow_no_alpn,
                     allow_any_alpn,
                     alpn_protocol_hashes,
@@ -475,10 +486,10 @@ pub async fn run_tcp_server(
                     .insert(*addr, *masklen, target_data.clone())
                     .is_some()
                 {
-                    panic!(
+                    return Err(std::io::Error::other(format!(
                         "Address {}/{} is duplicated in another non-tls target.",
                         addr, masklen
-                    );
+                    )));
                 }
             }
         }
@@ -486,88 +497,84 @@ pub async fn run_tcp_server(
         iptable_masks.extend(allowlist);
     }
 
-    if use_iptables {
-        configure_iptables(Protocol::Tcp, server_address, &iptable_masks).await;
-    }
-
     let sni_trie = Arc::new(sni_trie);
     let no_sni_targets = Arc::new(no_sni_targets);
 
-    let listener = TcpListener::bind(server_address).await.unwrap();
-    println!("Listening (TCP): {}", listener.local_addr().unwrap());
+    Ok(async move {
+        let listener = TcpListener::bind(server_address).await?;
+        if use_iptables {
+            configure_iptables(Protocol::Tcp, server_address, &iptable_masks).await?;
+        }
+        println!("Listening (TCP): {}", listener.local_addr()?);
 
-    loop {
-        let (stream, addr) = match listener.accept().await {
-            Ok(v) => v,
-            Err(e) => {
-                error!("Accept failed: {:?}", e);
+        loop {
+            let (stream, addr) = listener.accept().await?;
+
+            let ip = match addr.ip() {
+                IpAddr::V4(a) => a.to_ipv6_mapped(),
+                IpAddr::V6(a) => a,
+            };
+
+            let non_tls_data = non_tls_lookup_table
+                .longest_match(ip)
+                .map(|(_, _, m)| m.clone());
+            let has_tls_data = tls_lookup_table.longest_match(ip).is_some();
+
+            if non_tls_data.is_none() && !has_tls_data {
+                warn!("Unknown address, not allowing: {}", addr.ip());
                 continue;
             }
-        };
 
-        let ip = match addr.ip() {
-            IpAddr::V4(a) => a.to_ipv6_mapped(),
-            IpAddr::V6(a) => a,
-        };
+            if tcp_nodelay {
+                if let Err(e) = stream.set_nodelay(true) {
+                    error!("Failed to set tcp_nodelay on server stream: {}", e);
+                }
+            }
 
-        let non_tls_data = non_tls_lookup_table
-            .longest_match(ip)
-            .map(|(_, _, m)| m.clone());
-        let has_tls_data = tls_lookup_table.longest_match(ip).is_some();
+            // Apply TCP keepalive on server-side (client-facing) connection
+            if let Some(keepalive_config) = tcp_keepalive.resolve_for_server() {
+                if let Err(e) = crate::socket_util::set_tcp_keepalive(
+                    &stream,
+                    Duration::from_secs(keepalive_config.idle_secs),
+                    Duration::from_secs(keepalive_config.interval_secs),
+                ) {
+                    error!("Failed to set tcp_keepalive on server stream: {}", e);
+                }
+            }
 
-        if non_tls_data.is_none() && !has_tls_data {
-            warn!("Unknown address, not allowing: {}", addr.ip());
-            continue;
-        }
-
-        if tcp_nodelay {
-            if let Err(e) = stream.set_nodelay(true) {
-                error!("Failed to set tcp_nodelay on server stream: {}", e);
+            if has_tls_data {
+                let cloned_sni_trie = sni_trie.clone();
+                let cloned_no_sni = no_sni_targets.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = process_tls_stream(
+                        stream,
+                        &addr,
+                        ip,
+                        non_tls_data,
+                        cloned_sni_trie,
+                        cloned_no_sni,
+                    )
+                    .await
+                    {
+                        error!("{} finished with error: {:?}", addr, e);
+                    } else {
+                        debug!("{} finished successfully", addr);
+                    }
+                });
+            } else {
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        run_stream_action(Box::new(stream), &addr, non_tls_data.unwrap(), None)
+                            .await
+                    {
+                        error!("{} finished with error: {:?}", addr, e);
+                    } else {
+                        debug!("{} finished successfully", addr);
+                    }
+                });
             }
         }
-
-        // Apply TCP keepalive on server-side (client-facing) connection
-        if let Some(keepalive_config) = tcp_keepalive.resolve_for_server() {
-            if let Err(e) = crate::socket_util::set_tcp_keepalive(
-                &stream,
-                Duration::from_secs(keepalive_config.idle_secs),
-                Duration::from_secs(keepalive_config.interval_secs),
-            ) {
-                error!("Failed to set tcp_keepalive on server stream: {}", e);
-            }
-        }
-
-        if has_tls_data {
-            let cloned_sni_trie = sni_trie.clone();
-            let cloned_no_sni = no_sni_targets.clone();
-            tokio::spawn(async move {
-                if let Err(e) = process_tls_stream(
-                    stream,
-                    &addr,
-                    ip,
-                    non_tls_data,
-                    cloned_sni_trie,
-                    cloned_no_sni,
-                )
-                .await
-                {
-                    error!("{} finished with error: {:?}", addr, e);
-                } else {
-                    debug!("{} finished successfully", addr);
-                }
-            });
-        } else {
-            tokio::spawn(async move {
-                if let Err(e) =
-                    run_stream_action(Box::new(stream), &addr, non_tls_data.unwrap(), None).await
-                {
-                    error!("{} finished with error: {:?}", addr, e);
-                } else {
-                    debug!("{} finished successfully", addr);
-                }
-            });
-        }
-    }
+    })
 }
 
 /// Resolves SNI candidates and computes ALPN hashes from a parsed ClientHello.
@@ -707,7 +714,14 @@ async fn handle_terminate_with_parsed(
         accept_future
     };
 
-    let tls_stream = Box::new(accept_future.await?);
+    let tls_stream = Box::new(
+        crate::tokio_util::with_timeout(
+            target_data.handshake_timeout_secs,
+            "TLS handshake",
+            accept_future,
+        )
+        .await?,
+    );
 
     debug!("Completed TLS handshake for {}", addr);
 
@@ -760,7 +774,7 @@ async fn handle_passthrough_stream(
                 &location_data[0]
             }
         }
-        TargetActionData::Http { .. } => {
+        TargetActionData::Http(_) => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "HTTP action not supported with TLS passthrough mode",
@@ -939,7 +953,7 @@ async fn run_stream_action(
             {
                 Ok(s) => s,
                 Err(e) => {
-                    source_stream.try_shutdown().await?;
+                    let _ = source_stream.try_shutdown().await;
                     return Err(e);
                 }
             };
@@ -975,15 +989,11 @@ async fn run_stream_action(
 
             Ok(())
         }
-        TargetActionData::Http {
-            path_configs,
-            default_http_action,
-        } => {
+        TargetActionData::Http(http) => {
             handle_http_stream(
                 target_data.tcp_nodelay,
                 target_data.tcp_keepalive,
-                path_configs,
-                default_http_action,
+                http,
                 source_stream,
                 addr,
                 initial_data,
@@ -1081,5 +1091,65 @@ pub async fn setup_target_stream(
 
             maybe_wrap_tls(unix_stream, target_location, None).await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn termination_times_out_when_the_peer_stops_after_client_hello() {
+        let identity = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let tls_config = Arc::new(
+            create_server_config(
+                load_certs(identity.cert.pem().as_bytes()).unwrap(),
+                &load_private_key(identity.signing_key.serialize_pem().as_bytes()).unwrap(),
+                vec![],
+                &[],
+                &[],
+            )
+            .unwrap(),
+        );
+        let client_config =
+            crate::rustls_util::create_client_config_with_cert(false, None, vec![], true, vec![])
+                .unwrap();
+        let mut client_tls = rustls::ClientConnection::new(
+            client_config,
+            rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+        )
+        .unwrap();
+        let mut hello = Vec::new();
+        client_tls.write_tls(&mut hello).unwrap();
+        let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let address: SocketAddr = ([127, 0, 0, 1], listener.local_addr().unwrap().port()).into();
+        let (client, accepted) = tokio::join!(TcpStream::connect(address), listener.accept());
+        let _client = client.unwrap();
+        let (server, peer) = accepted.unwrap();
+        let target = Arc::new(TlsTargetData {
+            handshake_timeout_secs: std::num::NonZeroU64::new(1),
+            allow_no_alpn: true,
+            allow_any_alpn: true,
+            alpn_protocol_hashes: HashSet::new(),
+            ip_lookup_table: IpLookupTable::new(),
+            tls_mode: TlsMode::Terminate {
+                alpn_tls_config: tls_config.clone(),
+                no_alpn_tls_config: tls_config.clone(),
+            },
+            target_data: Arc::new(TargetData {
+                tcp_nodelay: true,
+                tcp_keepalive: None,
+                action_data: TargetActionData::Raw {
+                    location_data: vec![],
+                    next_address_index: AtomicUsize::new(0),
+                },
+            }),
+        });
+        let error = handle_terminate_with_parsed(server, &peer, hello, target, tls_config)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(error.to_string(), "TLS handshake timed out");
     }
 }

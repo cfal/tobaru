@@ -1,8 +1,10 @@
 mod alpn_value;
+mod deprecation;
 mod ip_mask;
 mod location;
 mod option_util;
 mod sni_value;
+mod validation;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -215,8 +217,12 @@ impl<'de> serde::de::Deserialize<'de> for Config {
                     serde_json::Value::String("tcp".to_string()),
                 );
             }
+            let deprecated = deprecation::deprecated_keys(&map);
             let config = serde_json::from_value(serde_json::Value::Object(map))
                 .map_err(serde::de::Error::custom)?;
+            for (old, new) in deprecated {
+                warn!("{old} is deprecated and has been renamed to {new}. This will be removed in future versions.");
+            }
             Ok(Config::ServerConfig(config))
         }
     }
@@ -350,6 +356,8 @@ pub enum TargetConfigs {
         targets: Box<OneOrSome<TcpTargetConfig>>,
     },
     Udp {
+        #[serde(default)]
+        udp_max_associations: Option<std::num::NonZeroUsize>,
         #[serde(alias = "target")]
         targets: OneOrSome<UdpTargetConfig>,
     },
@@ -378,8 +386,18 @@ pub struct RawTcpActionConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct HttpTcpActionConfig {
     #[serde(default)]
+    pub http_timeouts: HttpTimeouts,
+    #[serde(default)]
     pub http_paths: HashMap<String, OneOrSome<HttpPathConfig>>,
     pub default_http_action: HttpPathAction,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpTimeouts {
+    pub request_header_timeout_secs: Option<std::num::NonZeroU64>,
+    pub response_header_timeout_secs: Option<std::num::NonZeroU64>,
+    pub keepalive_idle_timeout_secs: Option<std::num::NonZeroU64>,
 }
 
 #[derive(Debug, Clone)]
@@ -412,7 +430,7 @@ impl<'de> Deserialize<'de> for TcpAction {
         let protocol = map
             .get("protocol")
             .and_then(serde_json::Value::as_str)
-            .unwrap();
+            .ok_or_else(|| serde::de::Error::custom("protocol must be a string"))?;
 
         match protocol {
             "raw" => {
@@ -639,20 +657,26 @@ impl<'de> Deserialize<'de> for HttpPathAction {
                             serde_json::Value::Object(json_map),
                         )
                         .map_err(serde::de::Error::custom)?;
-                        Ok(HttpPathAction::ServeMessage(config))
+                        let action = HttpPathAction::ServeMessage(config);
+                        action.validate().map_err(serde::de::Error::custom)?;
+                        Ok(action)
                     }
                     "serve-directory" => {
                         let config = HttpServeDirectoryConfig::deserialize(
                             serde_json::Value::Object(json_map),
                         )
                         .map_err(serde::de::Error::custom)?;
-                        Ok(HttpPathAction::ServeDirectory(config))
+                        let action = HttpPathAction::ServeDirectory(config);
+                        action.validate().map_err(serde::de::Error::custom)?;
+                        Ok(action)
                     }
                     "forward" => {
                         let config =
                             HttpForwardConfig::deserialize(serde_json::Value::Object(json_map))
                                 .map_err(serde::de::Error::custom)?;
-                        Ok(HttpPathAction::Forward(config))
+                        let action = HttpPathAction::Forward(config);
+                        action.validate().map_err(serde::de::Error::custom)?;
+                        Ok(action)
                     }
                     _ => Err(serde::de::Error::unknown_variant(
                         action_type,
@@ -712,12 +736,11 @@ impl<'de> Deserialize<'de> for TcpTargetLocation {
             where
                 E: serde::de::Error,
             {
-                // Try to parse as NetLocation
-                if let Ok(net_location) = NetLocation::try_from(value) {
-                    return Ok(TcpTargetLocation::OnlyAddress(net_location));
+                if value.contains(':') && !value.contains('/') {
+                    return NetLocation::try_from(value)
+                        .map(TcpTargetLocation::OnlyAddress)
+                        .map_err(serde::de::Error::custom);
                 }
-
-                // If not NetLocation, treat as PathBuf
                 Ok(TcpTargetLocation::OnlyPath(PathBuf::from(value)))
             }
 
@@ -789,6 +812,9 @@ pub struct ServerTlsConfig {
     #[serde(default)]
     pub mode: TlsMode,
 
+    #[serde(default)]
+    pub handshake_timeout_secs: Option<std::num::NonZeroU64>,
+
     #[serde(default, alias = "sni_hostname")]
     pub sni_hostnames: NoneOrSome<SniValue>,
 
@@ -832,6 +858,9 @@ impl ServerTlsConfig {
         // Note: optional flag is now handled by auto-expansion in load_server_configs
         // so we don't validate it here
 
+        if self.is_passthrough() && self.handshake_timeout_secs.is_some() {
+            return Err("handshake_timeout_secs requires TLS terminate mode".into());
+        }
         if self.is_terminate() {
             if self.cert.is_none() || self.key.is_none() {
                 return Err("cert and key are required for TLS terminate mode".to_string());
@@ -1129,20 +1158,6 @@ fn deserialize_configs(mut config_str: String, filename: &str) -> std::io::Resul
             .join("\n");
     }
 
-    if config_str.contains("serverTls") {
-        eprintln!("WARNING: serverTls is deprecated and has been renamed to server_tls. This will be removed in future versions.");
-    }
-
-    if config_str.contains("bindAddress") {
-        eprintln!("WARNING: bindAddress is deprecated and has been renamed to address. This will be removed in future versions.");
-    }
-
-    // Unfortunately, we can't grep for `address` in target configs since it's valid for server
-    // configs.
-    if config_str.contains("addresses") {
-        eprintln!("WARNING: addresses is deprecated and has been renamed to locations. This will be removed in future versions.");
-    }
-
     if is_json {
         serde_json::from_str(&config_str).map_err(|e| {
             std::io::Error::new(
@@ -1173,7 +1188,10 @@ pub async fn load_server_configs(
 
     for config_path in config_paths {
         let config_str = tokio::fs::read_to_string(&config_path).await?;
-        let configs = deserialize_configs(config_str, &config_path)?;
+        let configs =
+            tokio::task::spawn_blocking(move || deserialize_configs(config_str, &config_path))
+                .await
+                .map_err(std::io::Error::other)??;
         for config in configs {
             match config {
                 Config::ServerConfig(server_config) => {
@@ -1249,7 +1267,9 @@ pub async fn load_server_configs(
                     IpMaskSelection::replace_groups(&mut target.allowlist, &groups)?;
                 }
             }
-            TargetConfigs::Udp { ref mut targets } => {
+            TargetConfigs::Udp {
+                ref mut targets, ..
+            } => {
                 for target in targets.iter_mut() {
                     IpMaskSelection::replace_groups(&mut target.allowlist, &groups)?;
                 }
@@ -1395,6 +1415,7 @@ pub async fn load_url(config_url: &str) -> std::io::Result<ServerConfig> {
                 address,
                 use_iptables: false,
                 target_configs: TargetConfigs::Udp {
+                    udp_max_associations: None,
                     targets: OneOrSome::One(udp_target_config),
                 },
             })
