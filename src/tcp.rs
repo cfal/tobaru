@@ -508,13 +508,7 @@ pub async fn prepare_tcp_server(
         println!("Listening (TCP): {}", listener.local_addr()?);
 
         loop {
-            let (stream, addr) = match listener.accept().await {
-                Ok(v) => v,
-                Err(e) => {
-                    error!("Accept failed: {:?}", e);
-                    continue;
-                }
-            };
+            let (stream, addr) = listener.accept().await?;
 
             let ip = match addr.ip() {
                 IpAddr::V4(a) => a.to_ipv6_mapped(),

@@ -60,6 +60,41 @@ async function waitForLog(message) {
   }
 }
 
+async function assertAcceptFailure(configPath, config) {
+  const reservation = net.createServer();
+  const port = await listen(reservation);
+  await close(reservation);
+  writeFileSync(configPath, JSON.stringify([{ ...config, address: `0.0.0.0:${port}` }]));
+  const limited = spawn('/bin/sh', ['-c', 'ulimit -n 64; exec "$@"', 'listener-test', binary, '-t', '1', configPath]);
+  const closed = new Promise(resolve => limited.once('close', resolve));
+  const deadline = AbortSignal.timeout(5000);
+  const clients = [];
+  let output = '';
+  const capture = bytes => { output = (output + bytes).slice(-16384); };
+  limited.stdout.on('data', capture);
+  limited.stderr.on('data', capture);
+  try {
+    while (!output.includes('Listening (TCP)')) {
+      assert.equal(limited.exitCode, null, output);
+      await delay(20, undefined, { signal: deadline });
+    }
+    // Incomplete request heads retain accepted sockets until the FD limit is hit.
+    for (let i = 0; i < 96; i++) {
+      const client = net.connect(port, '127.0.0.1');
+      client.on('error', () => {});
+      clients.push(client);
+    }
+    await once(limited, 'close', { signal: deadline });
+    assert.equal(limited.exitCode, 1, output);
+    assert.match(output, /Listener .* failed:/);
+    assert.doesNotMatch(output, /panicked/);
+  } finally {
+    for (const client of clients) client.destroy();
+    if (limited.exitCode === null) limited.kill('SIGKILL');
+    await closed;
+  }
+}
+
 function request(port, method, path, body) {
   return new Promise((resolve, reject) => {
     let continues = 0;
@@ -157,6 +192,7 @@ try {
   assertFailure([failurePath]);
   writeFileSync(failurePath, JSON.stringify([{ ...config[0], target: { allowlist: '127.0.0.1/32', location: 'backend:abc' } }]));
   assertFailure(['--dry-run', failurePath]);
+  await assertAcceptFailure(failurePath, config[0]);
 
   writeFileSync(configPath, '{invalid');
   await waitForLog('Config reload rejected');
@@ -182,7 +218,7 @@ try {
     agent.destroy();
     assert.equal((await request(port, 'GET', '/')).body.toString(), content);
   }
-  console.log('HTTP CLI smoke passed: dispatch, reuse, HEAD, ordered cookies, Expect, echo, pipelining, last-good reload, repeated atomic saves.');
+  console.log('HTTP CLI smoke passed: dispatch, reuse, HEAD, ordered cookies, Expect, echo, pipelining, listener failures, last-good reload, repeated atomic saves.');
 } catch (error) {
   console.error(logs);
   throw error;

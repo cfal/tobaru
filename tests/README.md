@@ -23,3 +23,5 @@ are created beneath `$HOME/tmp` and removed on completion or failure. The test
 has a 30-second deadline and cleans up its child process and sockets. It also
 checks that invalid reloads retain the last-good configuration and repeated
 atomic file replacements remain observable.
+Listener-failure checks cover occupied ports and TCP accept failure under a
+child-local file-descriptor limit; both must exit nonzero without panicking.
