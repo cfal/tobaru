@@ -10,8 +10,55 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 1
 
 jobs:
+  checks:
+    name: Check Rust ${{ matrix.toolchain }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: [stable, '1.88.0']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          components: rustfmt, clippy
+
+      - name: Setup cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: checks-${{ matrix.toolchain }}
+
+      - name: Check formatting
+        if: matrix.toolchain == 'stable'
+        run: cargo fmt --all -- --check
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Run Clippy
+        if: matrix.toolchain == 'stable'
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Install Node
+        if: matrix.toolchain == 'stable'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Build native binary
+        if: matrix.toolchain == 'stable'
+        run: cargo build --locked
+
+      - name: Run HTTP CLI smoke
+        if: matrix.toolchain == 'stable'
+        run: node tests/http_smoke.mjs target/debug/tobaru
+
   build:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
@@ -186,7 +233,7 @@ jobs:
 
   release:
     name: Create Release
-    needs: build
+    needs: [checks, build]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
