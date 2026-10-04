@@ -13,6 +13,7 @@ impl<'a> Session<'a> {
     pub(super) async fn forward(&mut self, request: Request<'a>) -> std::io::Result<Outcome> {
         let Self {
             stream,
+            reader,
             cached_target,
             addr,
             tcp_nodelay,
@@ -47,9 +48,9 @@ impl<'a> Session<'a> {
             request_data.set_first_line(format!("{} {} HTTP/1.1", verb, new_path));
         }
 
-        let mut target_stream = match cached_target.take() {
+        let (mut target_stream, target_reader) = match cached_target.take() {
             // Actions live in the immutable configuration retained by this session.
-            Some(t) if std::ptr::eq(t.action, path_action) => t.stream,
+            Some(t) if std::ptr::eq(t.action, path_action) => (t.stream, t.reader),
             no_match => {
                 if let Some(mut t) = no_match {
                     let _ = t.stream.try_shutdown().await;
@@ -62,7 +63,10 @@ impl<'a> Session<'a> {
                 } else {
                     &location_data[0]
                 };
-                setup_target_stream(addr, target_location, tcp_nodelay, tcp_keepalive).await?
+                (
+                    setup_target_stream(addr, target_location, tcp_nodelay, tcp_keepalive).await?,
+                    line_reader::LineReader::new(),
+                )
             }
         };
 
@@ -123,14 +127,16 @@ impl<'a> Session<'a> {
                 *cached_target = Some(CachedTarget {
                     action: path_action,
                     stream: target_stream,
+                    reader: target_reader,
                 });
+                *reader = Some(request_data.into_reader());
                 return Ok(Outcome::Continue);
             }
         }
 
         let request_websocket_upgrade = request_data.headers().websocket_upgrade();
 
-        forward_message(&mut stream, Some(&mut target_stream), request_data).await?;
+        *reader = Some(forward_message(&mut stream, Some(&mut target_stream), request_data).await?);
 
         // Flush the request, and then read the response.
         target_stream.flush().await?;
@@ -138,7 +144,7 @@ impl<'a> Session<'a> {
         // TODO: add a read timeout
         // Responses from target server never have initial_data
         let mut response_data =
-            http_parser::ParsedHttpData::parse(&mut target_stream, None).await?;
+            http_parser::ParsedHttpData::parse(&mut target_stream, target_reader).await?;
 
         response_data
             .headers_mut()
@@ -161,18 +167,19 @@ impl<'a> Session<'a> {
                     &string_util::create_message(&response_data).into_bytes(),
                 )
                 .await?;
-                drop(response_data);
                 info!("[{}] {} {} [forward-ws]", LOG_PREFIX, verb, request_path);
-                return Ok(Outcome::Tunnel(target_stream));
+                return Ok(Outcome::Tunnel(target_stream, response_data.into_reader()));
             }
             error!("Websocket upgrade failed: {}", response_data.first_line());
         }
 
         let response_connection_close = response_data.headers().connection_close();
 
-        if verb != "HEAD" {
-            forward_message(&mut target_stream, Some(&mut stream), response_data).await?;
-        }
+        let target_reader = if verb != "HEAD" {
+            forward_message(&mut target_stream, Some(&mut stream), response_data).await?
+        } else {
+            response_data.into_reader()
+        };
 
         info!("[{}] {} {} [forward]", LOG_PREFIX, verb, request_path);
 
@@ -184,6 +191,7 @@ impl<'a> Session<'a> {
         *cached_target = Some(CachedTarget {
             action: path_action,
             stream: target_stream,
+            reader: target_reader,
         });
 
         Ok(Outcome::Continue)

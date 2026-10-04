@@ -119,11 +119,12 @@ impl LineReader {
         &self.buf[self.start_offset..self.end_offset]
     }
 
-    pub fn into_buf(self) -> Box<[u8]> {
-        self.buf
+    pub fn consume(&mut self, count: usize) {
+        assert!(count <= self.end_offset - self.start_offset);
+        self.start_offset += count;
     }
 
-    async fn read<T>(&mut self, stream: &mut T) -> std::io::Result<()>
+    pub async fn read_more<T>(&mut self, stream: &mut T) -> std::io::Result<usize>
     where
         T: AsyncRead + Unpin,
     {
@@ -141,15 +142,8 @@ impl LineReader {
         loop {
             match stream.read(&mut self.buf[self.end_offset..]).await {
                 Ok(len) => {
-                    if len == 0 {
-                        // EOF
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::ConnectionAborted,
-                            "EOF while reading",
-                        ));
-                    }
                     self.end_offset += len;
-                    return Ok(());
+                    return Ok(len);
                 }
                 Err(e) => {
                     if e.kind() == std::io::ErrorKind::Interrupted {
@@ -160,6 +154,16 @@ impl LineReader {
                 }
             }
         }
+    }
+
+    async fn read<T: AsyncRead + Unpin>(&mut self, stream: &mut T) -> std::io::Result<()> {
+        if self.read_more(stream).await? == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "EOF while reading",
+            ));
+        }
+        Ok(())
     }
 
     fn is_cache_full(&self) -> bool {

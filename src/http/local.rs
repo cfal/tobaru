@@ -86,6 +86,8 @@ impl Session<'_> {
                 response_headers,
                 response_id_header_name,
             } => {
+                let request_connection_close = request_data.headers().connection_close();
+                let request_first_line = request_data.first_line().to_owned();
                 if verb != "GET" && verb != "HEAD" {
                     let mut error_response = String::from("HTTP/1.1 501 Not Implemented\r\n");
                     error_response.push_str("content-length: 0\r\nconnection: close\r\n");
@@ -100,9 +102,21 @@ impl Session<'_> {
                 if memmem::find(request_path.as_bytes(), b"..").is_some() {
                     return Err(std::io::Error::other(format!(
                         "Ignoring request with possible base path escape: {}",
-                        request_data.first_line()
+                        request_first_line
                     )));
                 }
+                if request_data.headers().expect_100()? {
+                    write_all(&mut stream, b"HTTP/1.1 417 Expectation Failed\r\nConnection: close\r\nContent-Length: 0\r\n\r\n").await?;
+                    return Ok(Outcome::Close);
+                }
+                self.reader = Some(
+                    forward_message(
+                        &mut stream,
+                        None::<&mut tokio::net::TcpStream>,
+                        request_data,
+                    )
+                    .await?,
+                );
                 let file_path = string_util::update_base_path(&request_path, base_path, path);
                 match resolve_file(path, &file_path).await {
                     Ok(canonical_path) => match tokio::fs::metadata(&canonical_path).await {
@@ -119,8 +133,6 @@ impl Session<'_> {
                                     .append_header_to_string(&mut ok_response);
                             }
 
-                            let request_connection_close =
-                                request_data.headers().connection_close();
                             if request_connection_close {
                                 ok_response.push_str("connection: close\r\n");
                             } else {
@@ -162,8 +174,6 @@ impl Session<'_> {
                         _ => {
                             let mut not_found_response =
                                 String::from("HTTP/1.1 404\r\ncontent-length: 0\r\n");
-                            let request_connection_close =
-                                request_data.headers().connection_close();
                             if request_connection_close {
                                 not_found_response.push_str("connection: close\r\n");
                             } else {
@@ -189,7 +199,6 @@ impl Session<'_> {
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                         let mut not_found_response =
                             String::from("HTTP/1.1 404\r\ncontent-length: 0\r\n");
-                        let request_connection_close = request_data.headers().connection_close();
                         if request_connection_close {
                             not_found_response.push_str("connection: close\r\n");
                         } else {

@@ -1,13 +1,13 @@
 use super::header_map::HeaderMap;
 use super::{chunk_transfer, http_parser, line_reader, string_util};
 use crate::util::write_all;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite};
 
 pub(super) async fn forward_message<R, W>(
     from_stream: &mut R,
     mut maybe_to_stream: Option<&mut W>,
     http_data: http_parser::ParsedHttpData,
-) -> std::io::Result<()>
+) -> std::io::Result<line_reader::LineReader>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -28,89 +28,61 @@ where
 
     let reader = http_data.into_reader();
     if let Some(len) = content_length {
-        if len > 0 {
-            forward_content_with_length(from_stream, maybe_to_stream, reader, len).await?;
-        }
+        forward_content_with_length(from_stream, maybe_to_stream, reader, len).await
     } else if chunked {
-        forward_chunked_content(from_stream, maybe_to_stream, reader).await?;
-    } else if !reader.unparsed_data().is_empty() {
-        return Err(std::io::Error::other(format!(
-            "Unexpected request data with len {}",
-            reader.unparsed_data().len()
-        )));
+        forward_chunked_content(from_stream, maybe_to_stream, reader).await
+    } else {
+        Ok(reader)
     }
-
-    Ok(())
 }
 
 async fn forward_content_with_length<R, W>(
     from_stream: &mut R,
     mut maybe_to_stream: Option<&mut W>,
-    reader: line_reader::LineReader,
+    mut reader: line_reader::LineReader,
     content_length: usize,
-) -> std::io::Result<()>
+) -> std::io::Result<line_reader::LineReader>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let unparsed_data = reader.unparsed_data();
-    if unparsed_data.len() > content_length {
-        return Err(std::io::Error::other(format!(
-            "Unexpected content length ({} > {})",
-            unparsed_data.len(),
-            content_length
-        )));
-    }
-
-    if !unparsed_data.is_empty() {
-        if let Some(ref mut to_stream) = maybe_to_stream {
-            write_all(to_stream, unparsed_data).await?;
-        }
-    }
-
-    let mut remaining = content_length - unparsed_data.len();
-    let mut buf = reader.into_buf();
+    let mut remaining = content_length;
     while remaining > 0 {
-        let max_len = std::cmp::min(remaining, buf.len());
-        let read_len = from_stream.read(&mut buf[0..max_len]).await?;
-        if read_len == 0 {
+        if reader.unparsed_data().is_empty() && reader.read_more(from_stream).await? == 0 {
             return Err(std::io::Error::other(format!(
                 "Got EOF while reading content with length, {} bytes were remaining",
                 remaining
             )));
         }
+        let read_len = remaining.min(reader.unparsed_data().len());
         if let Some(ref mut to_stream) = maybe_to_stream {
-            write_all(to_stream, &buf[0..read_len]).await?;
+            write_all(to_stream, &reader.unparsed_data()[..read_len]).await?;
         }
+        reader.consume(read_len);
         remaining -= read_len;
     }
-    Ok(())
+    Ok(reader)
 }
 
 async fn forward_chunked_content<R, W>(
     from_stream: &mut R,
     mut maybe_to_stream: Option<&mut W>,
-    reader: line_reader::LineReader,
-) -> std::io::Result<()>
+    mut reader: line_reader::LineReader,
+) -> std::io::Result<line_reader::LineReader>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     let mut chunk_transfer = chunk_transfer::ChunkTransfer::new();
-    chunk_transfer
-        .run(reader.unparsed_data(), &mut maybe_to_stream)
-        .await?;
-
-    let mut buf = reader.into_buf();
     while !chunk_transfer.is_done() {
-        let read_len = from_stream.read(&mut buf).await?;
-        if read_len == 0 {
+        if reader.unparsed_data().is_empty() && reader.read_more(from_stream).await? == 0 {
             return Err(std::io::Error::other("Got EOF during chunk transfer"));
         }
-        chunk_transfer
-            .run(&buf[0..read_len], &mut maybe_to_stream)
+        let consumed = chunk_transfer
+            .run_prefix(reader.unparsed_data(), &mut maybe_to_stream)
             .await?;
+        reader.consume(consumed);
     }
 
-    Ok(())
+    Ok(reader)
 }

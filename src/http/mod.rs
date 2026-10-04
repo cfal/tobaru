@@ -26,10 +26,12 @@ use routing::find_matching_action;
 struct CachedTarget<'a> {
     action: &'a TargetHttpActionData,
     stream: Box<dyn AsyncStream>,
+    reader: line_reader::LineReader,
 }
 
 struct Session<'a> {
     stream: Box<dyn AsyncStream>,
+    reader: Option<line_reader::LineReader>,
     cached_target: Option<CachedTarget<'a>>,
     addr: &'a std::net::SocketAddr,
     tcp_nodelay: bool,
@@ -39,7 +41,7 @@ struct Session<'a> {
 enum Outcome {
     Continue,
     Close,
-    Tunnel(Box<dyn AsyncStream>),
+    Tunnel(Box<dyn AsyncStream>, line_reader::LineReader),
 }
 
 struct Request<'a> {
@@ -132,10 +134,14 @@ pub async fn handle_http_stream(
     default_action: &TargetHttpActionData,
     stream: Box<dyn AsyncStream>,
     addr: &std::net::SocketAddr,
-    mut initial_data: Option<Vec<u8>>,
+    initial_data: Option<Vec<u8>>,
 ) -> std::io::Result<()> {
     let mut session = Session {
         stream,
+        reader: Some(initial_data.map_or_else(
+            line_reader::LineReader::new,
+            line_reader::LineReader::new_with_data,
+        )),
         cached_target: None,
         addr,
         tcp_nodelay,
@@ -149,12 +155,11 @@ pub async fn handle_http_stream(
         if iteration > 1 {
             session.stream.flush().await?;
         }
-        let initial = if iteration == 1 {
-            initial_data.take()
-        } else {
-            None
-        };
-        let data = http_parser::ParsedHttpData::parse(&mut session.stream, initial).await?;
+        let reader = session
+            .reader
+            .take()
+            .expect("continued session must retain its reader");
+        let data = http_parser::ParsedHttpData::parse(&mut session.stream, reader).await?;
         let request = Request::new(
             data,
             format!("{}#{}", stream_id, iteration),
@@ -164,10 +169,23 @@ pub async fn handle_http_stream(
         match session.dispatch(request).await? {
             Outcome::Continue => {}
             Outcome::Close => break,
-            Outcome::Tunnel(mut target) => {
-                return copy_bidirectional(&mut session.stream, &mut target, true, false)
-                    .await
-                    .map(|_| ())
+            Outcome::Tunnel(mut target, target_reader) => {
+                let reader = session
+                    .reader
+                    .take()
+                    .expect("upgrade must retain its reader");
+                tokio::try_join!(
+                    crate::util::write_all(&mut session.stream, target_reader.unparsed_data()),
+                    crate::util::write_all(&mut target, reader.unparsed_data()),
+                )?;
+                return copy_bidirectional(
+                    &mut session.stream,
+                    &mut target,
+                    true,
+                    !reader.unparsed_data().is_empty(),
+                )
+                .await
+                .map(|_| ());
             }
         }
     }

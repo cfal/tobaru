@@ -1,3 +1,4 @@
+#[cfg(test)]
 use std::collections::HashMap;
 
 use memchr::{memchr, memmem};
@@ -15,6 +16,7 @@ pub struct ChunkTransfer {
     state: ChunkTransferState,
     read_size_buf: Vec<u8>,
     trailer_header_buf: [u8; TRAILER_HEADER_LEN],
+    #[cfg(test)]
     trailer_headers: HashMap<String, String>,
 }
 
@@ -39,15 +41,16 @@ impl ChunkTransfer {
             state: ChunkTransferState::ReadSize { cached_len: 0 },
             read_size_buf: Vec::with_capacity(CHUNK_SIZE_LINE_MAX_LEN),
             trailer_header_buf: [0u8; TRAILER_HEADER_LEN],
+            #[cfg(test)]
             trailer_headers: HashMap::new(),
         }
     }
 
-    pub async fn run<T>(
+    pub async fn run_prefix<T>(
         &mut self,
         data: &[u8],
         maybe_forward_stream: &mut Option<&mut T>,
-    ) -> std::io::Result<()>
+    ) -> std::io::Result<usize>
     where
         T: AsyncWrite + Unpin + ?Sized,
     {
@@ -146,7 +149,9 @@ impl ChunkTransfer {
                                     chunk_len,
                                     // provided chunk length doesn't include \r\n, but we want to
                                     // include it when forwarding the data chunk itself.
-                                    remaining_len: chunk_len + 2, // +2 for data's CRLF
+                                    remaining_len: chunk_len.checked_add(2).ok_or_else(|| {
+                                        std::io::Error::other("Chunk size overflow")
+                                    })?,
                                 };
                             } else {
                                 // Zero chunk indicates end of data, potentially followed by trailers
@@ -182,6 +187,18 @@ impl ChunkTransfer {
                     remaining_len,
                 } => {
                     let forward_len = std::cmp::min(unused.len(), remaining_len);
+                    for remaining in [2, 1] {
+                        if remaining_len >= remaining {
+                            let offset = remaining_len - remaining;
+                            if offset < forward_len
+                                && unused[offset] != if remaining == 2 { b'\r' } else { b'\n' }
+                            {
+                                return Err(std::io::Error::other(
+                                    "Chunk data is not terminated by CRLF",
+                                ));
+                            }
+                        }
+                    }
                     if let Some(ref mut forward_stream) = maybe_forward_stream {
                         write_all(forward_stream, &unused[0..forward_len]).await?;
                     }
@@ -249,13 +266,11 @@ impl ChunkTransfer {
                                         ),
                                     ));
                                 }
-                                let header_key = tokens[0].trim().to_lowercase();
-                                let header_value = tokens[1].trim().to_string(); // Store trimmed value
-
-                                // Prevent overwriting standard headers if they appear as trailers
-                                // (Though RFC allows it, some intermediaries might strip them)
-                                // TODO: Consider if specific trailers should be disallowed.
-                                self.trailer_headers.insert(header_key, header_value);
+                                #[cfg(test)]
+                                self.trailer_headers.insert(
+                                    tokens[0].trim().to_lowercase(),
+                                    tokens[1].trim().to_string(),
+                                );
 
                                 self.state = ChunkTransferState::ReadTrailer { cached_len: 0 };
                             } else {
@@ -284,14 +299,25 @@ impl ChunkTransfer {
                 }
 
                 Done => {
-                    // If we are already Done, any further data is an error
-                    return Err(std::io::Error::other(
-                        "extra data received after chunked transfer completion",
-                    ));
+                    return Ok(start_offset);
                 }
             }
         } // end while start_offset < data.len()
 
+        Ok(start_offset)
+    }
+
+    #[cfg(test)]
+    pub async fn run<T: AsyncWrite + Unpin + ?Sized>(
+        &mut self,
+        data: &[u8],
+        stream: &mut Option<&mut T>,
+    ) -> std::io::Result<()> {
+        if self.run_prefix(data, stream).await? != data.len() {
+            return Err(std::io::Error::other(
+                "extra data received after chunked transfer completion",
+            ));
+        }
         Ok(())
     }
 
@@ -311,6 +337,33 @@ mod tests {
     use std::time::Duration;
     use tokio::io::{AsyncWriteExt, BufWriter};
     use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn prefix_transfer_retains_next_message_and_validates_terminators() {
+        let mut transfer = ChunkTransfer::new();
+        let mut sink = None::<&mut Vec<u8>>;
+        let body = b"1\r\na\r\n0\r\n\r\n";
+        let input = [body.as_slice(), b"NEXT"].concat();
+        assert_eq!(
+            transfer.run_prefix(&input, &mut sink).await.unwrap(),
+            body.len()
+        );
+        assert!(transfer.is_done());
+        for input in [b"1\r\naXX".as_slice(), b"1\r\na\rX"] {
+            assert!(ChunkTransfer::new()
+                .run_prefix(input, &mut sink)
+                .await
+                .is_err());
+        }
+        let overflow = format!("{:X}\r\n", usize::MAX);
+        assert!(ChunkTransfer::new()
+            .run_prefix(overflow.as_bytes(), &mut sink)
+            .await
+            .is_err());
+        let mut fragmented = ChunkTransfer::new();
+        fragmented.run_prefix(b"1\r\na\r", &mut sink).await.unwrap();
+        assert!(fragmented.run_prefix(b"X", &mut sink).await.is_err());
+    }
 
     // Helper struct to act as a mock AsyncWrite target
     struct MockWriter {
