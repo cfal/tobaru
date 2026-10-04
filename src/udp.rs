@@ -118,16 +118,16 @@ pub fn prepare_udp_server(
 
         let result = loop {
             let received = tokio::select! {
-                _ = &mut stop => break Ok(()),
                 _ = cleanup.tick() => {
                     cleanup_associations(&mut associations);
                     continue;
                 }
                 _ = tasks.join_next(), if !tasks.is_empty() => continue,
-                received = server_socket.recv_from(&mut buf) => received,
+                received = receive_until_stopped(server_socket.recv_from(&mut buf), &mut stop) => received,
             };
             let (len, addr) = match received {
-                Ok(packet) => packet,
+                Ok(Some(packet)) => packet,
+                Ok(None) => break Ok(()),
                 Err(error) => break Err(error),
             };
 
@@ -165,6 +165,24 @@ pub fn prepare_udp_server(
         tasks.shutdown().await;
         result
     })
+}
+
+async fn receive_until_stopped<T>(
+    receive: impl std::future::Future<Output = std::io::Result<T>>,
+    stop: &mut oneshot::Receiver<()>,
+) -> std::io::Result<Option<T>> {
+    tokio::select! {
+        biased;
+        result = receive => {
+            let packet = result?;
+            // Preserve ready errors, but do not let successful traffic starve shutdown.
+            match stop.try_recv() {
+                Err(oneshot::error::TryRecvError::Empty) => Ok(Some(packet)),
+                _ => Ok(None),
+            }
+        }
+        _ = &mut *stop => Ok(None),
+    }
 }
 
 fn forward_packet(
@@ -330,6 +348,33 @@ async fn run_forward_tasks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shutdown_preserves_ready_receive_errors_but_not_successful_packets() {
+        for fail in [false, true] {
+            let (send_stop, mut stop) = oneshot::channel();
+            send_stop.send(()).unwrap();
+            let received = if fail {
+                Err(std::io::Error::other("receive failed"))
+            } else {
+                Ok(42)
+            };
+            let result = receive_until_stopped(std::future::ready(received), &mut stop).await;
+            if fail {
+                assert_eq!(result.unwrap_err().to_string(), "receive failed");
+            } else {
+                assert_eq!(result.unwrap(), None);
+            }
+        }
+        let (send_stop, mut stop) = oneshot::channel();
+        drop(send_stop);
+        assert_eq!(
+            receive_until_stopped(std::future::pending::<std::io::Result<()>>(), &mut stop)
+                .await
+                .unwrap(),
+            None
+        );
+    }
 
     #[tokio::test(start_paused = true)]
     async fn association_cap_preserves_existing_clients_and_recovers_after_cleanup() {
