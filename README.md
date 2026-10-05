@@ -55,11 +55,16 @@ Download from [GitHub Releases](https://github.com/cfal/tobaru/releases) for:
 
 ### Build from Source
 
-Requires Rust 1.88+ and cargo:
+Requires Rust 1.88+ and Cargo. From a repository checkout of the desired revision:
 
 ```bash
-cargo install tobaru
+CARGO_BUILD_JOBS=1 cargo install --locked --path .
 ```
+
+This preserves the vendored HTTP/2 validation fixes. `cargo install tobaru`
+instead installs the older published crates.io release, not this HTTP/2 revision.
+Registry publishing is intentionally blocked until a released `h2` dependency
+incorporates the fixes; see [dependency provenance](vendor/h2/PROVENANCE.md).
 
 ## Usage
 
