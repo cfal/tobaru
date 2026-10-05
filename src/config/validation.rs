@@ -1,4 +1,41 @@
-use super::{HttpHeaderPatch, HttpPathAction};
+use super::{
+    AlpnValue, HttpHeaderPatch, HttpPathAction, HttpProtocols, NoneOrSome, ServerTlsConfig,
+};
+
+impl HttpProtocols {
+    pub fn resolve(protocols: Self, tls: Option<&mut ServerTlsConfig>) -> std::io::Result<Self> {
+        let Some(tls) = tls else {
+            return Ok(protocols);
+        };
+        if matches!(tls.alpn_protocols, NoneOrSome::Unspecified) {
+            let mut alpn = Vec::new();
+            if protocols.http2 {
+                alpn.push(AlpnValue::Specified("h2".into()));
+            }
+            if protocols.http1 {
+                alpn.push(AlpnValue::Specified("http/1.1".into()));
+                alpn.push(AlpnValue::None);
+            }
+            tls.alpn_protocols = NoneOrSome::Some(alpn);
+        }
+        if tls.alpn_protocols.is_empty() && !protocols.http1 {
+            return Err(std::io::Error::other("HTTP/2-only TLS requires ALPN h2"));
+        }
+        for value in tls.alpn_protocols.iter() {
+            let enabled = match value {
+                AlpnValue::Specified(name) if name == "h2" => protocols.http2,
+                // Custom ALPN and wildcard/no-ALPN fallbacks retain H1 semantics.
+                _ => protocols.http1,
+            };
+            if !enabled {
+                return Err(std::io::Error::other(
+                    "server_tls.alpn_protocols permits a protocol disabled by http_protocols",
+                ));
+            }
+        }
+        Ok(protocols)
+    }
+}
 
 fn header_name(name: &str) -> Result<(), String> {
     if name.is_empty()
@@ -87,6 +124,128 @@ impl HttpPathAction {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn http2_policy_is_explicit_and_bounded() {
+        use super::super::{Http2Config, HttpProtocol, HttpTcpActionConfig};
+        let config: HttpTcpActionConfig =
+            serde_json::from_value(json!({"default_http_action":"close"})).unwrap();
+        assert_eq!(
+            config.http_protocols,
+            HttpProtocols {
+                http1: true,
+                http2: true
+            }
+        );
+        assert_eq!(config.http2.max_concurrent_streams.get(), 64);
+        let HttpPathAction::Forward(config) =
+            serde_json::from_value(json!({"type":"forward", "location":"localhost:80"})).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(config.upstream_protocol, HttpProtocol::Http1);
+        for value in [
+            json!({"prior_knowledge":true}),
+            json!({"max_concurrent_streams":0}),
+            json!({"header_timeout_secs":0}),
+            json!({"typo":1}),
+        ] {
+            assert!(serde_json::from_value::<Http2Config>(value).is_err());
+        }
+        for value in [
+            json!({"max_concurrent_streams":4097}),
+            json!({"max_header_list_size":1048577}),
+            json!({"drain_timeout_secs":86401}),
+        ] {
+            assert!(serde_json::from_value::<Http2Config>(value)
+                .unwrap()
+                .validate()
+                .is_err());
+        }
+        assert!(serde_json::from_value::<HttpPathAction>(
+            json!({"type":"forward", "location":"localhost:80", "upstream_protocol":"http3"})
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn http_protocol_allowlist_is_nonempty_and_unambiguous() {
+        for value in [
+            json!([]),
+            json!(["http1", "http1"]),
+            json!(["http3"]),
+            json!(null),
+            json!("http2"),
+        ] {
+            assert!(serde_json::from_value::<HttpProtocols>(value).is_err());
+        }
+        for (value, http1, http2) in [
+            (json!(["http1"]), true, false),
+            (json!(["http2"]), false, true),
+            (json!(["http1", "http2"]), true, true),
+            (json!(["http2", "http1"]), true, true),
+        ] {
+            let protocols: HttpProtocols = serde_json::from_value(value).unwrap();
+            assert_eq!(protocols, HttpProtocols { http1, http2 });
+            assert_eq!(HttpProtocols::resolve(protocols, None).unwrap(), protocols);
+        }
+    }
+
+    #[test]
+    fn http_tls_derives_alpn_only_when_unspecified() {
+        for (http1, http2, expected) in [
+            (true, true, vec!["h2", "http/1.1", "none"]),
+            (true, false, vec!["http/1.1", "none"]),
+            (false, true, vec!["h2"]),
+        ] {
+            let protocols = HttpProtocols { http1, http2 };
+            let mut tls: ServerTlsConfig = serde_json::from_value(json!({})).unwrap();
+            assert_eq!(
+                HttpProtocols::resolve(protocols, Some(&mut tls)).unwrap(),
+                protocols
+            );
+            let names: Vec<_> = tls
+                .alpn_protocols
+                .iter()
+                .map(|value| match value {
+                    AlpnValue::Specified(name) => name.as_str(),
+                    AlpnValue::None => "none",
+                    AlpnValue::Any => "any",
+                })
+                .collect();
+            assert_eq!(names, expected);
+        }
+        for alpn in [
+            json!([]),
+            json!(null),
+            json!(["legacy-http", "none"]),
+            json!(["any", "none"]),
+            json!(["http/1.1"]),
+        ] {
+            let mut tls: ServerTlsConfig =
+                serde_json::from_value(json!({"alpn_protocols":alpn})).unwrap();
+            let before = tls.alpn_protocols.clone().into_vec();
+            HttpProtocols::resolve(HttpProtocols::default(), Some(&mut tls)).unwrap();
+            assert_eq!(tls.alpn_protocols.into_vec(), before);
+        }
+    }
+
+    #[test]
+    fn http_tls_rejects_alpn_for_disabled_protocols() {
+        for (protocols, alpn) in [
+            (json!(["http1"]), json!(["h2"])),
+            (json!(["http2"]), json!(["h2", "http/1.1"])),
+            (json!(["http2"]), json!(["h2", "none"])),
+            (json!(["http2"]), json!(["h2", "any"])),
+            (json!(["http2"]), json!(["legacy-http"])),
+            (json!(["http2"]), json!([])),
+            (json!(["http2"]), json!(null)),
+        ] {
+            let protocols = serde_json::from_value(protocols).unwrap();
+            let mut tls = serde_json::from_value(json!({"alpn_protocols":alpn})).unwrap();
+            assert!(HttpProtocols::resolve(protocols, Some(&mut tls)).is_err());
+        }
+    }
 
     #[test]
     fn configured_http_metadata_cannot_inject_wire_lines() {

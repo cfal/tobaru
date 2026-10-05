@@ -8,6 +8,8 @@ fn session<'a>(
     timeouts: HttpTimeouts,
 ) -> Session<'a> {
     Session {
+        h2: super::h2::Context::testing(),
+        tls: false,
         stream: Box::new(stream),
         reader: Some(line_reader::LineReader::new()),
         cached_target: None,

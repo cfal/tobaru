@@ -1,16 +1,25 @@
-use super::header_map::Headers;
 use super::http_parser;
 use crate::config::HttpValueMatch;
 use crate::hostname_util::{matches_host_header, strip_host_port, validate_host_header};
 use crate::tcp::{TargetHttpActionData, TargetHttpPathData};
 use radix_trie::{Trie, TrieCommon};
-use std::collections::HashMap;
 
 pub(super) fn find_matching_action<'a>(
     path_configs: &'a Trie<String, Vec<TargetHttpPathData>>,
     default_action: &'a TargetHttpActionData,
     request_path: &str,
     request_data: &http_parser::ParsedHttpData,
+) -> std::io::Result<(&'a str, &'a TargetHttpActionData)> {
+    find_matching_headers(path_configs, default_action, request_path, |key| {
+        Ok(request_data.headers().get(key).map(String::as_str))
+    })
+}
+
+pub(super) fn find_matching_headers<'a, 'h>(
+    path_configs: &'a Trie<String, Vec<TargetHttpPathData>>,
+    default_action: &'a TargetHttpActionData,
+    request_path: &str,
+    header: impl Fn(&str) -> std::io::Result<Option<&'h str>>,
 ) -> std::io::Result<(&'a str, &'a TargetHttpActionData)> {
     let mut lookup_path;
     let lookup = if request_path.ends_with('/') {
@@ -25,10 +34,14 @@ pub(super) fn find_matching_action<'a>(
 
     if let Some(t) = matching_configs {
         for path_config in t.value().unwrap().iter() {
-            if !has_required_headers(
-                request_data.headers(),
-                &path_config.required_request_headers,
-            )? {
+            let mut matched = true;
+            for (key, rule) in &path_config.required_request_headers {
+                if !matches_http_value(rule, header(key)?)? {
+                    matched = false;
+                    break;
+                }
+            }
+            if !matched {
                 continue;
             }
             return Ok((t.key().unwrap(), &path_config.http_action));
@@ -36,19 +49,6 @@ pub(super) fn find_matching_action<'a>(
     }
 
     Ok(("/", default_action))
-}
-
-fn has_required_headers(
-    headers: &Headers,
-    required: &HashMap<String, HttpValueMatch>,
-) -> std::io::Result<bool> {
-    for (key, rule) in required.iter() {
-        let header_value = headers.get(key).map(String::as_str);
-        if !matches_http_value(rule, header_value)? {
-            return Ok(false);
-        }
-    }
-    Ok(true)
 }
 
 /// Checks whether a header value matches an `HttpValueMatch` rule.

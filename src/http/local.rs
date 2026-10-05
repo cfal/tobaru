@@ -200,7 +200,7 @@ async fn write_chunk<W: AsyncWrite + Unpin>(stream: &mut W, bytes: &[u8]) -> io:
     write_all(stream, b"\r\n").await
 }
 
-fn static_file_path(root: &str, target: &str, base_path: &str) -> io::Result<PathBuf> {
+pub(super) fn static_file_path(root: &str, target: &str, base_path: &str) -> io::Result<PathBuf> {
     let target_path = target.split_once('?').map_or(target, |(path, _)| path);
     let relative = string_util::update_base_path(target_path, base_path, "/");
     let decoded = percent_encoding::percent_decode_str(&relative)
@@ -219,7 +219,7 @@ fn static_file_path(root: &str, target: &str, base_path: &str) -> io::Result<Pat
     Ok(Path::new(root).join(decoded.trim_start_matches('/')))
 }
 
-async fn resolve_file(root: &str, requested: &Path) -> io::Result<PathBuf> {
+pub(super) async fn resolve_file(root: &str, requested: &Path) -> io::Result<PathBuf> {
     let root = tokio::fs::canonicalize(root).await?;
     let mut path = tokio::fs::canonicalize(requested).await?;
     if !path.starts_with(&root) {

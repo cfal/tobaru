@@ -55,11 +55,16 @@ Download from [GitHub Releases](https://github.com/cfal/tobaru/releases) for:
 
 ### Build from Source
 
-Requires Rust 1.88+ and cargo:
+Requires Rust 1.88+ and Cargo. From a repository checkout of the desired revision:
 
 ```bash
-cargo install tobaru
+CARGO_BUILD_JOBS=1 cargo install --locked --path .
 ```
+
+This preserves the vendored HTTP/2 validation fixes. `cargo install tobaru`
+instead installs the older published crates.io release, not this HTTP/2 revision.
+Registry publishing is intentionally blocked until a released `h2` dependency
+incorporates the fixes; see [dependency provenance](vendor/h2/PROVENANCE.md).
 
 ## Usage
 
@@ -179,6 +184,125 @@ Decrypt TLS and route based on content:
       addresses:
         - default-backend:8080
 ```
+
+### HTTP/2
+
+HTTP ingress and backend protocol selection are independent. HTTP targets accept
+both HTTP/1 and HTTP/2 by default (`http_protocols: [http1, http2]`). Plaintext
+connections select H2 on the first four bytes `PRI `, otherwise H1. TLS uses
+negotiated ALPN instead of sniffing. When the TLS ALPN setting is omitted, HTTP
+targets derive `[h2, http/1.1, none]`, allowing both protocols and no-ALPN H1 clients:
+
+```yaml
+- address: 0.0.0.0:8443
+  transport: tcp
+  target:
+    allowlist: 0.0.0.0/0
+    server_tls:
+      cert: server.crt
+      key: server.key
+    default_http_action:
+      type: forward
+      upstream_protocol: http2
+      location:
+        address: backend.example:443
+        client_tls: true
+```
+
+Explicit TLS ALPN settings remain authoritative and must agree with
+`http_protocols`. Other negotiated ALPN values retain the legacy HTTP/1 dispatch
+behavior when H1 is enabled; use standard HTTP ALPN names for new deployments.
+Set `http_protocols: [http1]` or `[http2]` to restrict ingress to one protocol.
+H2-only TLS derives `[h2]` and requires negotiation; TLS without ALPN never sniffs.
+
+`upstream_protocol` is `http1` (default) or `http2`, per forward action. HTTP/2 TLS
+backends advertise and require exactly `h2`; omit the client's ALPN setting or set
+it to `[h2]`. Existing certificate verification, pins, client certificates and SNI
+settings still apply. There is no fallback or automatic request replay.
+
+The old `http2.prior_knowledge` option is replaced by `http_protocols: [http2]`.
+Mixed plaintext listeners buffer at most four new bytes for detection, replay
+them unchanged, and let the selected handler validate the rest. Invalid H2
+prefaces close the connection without fallback. The reserved `PRI` method is not
+available as an H1 extension on mixed plaintext listeners; longer methods such
+as `PRINT` remain H1. Detection has an absolute timeout, default 10 seconds, so
+partial prefixes cannot hold a connection indefinitely. `Upgrade: h2c` remains
+unsupported. A cleartext HTTP/2 backend uses prior knowledge over TCP or a Unix
+socket, selected by `upstream_protocol: http2` without `client_tls`.
+
+Enabling H2 also validates local response configuration for H2 compatibility.
+Targets relying on H1-only local statuses or connection-specific headers must
+explicitly select `[http1]`.
+
+All three new forwarding paths (H2 to H1, H1 to H2, H2 to H2) stream bodies,
+informational responses and trailers. H2 to H2 supports bidirectional streaming.
+Repeated fields remain separate; binary field values are supported except through
+the existing text-based H1 ingress parser. Cross-version forwarding rejects
+ambiguous lengths, unsupported transfer codings, framing-changing header patches,
+and conflicting Host/authority. H1 output uses chunking when trailers might follow.
+Host patches change outgoing authority, not backend TLS identity. The logical
+request scheme is preserved independently of the backend transport.
+
+H2 backend connections are reused within one frontend connection and forward
+action, never globally or across actions. Round-robin advances on each physical
+backend connection, not each request. H2-to-H1 exchanges use dedicated H1 backend
+connections. GOAWAY retires an H2 backend; a request racing retirement may fail
+without being replayed. Local responses end one stream; the `close` action still
+closes the entire frontend connection, including siblings.
+
+HTTP/2 receive validation uses a [locally patched h2 dependency](vendor/h2/PROVENANCE.md).
+This branch supports source installs and release binaries; registry packaging is
+blocked until a published dependency incorporates the fixes, so Cargo cannot
+silently replace the patched code.
+Malformed or oversized trailer sections and raw request-target fragments are
+rejected before the library can discard their validation metadata. Failed H1
+uploads never receive a synthesized terminal chunk and their backend sockets
+are not reused.
+
+Run `cargo test --locked` for the complete regression suite. The
+`http::h2::tests::wire` corpus sends raw H2/HPACK adversarial inputs; the
+`http::h2::tests::forwarding` matrix covers H1-to-H2 uploads, pipelining, Expect,
+malformed framing and early closure, forwarded bodyless responses across all four
+protocol combinations, and H2 backend failure/backpressure with sibling reuse.
+Run `node tests/http2_smoke.mjs target/release/tobaru` against a built binary for
+independent Node HTTP/1 and HTTP/2 parsing, including uploads in both translation
+directions. These run in CI (the smoke uses the debug binary). Rerun them on
+dependency upgrades; regression coverage is not a substitute for fuzzing or a
+security audit.
+
+Optional `http2` settings and defaults:
+
+| Setting | Default | Scope |
+| --- | --- | --- |
+| `max_concurrent_streams` | 64 | Each ingress H2 connection |
+| `max_connections` | 256 | Ingress H2 connections per target/generation, after TLS |
+| `max_backend_connections` | 256 | Separate target-wide limits on new-path transports and active exchanges |
+| `max_header_list_size` | 65536 | Decoded header/trailer bytes |
+| `header_timeout_secs` | 10 | Plaintext detection and incomplete frame/header-block deadlines |
+| `connect_timeout_secs` | 10 | Backend setup and ingress H2 handshake |
+| `body_progress_timeout_secs` | 30 | Exchange inactivity, shared by upload and response |
+| `drain_timeout_secs` | 5 | H2 connection drain after reload or idle expiry |
+
+Limits must be positive; streams are capped at 4096, connection limits at 65536,
+header limits at 1024 through 1048576 bytes, and H2 timeouts at 86400 seconds.
+Each frontend retains at most 16 live H2 backend connections, including draining
+ones. Other fixed bounds include 128 fields per section, 16 informational responses,
+64 KiB stream/1 MiB connection receive windows and 16 KiB forwarding chunks.
+Excess work fails rather than accumulating an unbounded admission queue.
+
+On new paths, default response-header timeout is 30 seconds after upload completion;
+waiting for Expect's 100/final response is also bounded by 30 seconds. Explicit
+`http_timeouts.response_header_timeout_secs` instead starts with response processing
+and stays absolute across informational responses, as on the H1 path. Explicit
+request-header and idle timeouts override H2 defaults. Idle means no live streams,
+with a 60-second default. Partial-frame timeouts close the connection, not just a
+stream. Listener reload sends GOAWAY and bounds each H2 owner's drain; established
+H1/raw sessions retain their existing reload behavior.
+
+CONNECT, extended CONNECT/WebSocket, server push and H3 are not implemented on these
+new paths. Existing H1-to-H1 Upgrade handling is unchanged; H1 Upgrade requests
+directed to H2-only backends are rejected. Local H2 actions require a final status
+(at least 200); custom H1 reason phrases do not appear on the H2 wire.
 
 ### Mixed TLS Modes on Same Port
 
@@ -501,6 +625,7 @@ Supports both **YAML** and **JSON** formats. Config is an array of objects, wher
   - `client_fingerprints`: Array of SHA256 fingerprints for client certificate pinning
 
 **Optional HTTP:**
+- `http_protocols`: Ingress allowlist, default `[http1, http2]`; one protocol disables plaintext detection
 - `http_paths`: Map of path prefixes to HTTP actions
   - Each path can have one or more configs with `required_request_headers` and `http_action`
   - `required_request_headers`: Map of header names to expected values (keys are case-insensitive)

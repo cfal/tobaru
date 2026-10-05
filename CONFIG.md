@@ -296,8 +296,17 @@ alpn_protocols: none               # Match only when no ALPN
 
 `any` controls matching, not protocol negotiation. Termination advertises only
 explicit protocol names; `any` without explicit names negotiates no ALPN.
-Passthrough leaves negotiation to the backend. HTTP actions only support
-HTTP/1.1; do not advertise `h2` for them.
+Passthrough leaves negotiation to the backend. HTTP actions dispatch negotiated
+`h2` to HTTP/2 and otherwise retain the HTTP/1 session, including legacy custom
+ALPN names. Use `[h2, http/1.1, none]` to accept both standard protocols and clients
+without ALPN. `any` does not by itself negotiate HTTP/2.
+
+For terminating HTTP targets, omitted ALPN is derived from `http_protocols`:
+`[h2, http/1.1, none]` by default, `[http/1.1, none]` for H1-only, or `[h2]` for
+H2-only. Explicit ALPN lists are preserved and rejected if they permit a disabled
+HTTP protocol. Custom names, `any`, and `none` require H1 enabled. Explicit empty
+lists or `null` retain the generic no-ALPN behavior and also require H1 enabled.
+Raw forwarding and TLS passthrough do not derive HTTP ALPN settings.
 
 ### Client Certificate Authentication
 
@@ -421,8 +430,10 @@ target:
 
 ### HTTP Timeouts
 
-Timeouts belong to the HTTP target and apply to all of its routes. All are
-disabled when omitted or `null`; configured values must be positive seconds.
+Timeouts belong to the HTTP target and apply to all of its routes. On the existing
+H1-to-H1 session they are disabled when omitted or `null`; configured values must
+be positive seconds. Mixed plaintext protocol detection and HTTP/2 paths use
+finite defaults described below.
 
 ```yaml
 target:
@@ -448,6 +459,121 @@ target:
 
 Expiration closes the affected HTTP session. These are not body-transfer or
 whole-session deadlines; upgraded tunnels are not subject to them.
+
+### HTTP/2 Policy and Limits
+
+`http_protocols` is an ingress allowlist, default `[http1, http2]`. It must be a
+nonempty list without duplicates; select `[http1]` or `[http2]` to disable the
+other protocol. The old `http2.prior_knowledge` option is no longer accepted;
+replace `prior_knowledge: true` with target-level `http_protocols: [http2]`.
+
+With both protocols enabled, plaintext connections are detected incrementally:
+`PRI ` selects H2; the first mismatch selects H1. All consumed bytes, including
+any read-ahead from optional TLS detection, are replayed unchanged. The H2 library
+validates the remaining preface. Invalid prefaces never fall back to H1. This
+reserves `PRI` as an H2-only method on mixed plaintext listeners, while longer H1
+methods such as `PRINT` still work. Detection runs only once per connection, not
+for each keepalive request. Single-protocol listeners skip detection entirely.
+
+Detection uses one absolute deadline from entry into HTTP dispatch, including
+waiting for the first byte: `http_timeouts.request_header_timeout_secs` when set,
+otherwise `http2.header_timeout_secs` (10 seconds). Byte progress does not extend
+it. After selection, the existing handler's header/handshake deadlines apply.
+
+TLS never sniffs HTTP bytes. Negotiated `h2` selects H2; `http/1.1`, custom ALPN
+names, and no ALPN select H1, provided that protocol is enabled. Omitted TLS ALPN
+is derived as described above; explicit ALPN is authoritative. H2-only TLS
+requires `h2` negotiation. Generic TLS target matching still precedes HTTP
+dispatch. Raw streams and TLS passthrough are unaffected. Upgrade-based h2c is
+not supported.
+
+A forward action independently selects `upstream_protocol: http1 | http2`
+(default `http1`). H2 egress uses prior knowledge over clear TCP/Unix sockets or
+requires negotiated `h2` over TLS. Omit client ALPN to derive `[h2]`, or configure
+exactly `[h2]`; incompatible explicit lists are rejected. No automatic fallback.
+
+```yaml
+target:
+  allowlist: 127.0.0.1/32
+  http_protocols: [http1, http2]
+  http2:
+    max_concurrent_streams: 64
+    max_connections: 256
+    max_backend_connections: 256
+    max_header_list_size: 65536
+    header_timeout_secs: 10
+    connect_timeout_secs: 10
+    body_progress_timeout_secs: 30
+    drain_timeout_secs: 5
+  default_http_action:
+    type: forward
+    upstream_protocol: http2
+    location:
+      address: backend.example:443
+      client_tls: true
+```
+
+Protocol policy and limit values shown are defaults. Enabling H2 validates local
+response statuses and headers for H2 compatibility, even when an explicit ALPN
+list restricts TLS to H1. Use `[http1]` for H1-only local response configurations.
+`max_concurrent_streams` is per ingress H2 connection (maximum 4096).
+`max_connections` bounds admitted H2 connections per compiled target/generation,
+after TLS negotiation. `max_backend_connections` initializes two separate
+target-global limits: active new-path exchanges and live new-path backend
+transports, including dialing, idle and draining connections. Both connection
+limits are capped at 65536. Each frontend additionally retains at most 16 H2
+backend drivers across all actions. Admission refuses excess work rather than
+creating an unbounded queue. H1-to-H1 connections retain their existing policy.
+
+Header limits are 1024 through 1048576 decoded bytes, with a fixed 128-field cap.
+Receive windows are 64 KiB per stream and 1 MiB per connection; forwarding chunks
+are at most 16 KiB. Up to 16 informational responses are forwarded. Encoded
+field-section bytes and pre-consumption response-section counts are also bounded.
+Trailer fields are validated independently of initial headers and header patches.
+Pseudoheaders and oversized trailer sections are rejected before conversion to
+ordinary fields, for both ingress requests and upstream H2 responses, using the
+[vendored h2 fixes](vendor/h2/PROVENANCE.md). Literal `#` fragments are rejected
+before URI normalization on both H2 ingress and H1-to-H2 forwarding, so the backend
+cannot receive a different path from the one used for routing. Encoded `%23`
+remains permitted. These checks require no additional configuration flags.
+
+All H2 timeouts must be positive and at most 86400 seconds. The connect deadline
+includes action-slot waiting, DNS/TCP/Unix setup, TLS and H2 handshake/readiness.
+The header deadline is absolute for incomplete frames/header blocks, not extended
+by trickling bytes; expiry closes the connection. Existing explicit request-header
+timeout overrides the ingress frame/header default. Generic pre-ALPN TLS handshake
+policy remains controlled by `server_tls.handshake_timeout_secs`.
+
+Default response-header deadline is 30 seconds after upload completion, plus a
+30-second wait for Expect's 100/final response. Explicit response-header timeout
+instead remains absolute from response processing, including concurrent upload
+and informational responses. Body inactivity is shared across upload and response;
+meaningful progress in either direction keeps a duplex exchange alive. Frontend
+idle means no active streams, default 60 seconds, overridden by explicit keepalive
+idle timeout. Reload/idle retirement sends GOAWAY and bounds each owner's drain;
+top-level reload does not synchronously join established TCP sessions.
+
+H2 preserves the logical request scheme and authority independently of backend
+TLS/SNI. Host patches update outgoing authority. Repeated headers, DATA and trailers
+are preserved; H1 ingress retains its existing UTF-8 restriction. Cross-version
+translation rejects unsupported transfer-coding chains and framing-changing
+patches, and uses H1 chunking when trailers may follow. H2-to-H1 backend leases are
+exclusive and not cached. H2 backend reuse is frontend/action-scoped, without
+cross-action coalescing or automatic retries; round-robin advances per physical
+connection, not per stream.
+
+H2-to-H1 requests use one canonical Host, `Connection: close`, no incoming
+Content-Length or TE field, and chunked framing whenever the upload is open.
+DATA bytes cannot supply their own chunk boundaries. Failed uploads are not
+completed with a synthesized terminal chunk, and their backend sockets are never
+reused. If an early response is already in progress, upload failure half-closes
+the backend write side so an EOF-dependent response can finish.
+
+CONNECT, extended CONNECT/WebSocket, H3 and push are not supported on H2 paths.
+H1 upgrades directed to an H2-only action receive 501. Local H2 responses must be
+final statuses; HEAD/204/205/304 do not transmit payload. Custom reason phrases
+are H1-only. `close` intentionally closes the entire H2 connection and its siblings;
+ordinary local responses end only their stream.
 
 ### Path Matching
 
@@ -525,11 +651,13 @@ When possible, prefer SNI-level routing (`sni_hostnames`) over Host header match
 
 ### forward
 
-Forwards the HTTP request to one or more backend servers. Supports connection keep-alive, WebSocket upgrades, and header manipulation.
+Forwards the HTTP request to one or more backend servers. Supports connection
+reuse and header manipulation; WebSocket upgrades remain H1-to-H1 only.
 
 ```yaml
 http_action:
   type: forward
+  upstream_protocol: http1        # http1 (default) or http2
   locations: [string | object]     # Backend address(es) -- round-robin if multiple
   replacement_path: string         # Rewrite the request path
   request_header_patch:            # Modify request headers
@@ -566,9 +694,11 @@ must agree, including the case-sensitive protocol version when present.
 Forwarding supports HEAD/bodyless responses, informational responses including
 100 Continue and 103 Early Hints, and close-delimited response bodies. An early
 final response during an unfinished upload is forwarded and both connections are
-closed rather than reused. HTTP mode still accepts only origin-form HTTP/1.1
-requests; it does not implement CONNECT or HTTP/2. For HTTP actions, configure TLS
-ALPN as `http/1.1`, not `h2`.
+closed rather than reused on the existing H1-to-H1 path. New H2 paths continue
+upload alongside successful response DATA for duplex streaming. H1 backend error
+responses stop upload through write-side shutdown while the response drains.
+See [HTTP/2 Policy and Limits](#http2-policy-and-limits) for protocol selection,
+cancellation, and unsupported features. CONNECT remains unsupported.
 
 ### serve-message
 

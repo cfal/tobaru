@@ -1,10 +1,14 @@
 mod body;
+mod bridge;
 mod chunk_transfer;
+pub(crate) mod detect;
+pub(crate) mod h2;
 mod header_map;
 mod header_tuple;
 mod http_parser;
 mod line_reader;
 mod local;
+mod message;
 mod proxy;
 mod routing;
 mod string_util;
@@ -38,6 +42,8 @@ struct CachedTarget<'a> {
 }
 
 struct Session<'a> {
+    h2: h2::Context,
+    tls: bool,
     stream: Box<dyn AsyncStream>,
     reader: Option<line_reader::LineReader>,
     cached_target: Option<CachedTarget<'a>>,
@@ -170,6 +176,7 @@ impl<'a> Session<'a> {
     }
 }
 
+#[cfg(test)]
 pub async fn handle_http_stream(
     tcp_nodelay: bool,
     tcp_keepalive: Option<TcpKeepaliveConfig>,
@@ -178,7 +185,30 @@ pub async fn handle_http_stream(
     addr: &std::net::SocketAddr,
     initial_data: Option<Vec<u8>>,
 ) -> std::io::Result<()> {
+    handle_http_stream_with_tls(
+        tcp_nodelay,
+        tcp_keepalive,
+        http,
+        stream,
+        addr,
+        initial_data,
+        false,
+    )
+    .await
+}
+
+pub async fn handle_http_stream_with_tls(
+    tcp_nodelay: bool,
+    tcp_keepalive: Option<TcpKeepaliveConfig>,
+    http: &HttpTargetData,
+    stream: Box<dyn AsyncStream>,
+    addr: &std::net::SocketAddr,
+    initial_data: Option<Vec<u8>>,
+    tls: bool,
+) -> std::io::Result<()> {
     let mut session = Session {
+        h2: h2::Context::new(*addr, tcp_nodelay, tcp_keepalive, http),
+        tls,
         stream,
         reader: Some(initial_data.map_or_else(
             line_reader::LineReader::new,
@@ -232,5 +262,6 @@ pub async fn handle_http_stream(
     session.stream.flush().await?;
     let _ = session.stream.try_shutdown().await;
     session.close_target().await;
+    session.h2.clients.shutdown().await;
     Ok(())
 }

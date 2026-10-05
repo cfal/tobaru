@@ -33,6 +33,10 @@ notify = "~8.2.0"
 radix_trie = { version = "~0.3.0", features = ["serde"] }
 rand = "~0.10.3"
 memchr = "~2.8.3"
+# No registry version: packaging must not silently discard receive-validation fixes.
+h2 = { path = "vendor/h2" }
+http = "~1.4.0"
+bytes = "~1.12.1"
 mime_guess = "~2.0.5"
 socket2 = "~0.6.5"
 

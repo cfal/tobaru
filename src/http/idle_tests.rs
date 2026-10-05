@@ -11,6 +11,8 @@ fn session<'a>(
         12345,
     ));
     Session {
+        h2: super::h2::Context::testing(),
+        tls: false,
         stream: Box::new(frontend),
         reader: Some(line_reader::LineReader::new()),
         cached_target: Some(CachedTarget {
