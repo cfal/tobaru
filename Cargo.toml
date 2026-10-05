@@ -39,6 +39,9 @@ bytes = "~1.12.1"
 mime_guess = "~2.0.5"
 socket2 = "~0.6.5"
 
+[patch.crates-io]
+h2 = { path = "vendor/h2" }
+
 [dev-dependencies]
 rcgen = { version = "~0.14.10", default-features = false, features = ["aws_lc_rs", "pem"] }
 tokio = { version = "~1.53.2", features = ["test-util"] }
