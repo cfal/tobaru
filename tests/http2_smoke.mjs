@@ -1,0 +1,276 @@
+import assert from 'node:assert/strict';
+import http from 'node:http';
+import https from 'node:https';
+import http2 from 'node:http2';
+import net from 'node:net';
+import { X509Certificate } from 'node:crypto';
+import { once } from 'node:events';
+import { spawn, spawnSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, symlinkSync, rmSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { setTimeout as delay } from 'node:timers/promises';
+
+const root = dirname(dirname(fileURLToPath(import.meta.url)));
+const binary = resolve(process.argv[2] ?? join(root, 'target/release/tobaru'));
+mkdirSync(join(homedir(), 'tmp'), { recursive: true });
+const directory = mkdtempSync(join(homedir(), 'tmp/tobaru-h2-smoke-'));
+const signal = AbortSignal.timeout(30_000);
+const sockets = new Set();
+const sessions = new Set();
+const servers = [];
+let child;
+let childClosed;
+let logs = '';
+let backendConnections = 0;
+let uploads = 0;
+let pushDisabled = false;
+let peerFailure;
+function guard(callback) {
+  return (...args) => {
+    try { callback(...args); }
+    catch (error) {
+      peerFailure ??= error;
+      for (const session of sessions) session.destroy(error);
+    }
+  };
+}
+signal.addEventListener('abort', () => {
+  for (const session of sessions) session.destroy(new Error('Smoke test deadline'));
+}, { once: true });
+
+async function listen(server, path) {
+  servers.push(server);
+  server.on('connection', socket => {
+    sockets.add(socket);
+    socket.on('close', () => sockets.delete(socket));
+  });
+  if (path) server.listen(path);
+  else server.listen(0, '0.0.0.0');
+  await once(server, 'listening', { signal });
+  return server.address().port;
+}
+
+async function port() {
+  const server = net.createServer();
+  const value = await listen(server);
+  await new Promise(resolve => server.close(resolve));
+  return value;
+}
+
+function track(session) {
+  sessions.add(session);
+  session.on('error', () => {});
+  session.on('close', () => sessions.delete(session));
+  return session;
+}
+
+function get(session, path = '/', method = 'GET') {
+  return new Promise((resolve, reject) => {
+    const request = session.request({ ':path': path, ':method': method });
+    let headers;
+    let trailers;
+    const chunks = [];
+    request.on('response', value => { headers = value; });
+    request.on('trailers', value => { trailers = value; });
+    request.on('data', value => chunks.push(value));
+    request.on('error', reject);
+    request.on('close', () => { if (!request.readableEnded) reject(new Error('Stream closed before response end')); });
+    request.on('end', () => resolve({ headers, trailers, body: Buffer.concat(chunks).toString() }));
+    request.end();
+  });
+}
+
+function h1Get(port, options = {}) {
+  return new Promise((resolve, reject) => {
+    const request = https.get({
+      hostname: '127.0.0.1', port, path: '/', servername: 'localhost',
+      ALPNProtocols: ['http/1.1'], rejectUnauthorized: false, agent: false, signal, ...options,
+    }, response => {
+      const chunks = [];
+      response.on('data', chunk => chunks.push(chunk));
+      response.on('end', () => resolve({ response, body: Buffer.concat(chunks).toString() }));
+      response.on('error', reject);
+    });
+    request.on('error', reject);
+  });
+}
+
+async function duplex(session) {
+  const request = session.request({ ':method': 'POST', ':path': '/duplex', expect: '100-continue' }, { waitForTrailers: true });
+  const information = [];
+  const chunks = [];
+  let started = false;
+  let ended = false;
+  request.on('headers', headers => {
+    information.push(headers[':status']);
+    if (headers[':status'] === 100) { started = true; request.write('first'); }
+  });
+  request.on('data', guard(chunk => {
+    chunks.push(chunk);
+    if (!ended) {
+      assert.equal(started, true);
+      ended = true;
+      request.end('last');
+    }
+  }));
+  request.on('wantTrailers', () => request.sendTrailers({ 'x-upload': 'complete' }));
+  let trailers;
+  request.on('trailers', value => { trailers = value; });
+  await once(request, 'end', { signal });
+  assert.deepEqual(information, [100, 103]);
+  assert.equal(Buffer.concat(chunks).toString(), 'firstlast');
+  assert.equal(trailers['x-finished'], 'yes');
+  assert.equal(uploads, 1);
+}
+
+try {
+  const keyPath = join(directory, 'key.pem');
+  const certPath = join(directory, 'cert.pem');
+  const generated = spawnSync('openssl', ['req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:P-256',
+    '-nodes', '-keyout', keyPath, '-out', certPath, '-days', '1', '-subj', '/CN=localhost',
+    '-addext', 'subjectAltName=DNS:localhost'], { encoding: 'utf8' });
+  assert.equal(generated.status, 0, generated.stderr);
+  const cert = readFileSync(certPath);
+  const key = readFileSync(keyPath);
+  const fingerprint = new X509Certificate(cert).fingerprint256.replaceAll(':', '');
+  const backend = http2.createSecureServer({ key, cert, ca: cert, requestCert: true, rejectUnauthorized: true });
+  backend.on('session', session => {
+    backendConnections++;
+    track(session);
+    session.on('remoteSettings', settings => { pushDisabled = settings.enablePush === false; });
+  });
+  backend.on('stream', guard((stream, headers) => {
+    stream.on('error', () => {});
+    assert.equal(stream.session.socket.authorized, true);
+    assert.equal(stream.session.socket.servername, 'localhost');
+    if (headers[':path'] === '/duplex') {
+      stream.additionalHeaders({ ':status': 100 });
+      stream.additionalHeaders({ ':status': 103, link: '</asset>' });
+      stream.respond({ ':status': 200 }, { waitForTrailers: true });
+      stream.on('data', data => stream.write(data));
+      stream.on('trailers', guard(trailers => { assert.equal(trailers['x-upload'], 'complete'); uploads++; }));
+      stream.on('end', () => stream.end());
+      stream.on('wantTrailers', () => stream.sendTrailers({ 'x-finished': 'yes' }));
+    } else {
+      stream.respond({ ':status': 200, 'set-cookie': ['a=1', 'b=2'] });
+      stream.end('h2 backend');
+    }
+  }));
+  const backendPort = await listen(backend);
+  const h1Backend = http.createServer((request, response) => {
+    response.writeEarlyHints({ link: '</asset>' });
+    response.writeHead(200, { 'Set-Cookie': ['one=1', 'two=2'], Trailer: 'x-finished' });
+    response.write('h1 backend');
+    response.addTrailers({ 'x-finished': 'yes' });
+    response.end();
+  });
+  const h1Port = await listen(h1Backend);
+  const wrongAlpn = https.createServer({ key, cert, ALPNProtocols: ['http/1.1'] });
+  let wrongAlpnBytes = 0;
+  wrongAlpn.on('secureConnection', socket => socket.on('data', data => { wrongAlpnBytes += data.length; }));
+  const wrongPort = await listen(wrongAlpn);
+  const unixPath = join(directory, 'backend.sock');
+  const unixBackend = http2.createServer();
+  unixBackend.on('session', track);
+  unixBackend.on('stream', stream => { stream.respond({ ':status': 200 }); stream.end('unix h2'); });
+  await listen(unixBackend, unixPath);
+  const tlsPort = await port();
+  const clearPort = await port();
+  const authPort = await port();
+  const publicRoot = join(directory, 'public');
+  mkdirSync(join(publicRoot, 'escape'), { recursive: true });
+  writeFileSync(join(publicRoot, 'index.html'), 'public');
+  writeFileSync(join(directory, 'private.txt'), 'private');
+  symlinkSync(join(directory, 'private.txt'), join(publicRoot, 'escape/index.html'));
+  const tls = { verify: false, sni_hostname: 'localhost', server_fingerprint: fingerprint, cert: certPath, key: keyPath };
+  const forward = { type: 'forward', upstream_protocol: 'http2', location: { address: `127.0.0.1:${backendPort}`, client_tls: tls } };
+  const configPath = join(directory, 'config.json');
+  writeFileSync(configPath, JSON.stringify([
+    { address: `0.0.0.0:${tlsPort}`, transport: 'tcp', target: {
+      allowlist: '127.0.0.1/32',
+      server_tls: { cert: certPath, key: keyPath, alpn_protocols: ['h2', 'http/1.1', 'legacy-http', 'none'] },
+      http2: { prior_knowledge: true },
+      default_http_action: forward,
+      http_paths: {
+        '/static/': { http_action: { type: 'serve-directory', path: publicRoot } },
+        '/h1/': { http_action: { type: 'forward', location: `127.0.0.1:${h1Port}` } },
+        '/unix/': { http_action: { type: 'forward', upstream_protocol: 'http2', location: unixPath } },
+        '/bad-pin/': { http_action: { ...forward, location: { address: `127.0.0.1:${backendPort}`, client_tls: { ...tls, server_fingerprint: '00'.repeat(32) } } } },
+        '/untrusted/': { http_action: { ...forward, location: { address: `127.0.0.1:${backendPort}`, client_tls: { ...tls, verify: true } } } },
+        '/bad-alpn/': { http_action: { ...forward, location: { address: `127.0.0.1:${wrongPort}`, client_tls: { ...tls } } } },
+      },
+    } },
+    { address: `0.0.0.0:${clearPort}`, transport: 'tcp', target: {
+      allowlist: '127.0.0.1/32', http2: { prior_knowledge: true },
+      default_http_action: { type: 'serve-message', status_code: 200, content: 'clear h2' },
+    } },
+    { address: `0.0.0.0:${authPort}`, transport: 'tcp', target: {
+      allowlist: '127.0.0.1/32',
+      server_tls: { cert: certPath, key: keyPath, alpn_protocols: ['h2'], client_fingerprints: [fingerprint] },
+      default_http_action: { type: 'serve-message', status_code: 200, content: 'authenticated' },
+    } },
+  ]));
+  child = spawn(binary, ['-t', '1', configPath]);
+  childClosed = new Promise(resolve => child.once('close', resolve));
+  child.on('error', error => { throw error; });
+  const capture = bytes => { logs = (logs + bytes).slice(-65536); };
+  child.stdout.on('data', capture);
+  child.stderr.on('data', capture);
+  while ((logs.match(/Listening \(TCP\)/g) ?? []).length < 3) {
+    assert.equal(child.exitCode, null, logs);
+    await delay(25, undefined, { signal });
+  }
+  const client = track(http2.connect(`https://127.0.0.1:${tlsPort}`, { rejectUnauthorized: false, servername: 'localhost' }));
+  await once(client, 'connect', { signal });
+  assert.equal(client.alpnProtocol, 'h2');
+  for (let i = 0; i < 2; i++) {
+    const result = await get(client);
+    assert.equal(result.body, 'h2 backend');
+    assert.deepEqual(result.headers['set-cookie'], ['a=1', 'b=2']);
+  }
+  assert.equal(backendConnections, 1);
+  assert.equal(pushDisabled, true);
+  await duplex(client);
+  const h1 = await get(client, '/h1/');
+  assert.equal(h1.body, 'h1 backend');
+  assert.equal(h1.trailers['x-finished'], 'yes');
+  assert.equal((await get(client, '/unix/')).body, 'unix h2');
+  assert.equal((await get(client, '/static/')).body, 'public');
+  const fileHead = await get(client, '/static/', 'HEAD');
+  assert.equal(fileHead.headers['content-length'], '6');
+  assert.equal(fileHead.body, '');
+  assert.equal((await get(client, '/static/missing')).headers[':status'], 404);
+  const escaped = await get(client, '/static/escape/');
+  assert.equal(escaped.headers[':status'], 502);
+  assert.equal(escaped.body, '');
+  for (const path of ['/bad-pin/', '/untrusted/', '/bad-alpn/']) {
+    assert.equal((await get(client, path)).headers[':status'], 502, path);
+  }
+  assert.equal(wrongAlpnBytes, 0);
+  const fallback = await h1Get(tlsPort);
+  assert.equal(fallback.body, 'h2 backend');
+  assert.equal(fallback.response.socket?.alpnProtocol ?? 'http/1.1', 'http/1.1');
+  assert.equal((await h1Get(tlsPort, { ALPNProtocols: [] })).body, 'h2 backend');
+  assert.equal((await h1Get(tlsPort, { ALPNProtocols: ['legacy-http'] })).body, 'h2 backend');
+  const clear = track(http2.connect(`http://127.0.0.1:${clearPort}`));
+  assert.equal((await get(clear)).body, 'clear h2');
+  const authenticated = track(http2.connect(`https://127.0.0.1:${authPort}`, { rejectUnauthorized: false, servername: 'localhost', cert, key }));
+  assert.equal((await get(authenticated)).body, 'authenticated');
+  const anonymous = track(http2.connect(`https://127.0.0.1:${authPort}`, { rejectUnauthorized: false, servername: 'localhost' }));
+  await assert.rejects(get(anonymous));
+  assert.doesNotMatch(logs, /panicked/);
+  if (peerFailure) throw peerFailure;
+  console.log('HTTP/2 smoke passed: TLS/ALPN, H1 fallback, H2/H1/H2 translation, duplex, 1xx, trailers, reuse, Unix, pins, verification, mTLS, prior knowledge.');
+} catch (error) {
+  console.error(logs);
+  throw error;
+} finally {
+  for (const session of sessions) session.destroy();
+  for (const socket of sockets) socket.destroy();
+  if (child && child.exitCode === null && child.signalCode === null) child.kill('SIGTERM');
+  if (childClosed) await childClosed;
+  await Promise.all(servers.filter(server => server.listening).map(server => new Promise(resolve => server.close(resolve))));
+  rmSync(directory, { recursive: true, force: true });
+}

@@ -1,4 +1,4 @@
-# HTTP Smoke Test
+# HTTP Smoke Tests
 
 The Rust suite includes deterministic protocol tests and local TCP, Unix, and
 TLS session tests:
@@ -14,6 +14,7 @@ required; no npm packages are needed.
 ```sh
 CARGO_BUILD_JOBS=1 cargo build --release --locked
 node tests/http_smoke.mjs target/release/tobaru
+node tests/http2_smoke.mjs target/release/tobaru
 ```
 
 Omitting the argument selects `target/release/tobaru` relative to the repository.
@@ -25,3 +26,11 @@ checks that invalid reloads retain the last-good configuration and repeated
 atomic file replacements remain observable.
 Listener-failure checks cover occupied ports and TCP accept failure under a
 child-local file-descriptor limit; both must exit nonzero without panicking.
+
+The HTTP/2 test additionally requires `openssl` for ephemeral certificates. Its
+independent Node HTTP/2 peers cover TLS ALPN and no-ALPN H1 fallback, H2-to-H1 and
+H1-to-H2 translation, H2-to-H2 duplex progress, withheld Expect uploads, 100/103,
+repeated cookies, request/response trailers, backend reuse, Unix prior knowledge,
+outbound pins and CA verification failures, inbound and outbound mTLS, and rejection
+of a backend that cannot negotiate H2. It does not measure Internet-scale throughput
+or claim exhaustive RFC conformance.
