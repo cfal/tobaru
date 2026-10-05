@@ -28,7 +28,10 @@ Listener-failure checks cover occupied ports and TCP accept failure under a
 child-local file-descriptor limit; both must exit nonzero without panicking.
 
 The HTTP/2 test additionally requires `openssl` for ephemeral certificates. Its
-independent Node HTTP/2 peers cover TLS ALPN and no-ALPN H1 fallback, H2-to-H1 and
+independent Node HTTP/2 peers cover default plaintext H1/H2 detection, protocol
+allowlists, derived and explicit TLS ALPN (including empty/null lists), competing
+TLS targets selected by source IP/SNI/ALPN, optional-TLS read-ahead replay,
+no-ALPN H1 fallback, rejection of invalid prefaces without fallback, H2-to-H1 and
 H1-to-H2 translation, H2-to-H2 duplex progress, withheld Expect uploads, 100/103,
 repeated cookies, request/response trailers, backend reuse, Unix prior knowledge,
 outbound pins and CA verification failures, inbound and outbound mTLS, and rejection

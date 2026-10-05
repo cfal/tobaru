@@ -299,7 +299,14 @@ explicit protocol names; `any` without explicit names negotiates no ALPN.
 Passthrough leaves negotiation to the backend. HTTP actions dispatch negotiated
 `h2` to HTTP/2 and otherwise retain the HTTP/1 session, including legacy custom
 ALPN names. Use `[h2, http/1.1, none]` to accept both standard protocols and clients
-without ALPN. `any` does not by itself enable HTTP/2.
+without ALPN. `any` does not by itself negotiate HTTP/2.
+
+For terminating HTTP targets, omitted ALPN is derived from `http_protocols`:
+`[h2, http/1.1, none]` by default, `[http/1.1, none]` for H1-only, or `[h2]` for
+H2-only. Explicit ALPN lists are preserved and rejected if they permit a disabled
+HTTP protocol. Custom names, `any`, and `none` require H1 enabled. Explicit empty
+lists or `null` retain the generic no-ALPN behavior and also require H1 enabled.
+Raw forwarding and TLS passthrough do not derive HTTP ALPN settings.
 
 ### Client Certificate Authentication
 
@@ -424,8 +431,9 @@ target:
 ### HTTP Timeouts
 
 Timeouts belong to the HTTP target and apply to all of its routes. On the existing
-H1-to-H1 path they are disabled when omitted or `null`; configured values must be
-positive seconds. New HTTP/2 paths use finite defaults described below.
+H1-to-H1 session they are disabled when omitted or `null`; configured values must
+be positive seconds. Mixed plaintext protocol detection and HTTP/2 paths use
+finite defaults described below.
 
 ```yaml
 target:
@@ -454,10 +462,32 @@ whole-session deadlines; upgraded tunnels are not subject to them.
 
 ### HTTP/2 Policy and Limits
 
-Ingress uses negotiated `h2` under terminating TLS. Plaintext listeners require
-`http2.prior_knowledge: true` and then accept only prior-knowledge H2, not HTTP/1
-or Upgrade-based h2c. TLS without ALPN remains HTTP/1 even when prior knowledge is
-enabled. A forward action independently selects `upstream_protocol: http1 | http2`
+`http_protocols` is an ingress allowlist, default `[http1, http2]`. It must be a
+nonempty list without duplicates; select `[http1]` or `[http2]` to disable the
+other protocol. The old `http2.prior_knowledge` option is no longer accepted;
+replace `prior_knowledge: true` with target-level `http_protocols: [http2]`.
+
+With both protocols enabled, plaintext connections are detected incrementally:
+`PRI ` selects H2; the first mismatch selects H1. All consumed bytes, including
+any read-ahead from optional TLS detection, are replayed unchanged. The H2 library
+validates the remaining preface. Invalid prefaces never fall back to H1. This
+reserves `PRI` as an H2-only method on mixed plaintext listeners, while longer H1
+methods such as `PRINT` still work. Detection runs only once per connection, not
+for each keepalive request. Single-protocol listeners skip detection entirely.
+
+Detection uses one absolute deadline from entry into HTTP dispatch, including
+waiting for the first byte: `http_timeouts.request_header_timeout_secs` when set,
+otherwise `http2.header_timeout_secs` (10 seconds). Byte progress does not extend
+it. After selection, the existing handler's header/handshake deadlines apply.
+
+TLS never sniffs HTTP bytes. Negotiated `h2` selects H2; `http/1.1`, custom ALPN
+names, and no ALPN select H1, provided that protocol is enabled. Omitted TLS ALPN
+is derived as described above; explicit ALPN is authoritative. H2-only TLS
+requires `h2` negotiation. Generic TLS target matching still precedes HTTP
+dispatch. Raw streams and TLS passthrough are unaffected. Upgrade-based h2c is
+not supported.
+
+A forward action independently selects `upstream_protocol: http1 | http2`
 (default `http1`). H2 egress uses prior knowledge over clear TCP/Unix sockets or
 requires negotiated `h2` over TLS. Omit client ALPN to derive `[h2]`, or configure
 exactly `[h2]`; incompatible explicit lists are rejected. No automatic fallback.
@@ -465,8 +495,8 @@ exactly `[h2]`; incompatible explicit lists are rejected. No automatic fallback.
 ```yaml
 target:
   allowlist: 127.0.0.1/32
+  http_protocols: [http1, http2]
   http2:
-    prior_knowledge: true
     max_concurrent_streams: 64
     max_connections: 256
     max_backend_connections: 256
@@ -483,7 +513,9 @@ target:
       client_tls: true
 ```
 
-Values shown are defaults except `prior_knowledge`, which defaults to `false`.
+Protocol policy and limit values shown are defaults. Enabling H2 validates local
+response statuses and headers for H2 compatibility, even when an explicit ALPN
+list restricts TLS to H1. Use `[http1]` for H1-only local response configurations.
 `max_concurrent_streams` is per ingress H2 connection (maximum 4096).
 `max_connections` bounds admitted H2 connections per compiled target/generation,
 after TLS negotiation. `max_backend_connections` initializes two separate

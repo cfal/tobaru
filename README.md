@@ -182,9 +182,11 @@ Decrypt TLS and route based on content:
 
 ### HTTP/2
 
-HTTP ingress and backend protocol selection are independent. Existing configurations
-remain HTTP/1. Enable TLS HTTP/2 ingress with `h2` in the terminating target's ALPN
-list; `http/1.1` permits HTTP/1 clients and `none` permits clients without ALPN:
+HTTP ingress and backend protocol selection are independent. HTTP targets accept
+both HTTP/1 and HTTP/2 by default (`http_protocols: [http1, http2]`). Plaintext
+connections select H2 on the first four bytes `PRI `, otherwise H1. TLS uses
+negotiated ALPN instead of sniffing. When the TLS ALPN setting is omitted, HTTP
+targets derive `[h2, http/1.1, none]`, allowing both protocols and no-ALPN H1 clients:
 
 ```yaml
 - address: 0.0.0.0:8443
@@ -194,7 +196,6 @@ list; `http/1.1` permits HTTP/1 clients and `none` permits clients without ALPN:
     server_tls:
       cert: server.crt
       key: server.key
-      alpn_protocols: [h2, http/1.1, none]
     default_http_action:
       type: forward
       upstream_protocol: http2
@@ -203,18 +204,30 @@ list; `http/1.1` permits HTTP/1 clients and `none` permits clients without ALPN:
         client_tls: true
 ```
 
-Other negotiated ALPN values retain the legacy HTTP/1 dispatch behavior; use
-standard HTTP ALPN names for new deployments.
+Explicit TLS ALPN settings remain authoritative and must agree with
+`http_protocols`. Other negotiated ALPN values retain the legacy HTTP/1 dispatch
+behavior when H1 is enabled; use standard HTTP ALPN names for new deployments.
+Set `http_protocols: [http1]` or `[http2]` to restrict ingress to one protocol.
+H2-only TLS derives `[h2]` and requires negotiation; TLS without ALPN never sniffs.
 
 `upstream_protocol` is `http1` (default) or `http2`, per forward action. HTTP/2 TLS
 backends advertise and require exactly `h2`; omit the client's ALPN setting or set
 it to `[h2]`. Existing certificate verification, pins, client certificates and SNI
 settings still apply. There is no fallback or automatic request replay.
 
-For a cleartext HTTP/2-only listener, set `http2: { prior_knowledge: true }` on its
-HTTP target. This does not detect HTTP/1, implement `Upgrade: h2c`, or change TLS
-without ALPN into HTTP/2. A cleartext HTTP/2 backend uses prior knowledge over TCP
-or a Unix socket, selected by `upstream_protocol: http2` without `client_tls`.
+The old `http2.prior_knowledge` option is replaced by `http_protocols: [http2]`.
+Mixed plaintext listeners buffer at most four new bytes for detection, replay
+them unchanged, and let the selected handler validate the rest. Invalid H2
+prefaces close the connection without fallback. The reserved `PRI` method is not
+available as an H1 extension on mixed plaintext listeners; longer methods such
+as `PRINT` remain H1. Detection has an absolute timeout, default 10 seconds, so
+partial prefixes cannot hold a connection indefinitely. `Upgrade: h2c` remains
+unsupported. A cleartext HTTP/2 backend uses prior knowledge over TCP or a Unix
+socket, selected by `upstream_protocol: http2` without `client_tls`.
+
+Enabling H2 also validates local response configuration for H2 compatibility.
+Targets relying on H1-only local statuses or connection-specific headers must
+explicitly select `[http1]`.
 
 All three new forwarding paths (H2 to H1, H1 to H2, H2 to H2) stream bodies,
 informational responses and trailers. H2 to H2 supports bidirectional streaming.
@@ -240,7 +253,7 @@ Optional `http2` settings and defaults:
 | `max_connections` | 256 | Ingress H2 connections per target/generation, after TLS |
 | `max_backend_connections` | 256 | Separate target-wide limits on new-path transports and active exchanges |
 | `max_header_list_size` | 65536 | Decoded header/trailer bytes |
-| `header_timeout_secs` | 10 | Absolute incomplete frame/header-block deadline |
+| `header_timeout_secs` | 10 | Plaintext detection and incomplete frame/header-block deadlines |
 | `connect_timeout_secs` | 10 | Backend setup and ingress H2 handshake |
 | `body_progress_timeout_secs` | 30 | Exchange inactivity, shared by upload and response |
 | `drain_timeout_secs` | 5 | H2 connection drain after reload or idle expiry |
@@ -587,6 +600,7 @@ Supports both **YAML** and **JSON** formats. Config is an array of objects, wher
   - `client_fingerprints`: Array of SHA256 fingerprints for client certificate pinning
 
 **Optional HTTP:**
+- `http_protocols`: Ingress allowlist, default `[http1, http2]`; one protocol disables plaintext detection
 - `http_paths`: Map of path prefixes to HTTP actions
   - Each path can have one or more configs with `required_request_headers` and `http_action`
   - `required_request_headers`: Map of header names to expected values (keys are case-insensitive)

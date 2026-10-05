@@ -77,7 +77,10 @@ function get(session, path = '/', method = 'GET') {
     request.on('data', value => chunks.push(value));
     request.on('error', reject);
     request.on('close', () => { if (!request.readableEnded) reject(new Error('Stream closed before response end')); });
-    request.on('end', () => resolve({ headers, trailers, body: Buffer.concat(chunks).toString() }));
+    request.on('end', () => {
+      if (!headers) reject(new Error('Stream ended without response headers'));
+      else resolve({ headers, trailers, body: Buffer.concat(chunks).toString() });
+    });
     request.end();
   });
 }
@@ -89,11 +92,25 @@ function h1Get(port, options = {}) {
       ALPNProtocols: ['http/1.1'], rejectUnauthorized: false, agent: false, signal, ...options,
     }, response => {
       const chunks = [];
+      const alpn = response.socket.alpnProtocol;
       response.on('data', chunk => chunks.push(chunk));
-      response.on('end', () => resolve({ response, body: Buffer.concat(chunks).toString() }));
+      response.on('end', () => resolve({ response, alpn, body: Buffer.concat(chunks).toString() }));
       response.on('error', reject);
     });
     request.on('error', reject);
+  });
+}
+
+function clearH1Get(port, method = 'GET') {
+  return new Promise((resolve, reject) => {
+    const request = http.request({ hostname: '127.0.0.1', port, method, path: '/', agent: false, signal }, response => {
+      const chunks = [];
+      response.on('data', chunk => chunks.push(chunk));
+      response.on('end', () => resolve(Buffer.concat(chunks).toString()));
+      response.on('error', reject);
+    });
+    request.on('error', reject);
+    request.end();
   });
 }
 
@@ -179,6 +196,10 @@ try {
   const tlsPort = await port();
   const clearPort = await port();
   const authPort = await port();
+  const autoPort = await port();
+  const h1OnlyPort = await port();
+  const h2OnlyPort = await port();
+  const selectionPort = await port();
   const publicRoot = join(directory, 'public');
   mkdirSync(join(publicRoot, 'escape'), { recursive: true });
   writeFileSync(join(publicRoot, 'index.html'), 'public');
@@ -191,7 +212,6 @@ try {
     { address: `0.0.0.0:${tlsPort}`, transport: 'tcp', target: {
       allowlist: '127.0.0.1/32',
       server_tls: { cert: certPath, key: keyPath, alpn_protocols: ['h2', 'http/1.1', 'legacy-http', 'none'] },
-      http2: { prior_knowledge: true },
       default_http_action: forward,
       http_paths: {
         '/static/': { http_action: { type: 'serve-directory', path: publicRoot } },
@@ -203,7 +223,7 @@ try {
       },
     } },
     { address: `0.0.0.0:${clearPort}`, transport: 'tcp', target: {
-      allowlist: '127.0.0.1/32', http2: { prior_knowledge: true },
+      allowlist: '127.0.0.1/32',
       default_http_action: { type: 'serve-message', status_code: 200, content: 'clear h2' },
     } },
     { address: `0.0.0.0:${authPort}`, transport: 'tcp', target: {
@@ -211,6 +231,26 @@ try {
       server_tls: { cert: certPath, key: keyPath, alpn_protocols: ['h2'], client_fingerprints: [fingerprint] },
       default_http_action: { type: 'serve-message', status_code: 200, content: 'authenticated' },
     } },
+    ...[
+      [autoPort, undefined, 'automatic'],
+      [h1OnlyPort, ['http1'], 'h1 only'],
+      [h2OnlyPort, ['http2'], 'h2 only'],
+    ].map(([port, protocols, content]) => ({ address: `0.0.0.0:${port}`, transport: 'tcp', target: {
+      allowlist: '127.0.0.1/32', http_protocols: protocols,
+      server_tls: { cert: certPath, key: keyPath, optional: true },
+      default_http_action: { type: 'serve-message', status_code: 200, content },
+    } })),
+    { address: `0.0.0.0:${selectionPort}`, transport: 'tcp', targets: [
+      ['192.0.2.1/32', 'localhost', undefined, 'wrong source'],
+      ['127.0.0.1/32', 'localhost', ['http/1.1', 'none'], 'selected h1'],
+      ['127.0.0.1/32', 'localhost', undefined, 'selected h2'],
+      ['127.0.0.1/32', 'empty.localhost', [], 'empty alpn'],
+      ['127.0.0.1/32', 'null.localhost', null, 'null alpn'],
+    ].map(([allowlist, name, alpn, content]) => ({
+      allowlist,
+      server_tls: { cert: certPath, key: keyPath, sni_hostnames: [name], alpn_protocols: alpn },
+      default_http_action: { type: 'serve-message', status_code: 200, content },
+    })) },
   ]));
   child = spawn(binary, ['-t', '1', configPath]);
   childClosed = new Promise(resolve => child.once('close', resolve));
@@ -218,7 +258,7 @@ try {
   const capture = bytes => { logs = (logs + bytes).slice(-65536); };
   child.stdout.on('data', capture);
   child.stderr.on('data', capture);
-  while ((logs.match(/Listening \(TCP\)/g) ?? []).length < 3) {
+  while ((logs.match(/Listening \(TCP\)/g) ?? []).length < 7) {
     assert.equal(child.exitCode, null, logs);
     await delay(25, undefined, { signal });
   }
@@ -256,13 +296,51 @@ try {
   assert.equal((await h1Get(tlsPort, { ALPNProtocols: ['legacy-http'] })).body, 'h2 backend');
   const clear = track(http2.connect(`http://127.0.0.1:${clearPort}`));
   assert.equal((await get(clear)).body, 'clear h2');
+  for (const method of ['GET', 'POST', 'PUT', 'PATCH', 'PRINT']) {
+    assert.equal(await clearH1Get(clearPort, method), 'clear h2');
+  }
+  // The same listener accepts TLS and plaintext; ClientHello read-ahead must replay intact.
+  for (const scheme of ['http', 'https']) {
+    const automatic = track(http2.connect(`${scheme}://127.0.0.1:${autoPort}`, { rejectUnauthorized: false, servername: 'localhost' }));
+    assert.equal((await get(automatic)).body, 'automatic');
+    if (scheme === 'https') assert.equal(automatic.alpnProtocol, 'h2');
+    const strict = track(http2.connect(`${scheme}://127.0.0.1:${h2OnlyPort}`, { rejectUnauthorized: false, servername: 'localhost' }));
+    assert.equal((await get(strict)).body, 'h2 only');
+    const denied = track(http2.connect(`${scheme}://127.0.0.1:${h1OnlyPort}`, { rejectUnauthorized: false, servername: 'localhost' }));
+    await assert.rejects(get(denied));
+  }
+  assert.equal(await clearH1Get(autoPort), 'automatic');
+  assert.equal((await h1Get(autoPort)).body, 'automatic');
+  assert.equal((await h1Get(autoPort, { ALPNProtocols: [] })).body, 'automatic');
+  // Negotiated H1 and absent ALPN must not sniff, even for an H1 extension named PRI.
+  assert.equal((await h1Get(autoPort, { method: 'PRI' })).body, 'automatic');
+  assert.equal((await h1Get(autoPort, { method: 'PRI', ALPNProtocols: [] })).body, 'automatic');
+  await assert.rejects(clearH1Get(autoPort, 'PRI'));
+  assert.equal(await clearH1Get(h1OnlyPort), 'h1 only');
+  assert.equal((await h1Get(h1OnlyPort)).body, 'h1 only');
+  assert.equal((await h1Get(h1OnlyPort, { ALPNProtocols: [] })).body, 'h1 only');
+  await assert.rejects(clearH1Get(h2OnlyPort));
+  await assert.rejects(h1Get(h2OnlyPort));
+  await assert.rejects(h1Get(h2OnlyPort, { ALPNProtocols: [] }));
+  const selected = track(http2.connect(`https://127.0.0.1:${selectionPort}`, { rejectUnauthorized: false, servername: 'localhost' }));
+  assert.equal((await get(selected)).body, 'selected h2');
+  assert.equal((await h1Get(selectionPort)).body, 'selected h1');
+  assert.equal((await h1Get(selectionPort, { ALPNProtocols: [] })).body, 'selected h1');
+  await assert.rejects(h1Get(selectionPort, { servername: 'unknown.localhost' }));
+  for (const name of ['empty', 'null']) {
+    for (const offered of [[], ['h2', 'http/1.1']]) {
+      const result = await h1Get(selectionPort, { servername: `${name}.localhost`, ALPNProtocols: offered });
+      assert.equal(result.body, `${name} alpn`);
+      assert.equal(result.alpn, false);
+    }
+  }
   const authenticated = track(http2.connect(`https://127.0.0.1:${authPort}`, { rejectUnauthorized: false, servername: 'localhost', cert, key }));
   assert.equal((await get(authenticated)).body, 'authenticated');
   const anonymous = track(http2.connect(`https://127.0.0.1:${authPort}`, { rejectUnauthorized: false, servername: 'localhost' }));
   await assert.rejects(get(anonymous));
   assert.doesNotMatch(logs, /panicked/);
   if (peerFailure) throw peerFailure;
-  console.log('HTTP/2 smoke passed: TLS/ALPN, H1 fallback, H2/H1/H2 translation, duplex, 1xx, trailers, reuse, Unix, pins, verification, mTLS, prior knowledge.');
+  console.log('HTTP/2 smoke passed: plaintext detection, protocol allowlists, derived TLS ALPN, optional TLS replay, H1 fallback, H2/H1/H2 translation, duplex, 1xx, trailers, reuse, Unix, pins, verification, mTLS.');
 } catch (error) {
   console.error(logs);
   throw error;
