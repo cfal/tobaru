@@ -530,6 +530,11 @@ Receive windows are 64 KiB per stream and 1 MiB per connection; forwarding chunk
 are at most 16 KiB. Up to 16 informational responses are forwarded. Encoded
 field-section bytes and pre-consumption response-section counts are also bounded.
 Trailer fields are validated independently of initial headers and header patches.
+Pseudoheaders and oversized trailer sections are rejected before conversion to
+ordinary fields, for both ingress requests and upstream H2 responses. Literal
+`#` fragments in H2 request paths are rejected before URI normalization; encoded
+`%23` remains permitted. These checks rely on the
+[vendored h2 fixes](vendor/h2/PROVENANCE.md), not additional configuration flags.
 
 All H2 timeouts must be positive and at most 86400 seconds. The connect deadline
 includes action-slot waiting, DNS/TCP/Unix setup, TLS and H2 handshake/readiness.
@@ -555,6 +560,13 @@ patches, and uses H1 chunking when trailers may follow. H2-to-H1 backend leases 
 exclusive and not cached. H2 backend reuse is frontend/action-scoped, without
 cross-action coalescing or automatic retries; round-robin advances per physical
 connection, not per stream.
+
+H2-to-H1 requests use one canonical Host, `Connection: close`, no incoming
+Content-Length or TE field, and chunked framing whenever the upload is open.
+DATA bytes cannot supply their own chunk boundaries. Failed uploads are not
+completed with a synthesized terminal chunk, and their backend sockets are never
+reused. If an early response is already in progress, upload failure half-closes
+the backend write side so an EOF-dependent response can finish.
 
 CONNECT, extended CONNECT/WebSocket, H3 and push are not supported on H2 paths.
 H1 upgrades directed to an H2-only action receive 501. Local H2 responses must be
