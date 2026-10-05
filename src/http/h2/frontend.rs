@@ -18,6 +18,10 @@ impl Session<'_> {
             return Ok(Outcome::Close);
         }
         let close = request.data.headers().connection_close();
+        // http::Uri drops fragments; never change the target after routing.
+        if request.path.contains('#') {
+            return Err(message::invalid("Fragment in request target"));
+        }
         let mut headers = http::HeaderMap::new();
         for (name, value) in request.data.headers().fields() {
             headers.append(

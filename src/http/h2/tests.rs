@@ -9,6 +9,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixStream};
 use tokio::task::JoinHandle;
 
+mod forwarding;
 mod wire;
 
 struct Task<T>(JoinHandle<T>);
@@ -149,6 +150,9 @@ where
                                 },
                                 Some(result) = requests.join_next(), if !requests.is_empty() => result.unwrap(),
                             }
+                        }
+                        while let Some(result) = requests.join_next().await {
+                            result.unwrap();
                         }
                     });
                 }
