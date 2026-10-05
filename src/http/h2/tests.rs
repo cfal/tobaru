@@ -637,9 +637,7 @@ async fn backend_push_is_disabled_and_violations_fail_the_exchange() {
                 let mut payload = vec![0; size];
                 io.read_exact(&mut payload).await.unwrap();
                 if frame[3] == 4 && frame[4] == 0 {
-                    disabled = payload
-                        .chunks_exact(6)
-                        .any(|setting| setting == [0, 2, 0, 0, 0, 0]);
+                    disabled = payload.as_chunks::<6>().0.contains(&[0, 2, 0, 0, 0, 0]);
                     io.write_all(&[0, 0, 0, 4, 1, 0, 0, 0, 0]).await.unwrap();
                 }
                 if frame[3] == 1 {
