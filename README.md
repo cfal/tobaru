@@ -245,6 +245,21 @@ connections. GOAWAY retires an H2 backend; a request racing retirement may fail
 without being replayed. Local responses end one stream; the `close` action still
 closes the entire frontend connection, including siblings.
 
+HTTP/2 receive validation uses a [locally patched h2 dependency](vendor/h2/PROVENANCE.md).
+This branch supports source installs and release binaries; registry packaging is
+blocked until a published dependency incorporates the fixes, so Cargo cannot
+silently replace the patched code.
+Malformed or oversized trailer sections and raw request-target fragments are
+rejected before the library can discard their validation metadata. Failed H1
+uploads never receive a synthesized terminal chunk and their backend sockets
+are not reused.
+
+Run `cargo test --locked http::h2::tests::wire` for the raw H2/HPACK adversarial
+corpus, then `node tests/http2_smoke.mjs target/release/tobaru` against a built
+binary for independent Node HTTP/1 and HTTP/2 interoperability checks. Both run
+in CI (the smoke uses the debug binary). Rerun them on dependency upgrades;
+regression coverage is not a substitute for fuzzing or a security audit.
+
 Optional `http2` settings and defaults:
 
 | Setting | Default | Scope |

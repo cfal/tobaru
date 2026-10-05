@@ -142,6 +142,20 @@ async function duplex(session) {
   assert.equal(uploads, 1);
 }
 
+async function h1Upload(session, payload) {
+  const request = session.request({
+    ':method': 'POST', ':path': '/h1/upload', 'content-length': String(payload.length),
+    te: 'trailers', cookie: ['a=1', 'b=2'],
+  }, { waitForTrailers: true });
+  let status;
+  request.on('response', headers => { status = headers[':status']; });
+  request.on('wantTrailers', () => request.sendTrailers({ 'x-upload': 'complete' }));
+  request.resume();
+  request.end(payload);
+  await once(request, 'end', { signal });
+  assert.equal(status, 200);
+}
+
 try {
   const keyPath = join(directory, 'key.pem');
   const certPath = join(directory, 'cert.pem');
@@ -176,13 +190,35 @@ try {
     }
   }));
   const backendPort = await listen(backend);
-  const h1Backend = http.createServer((request, response) => {
+  const parsedH1 = [];
+  const h1Backend = http.createServer(guard((request, response) => {
+    const entry = { path: request.url, socket: request.socket };
+    parsedH1.push(entry);
+    if (request.url === '/h1/upload') {
+      assert.equal(request.headers['content-length'], undefined);
+      assert.equal(request.headers.te, undefined);
+      assert.equal(request.headers['transfer-encoding'], 'chunked');
+      assert.equal(request.headers.connection, 'close');
+      assert.equal(request.headers.cookie, 'a=1; b=2');
+      const names = request.rawHeaders.filter((_, index) => index % 2 === 0).map(name => name.toLowerCase());
+      assert.equal(names.filter(name => name === 'host').length, 1);
+      assert.equal(names.filter(name => name === 'transfer-encoding').length, 1);
+      const data = [];
+      request.on('data', bytes => data.push(bytes));
+      request.on('end', guard(() => {
+        assert.equal(request.complete, true);
+        assert.equal(request.trailers['x-upload'], 'complete');
+        entry.body = Buffer.concat(data);
+        response.end('accepted');
+      }));
+      return;
+    }
     response.writeEarlyHints({ link: '</asset>' });
     response.writeHead(200, { 'Set-Cookie': ['one=1', 'two=2'], Trailer: 'x-finished' });
     response.write('h1 backend');
     response.addTrailers({ 'x-finished': 'yes' });
     response.end();
-  });
+  }));
   const h1Port = await listen(h1Backend);
   const wrongAlpn = https.createServer({ key, cert, ALPNProtocols: ['http/1.1'] });
   let wrongAlpnBytes = 0;
@@ -276,6 +312,16 @@ try {
   const h1 = await get(client, '/h1/');
   assert.equal(h1.body, 'h1 backend');
   assert.equal(h1.trailers['x-finished'], 'yes');
+  const beforeUploads = parsedH1.length;
+  const injection = Buffer.from('0\r\n\r\nGET /smuggled HTTP/1.1\r\nHost: other.test\r\n\r\n\x00\xff', 'latin1');
+  await h1Upload(client, injection);
+  await h1Upload(client, Buffer.from('second'));
+  const parsedUploads = parsedH1.slice(beforeUploads);
+  assert.equal(parsedUploads.length, 2);
+  assert.deepEqual(parsedUploads.map(request => request.path), ['/h1/upload', '/h1/upload']);
+  assert.deepEqual(parsedUploads[0].body, injection);
+  assert.deepEqual(parsedUploads[1].body, Buffer.from('second'));
+  assert.notEqual(parsedUploads[0].socket, parsedUploads[1].socket);
   assert.equal((await get(client, '/unix/')).body, 'unix h2');
   assert.equal((await get(client, '/static/')).body, 'public');
   const fileHead = await get(client, '/static/', 'HEAD');
@@ -340,7 +386,7 @@ try {
   await assert.rejects(get(anonymous));
   assert.doesNotMatch(logs, /panicked/);
   if (peerFailure) throw peerFailure;
-  console.log('HTTP/2 smoke passed: plaintext detection, protocol allowlists, derived TLS ALPN, optional TLS replay, H1 fallback, H2/H1/H2 translation, duplex, 1xx, trailers, reuse, Unix, pins, verification, mTLS.');
+  console.log('HTTP/2 smoke passed: plaintext detection, protocol allowlists, derived TLS ALPN, optional TLS replay, H1 fallback, H2/H1/H2 translation, independent H1 upload parsing and isolation, duplex, 1xx, trailers, reuse, Unix, pins, verification, mTLS.');
 } catch (error) {
   console.error(logs);
   throw error;

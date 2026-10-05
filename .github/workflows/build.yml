@@ -59,6 +59,10 @@ jobs:
         if: matrix.toolchain == 'stable'
         run: node tests/http_smoke.mjs target/debug/tobaru
 
+      - name: Run HTTP/2 interoperability and framing smoke
+        if: matrix.toolchain == 'stable'
+        run: node tests/http2_smoke.mjs target/debug/tobaru
+
   build:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
