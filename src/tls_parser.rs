@@ -37,8 +37,8 @@ pub async fn parse_client_hello(
     reader: &mut TlsReader,
     stream: &mut TcpStream,
 ) -> std::io::Result<ParsedClientHello> {
-    // Read TLS record header (5 bytes)
-    reader.ensure_bytes(stream, TLS_HEADER_LEN).await?;
+    // Reject plaintext before waiting for the rest of the TLS record header.
+    reader.ensure_bytes(stream, 1).await?;
 
     let content_type = reader.read_u8()?;
     if content_type != CONTENT_TYPE_HANDSHAKE {
@@ -48,6 +48,7 @@ pub async fn parse_client_hello(
         ));
     }
 
+    reader.ensure_bytes(stream, TLS_HEADER_LEN - 1).await?;
     let legacy_version_major = reader.read_u8()?;
     let legacy_version_minor = reader.read_u8()?;
 

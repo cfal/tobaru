@@ -386,6 +386,8 @@ pub struct RawTcpActionConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct HttpTcpActionConfig {
     #[serde(default)]
+    pub http_protocols: HttpProtocols,
+    #[serde(default)]
     pub http2: Box<Http2Config>,
     #[serde(default)]
     pub http_timeouts: HttpTimeouts,
@@ -410,10 +412,50 @@ pub enum HttpProtocol {
     Http2,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "Vec<HttpProtocol>")]
+pub struct HttpProtocols {
+    pub http1: bool,
+    pub http2: bool,
+}
+
+impl Default for HttpProtocols {
+    fn default() -> Self {
+        Self {
+            http1: true,
+            http2: true,
+        }
+    }
+}
+
+impl TryFrom<Vec<HttpProtocol>> for HttpProtocols {
+    type Error = &'static str;
+
+    fn try_from(protocols: Vec<HttpProtocol>) -> Result<Self, Self::Error> {
+        if protocols.is_empty() {
+            return Err("http_protocols must enable at least one protocol");
+        }
+        let mut result = Self {
+            http1: false,
+            http2: false,
+        };
+        for protocol in protocols {
+            let enabled = match protocol {
+                HttpProtocol::Http1 => &mut result.http1,
+                HttpProtocol::Http2 => &mut result.http2,
+            };
+            if *enabled {
+                return Err("http_protocols must not contain duplicates");
+            }
+            *enabled = true;
+        }
+        Ok(result)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Http2Config {
-    pub prior_knowledge: bool,
     pub max_concurrent_streams: std::num::NonZeroU32,
     pub max_connections: std::num::NonZeroUsize,
     pub max_backend_connections: std::num::NonZeroUsize,
@@ -427,7 +469,6 @@ pub struct Http2Config {
 impl Default for Http2Config {
     fn default() -> Self {
         Self {
-            prior_knowledge: false,
             max_concurrent_streams: std::num::NonZeroU32::new(64).unwrap(),
             max_connections: std::num::NonZeroUsize::new(256).unwrap(),
             max_backend_connections: std::num::NonZeroUsize::new(256).unwrap(),

@@ -33,6 +33,10 @@ fn runtime(
     reload: Option<watch::Receiver<()>>,
 ) -> HttpTargetData {
     HttpTargetData {
+        http_protocols: crate::config::HttpProtocols {
+            http1: true,
+            http2: true,
+        },
         path_configs: radix_trie::Trie::new(),
         default_http_action: action,
         http_timeouts: HttpTimeouts::default(),

@@ -1,6 +1,7 @@
 mod body;
 mod bridge;
 mod chunk_transfer;
+pub(crate) mod detect;
 pub(crate) mod h2;
 mod header_map;
 mod header_tuple;

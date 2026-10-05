@@ -63,6 +63,7 @@ fn session(
     let (client, proxy) = UnixStream::pair().unwrap();
     let task = tokio::spawn(async move {
         let http = crate::tcp::HttpTargetData {
+            http_protocols: crate::config::HttpProtocols::default(),
             http2: crate::config::Http2Config::default(),
             h2_admission: crate::http::h2::Admission::new(
                 crate::config::Http2Config::default(),
@@ -1352,7 +1353,7 @@ async fn transport_matrix_preserves_tls_pins_mtls_sni_and_alpn() {
                         let stream: Box<dyn AsyncStream> = if frontend_tls {
                             Box::new(acceptor_frontend.accept(server).await.unwrap())
                         } else { Box::new(server) };
-                        let http = crate::tcp::HttpTargetData { h2_admission: crate::http::h2::Admission::new(crate::config::Http2Config::default(), None), http2: crate::config::Http2Config::default(), path_configs: Trie::new(), default_http_action: default, http_timeouts: crate::config::HttpTimeouts::default() };
+                        let http = crate::tcp::HttpTargetData { http_protocols: crate::config::HttpProtocols::default(), h2_admission: crate::http::h2::Admission::new(crate::config::Http2Config::default(), None), http2: crate::config::Http2Config::default(), path_configs: Trie::new(), default_http_action: default, http_timeouts: crate::config::HttpTimeouts::default() };
                         super::handle_http_stream(true, None, &http, stream, &"127.0.0.1:12345".parse().unwrap(), None).await.unwrap();
                     }));
                     let mut client: Box<dyn AsyncStream> = if frontend_tls {

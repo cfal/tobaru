@@ -16,10 +16,11 @@ use tokio::time::{timeout, Duration};
 
 use crate::async_stream::AsyncStream;
 use crate::config::{
-    AlpnValue, HttpForwardConfig, HttpHeaderPatch, HttpPathAction, HttpServeDirectoryConfig,
-    HttpServeMessageConfig, HttpTcpActionConfig, HttpTimeouts, HttpValueMatch, IpMask,
-    IpMaskSelection, Location, NetLocation, NoneOrOne, RawTcpActionConfig, SniValue, TcpAction,
-    TcpKeepaliveConfig, TcpKeepaliveOption, TcpTargetConfig, TcpTargetLocation,
+    AlpnValue, HttpForwardConfig, HttpHeaderPatch, HttpPathAction, HttpProtocol, HttpProtocols,
+    HttpServeDirectoryConfig, HttpServeMessageConfig, HttpTcpActionConfig, HttpTimeouts,
+    HttpValueMatch, IpMask, IpMaskSelection, Location, NetLocation, NoneOrOne, RawTcpActionConfig,
+    SniValue, TcpAction, TcpKeepaliveConfig, TcpKeepaliveOption, TcpTargetConfig,
+    TcpTargetLocation,
 };
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::domain_trie::DomainTrie;
@@ -28,6 +29,9 @@ use crate::rustls_util::{
     create_server_config, get_dummy_server_name, load_certs, load_private_key,
 };
 use crate::tokio_util::resolve_host;
+
+#[cfg(test)]
+mod protocol_tests;
 
 pub struct TargetLocationData {
     pub location: Location,
@@ -138,6 +142,7 @@ pub enum TargetActionData {
 }
 
 pub struct HttpTargetData {
+    pub http_protocols: HttpProtocols,
     pub http2: crate::config::Http2Config,
     pub h2_admission: crate::http::h2::Admission,
     pub path_configs: Trie<String, Vec<TargetHttpPathData>>,
@@ -347,7 +352,7 @@ pub async fn prepare_tcp_server(
     for target_config in target_configs {
         let TcpTargetConfig {
             allowlist,
-            server_tls,
+            mut server_tls,
             tcp_nodelay,
             tcp_keepalive: target_tcp_keepalive,
             action,
@@ -375,11 +380,13 @@ pub async fn prepare_tcp_server(
                 next_address_index: AtomicUsize::new(0),
             },
             TcpAction::Http(HttpTcpActionConfig {
+                http_protocols,
                 http2,
                 http_timeouts,
                 http_paths,
                 default_http_action,
             }) => {
+                let http_protocols = HttpProtocols::resolve(http_protocols, server_tls.as_mut())?;
                 let http2 = *http2;
                 http2.validate()?;
                 let mut path_configs = Trie::new();
@@ -396,6 +403,7 @@ pub async fn prepare_tcp_server(
                     path_configs.insert(path, path_data_vec);
                 }
                 TargetActionData::Http(Box::new(HttpTargetData {
+                    http_protocols,
                     http2,
                     h2_admission: crate::http::h2::Admission::new(http2, Some(retired.clone())),
                     path_configs,
@@ -406,13 +414,7 @@ pub async fn prepare_tcp_server(
         };
 
         if let TargetActionData::Http(http) = &action_data {
-            let h2_enabled = http.http2.prior_knowledge
-                || server_tls.as_ref().is_some_and(|tls| {
-                    tls.alpn_protocols
-                        .iter()
-                        .any(|value| matches!(value, AlpnValue::Specified(name) if name == "h2"))
-                });
-            if h2_enabled {
+            if http.http_protocols.http2 {
                 crate::http::h2::validate_config(http)?;
             }
         }
@@ -1007,7 +1009,7 @@ async fn run_stream_action_with_protocol(
     mut source_stream: Box<dyn AsyncStream>,
     addr: &std::net::SocketAddr,
     target_data: Arc<TargetData>,
-    initial_data: Option<Vec<u8>>,
+    mut initial_data: Option<Vec<u8>>,
     alpn: Option<Vec<u8>>,
     tls: bool,
 ) -> std::io::Result<()> {
@@ -1070,7 +1072,39 @@ async fn run_stream_action_with_protocol(
             Ok(())
         }
         TargetActionData::Http(http) => {
-            if alpn.as_deref() == Some(b"h2") || (!tls && http.http2.prior_knowledge) {
+            let protocol = if tls {
+                if alpn.as_deref() == Some(b"h2") {
+                    HttpProtocol::Http2
+                } else {
+                    HttpProtocol::Http1
+                }
+            } else if http.http_protocols.http1 && http.http_protocols.http2 {
+                let seconds = http
+                    .http_timeouts
+                    .request_header_timeout_secs
+                    .unwrap_or(http.http2.header_timeout_secs)
+                    .get();
+                crate::http::detect::protocol(
+                    &mut source_stream,
+                    &mut initial_data,
+                    Duration::from_secs(seconds),
+                )
+                .await?
+            } else if http.http_protocols.http2 {
+                HttpProtocol::Http2
+            } else {
+                HttpProtocol::Http1
+            };
+            let allowed = match protocol {
+                HttpProtocol::Http1 => http.http_protocols.http1,
+                HttpProtocol::Http2 => http.http_protocols.http2,
+            };
+            if !allowed {
+                return Err(std::io::Error::other(
+                    "Negotiated HTTP protocol is disabled",
+                ));
+            }
+            if protocol == HttpProtocol::Http2 {
                 return crate::http::h2::handle(source_stream, *addr, target_data, initial_data)
                     .await;
             }
