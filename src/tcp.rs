@@ -23,7 +23,6 @@ use crate::config::{
 };
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::domain_trie::DomainTrie;
-use crate::http::handle_http_stream;
 use crate::iptables_util::{configure_iptables, Protocol};
 use crate::rustls_util::{
     create_server_config, get_dummy_server_name, load_certs, load_private_key,
@@ -34,6 +33,33 @@ pub struct TargetLocationData {
     pub location: Location,
     pub tls_connector: Option<tokio_rustls::TlsConnector>,
     pub sni_hostname: NoneOrOne<String>,
+}
+
+impl TargetLocationData {
+    fn for_http(
+        location: TcpTargetLocation,
+        protocol: crate::config::HttpProtocol,
+    ) -> std::io::Result<Self> {
+        let mut target = Self::try_from(location)?;
+        if protocol == crate::config::HttpProtocol::Http2 {
+            if let Some(connector) = &target.tls_connector {
+                let mut config = connector.config().as_ref().clone();
+                if !config.alpn_protocols.is_empty() && config.alpn_protocols != [b"h2".to_vec()] {
+                    return Err(std::io::Error::other(
+                        "HTTP/2 backend requires ALPN h2 only",
+                    ));
+                }
+                config.alpn_protocols = vec![b"h2".to_vec()];
+                target.tls_connector = Some(Arc::new(config).into());
+            }
+        }
+        Ok(target)
+    }
+}
+
+pub struct EstablishedStream {
+    pub io: Box<dyn AsyncStream>,
+    pub negotiated_alpn: Option<Vec<u8>>,
 }
 
 impl TryFrom<TcpTargetLocation> for TargetLocationData {
@@ -112,6 +138,8 @@ pub enum TargetActionData {
 }
 
 pub struct HttpTargetData {
+    pub http2: crate::config::Http2Config,
+    pub h2_admission: crate::http::h2::Admission,
     pub path_configs: Trie<String, Vec<TargetHttpPathData>>,
     pub default_http_action: TargetHttpActionData,
     pub http_timeouts: HttpTimeouts,
@@ -139,6 +167,8 @@ pub enum TargetHttpActionData {
         response_id_header_name: Option<String>,
     },
     Forward {
+        id: usize,
+        upstream_protocol: crate::config::HttpProtocol,
         location_data: Vec<TargetLocationData>,
         next_address_index: AtomicUsize,
         // replacement paths are best effort - it's entirely possible that absolute paths are specified
@@ -180,6 +210,7 @@ impl TryFrom<HttpPathAction> for TargetHttpActionData {
                 response_id_header_name,
             },
             HttpPathAction::Forward(HttpForwardConfig {
+                upstream_protocol,
                 locations,
                 replacement_path,
                 request_header_patch,
@@ -187,9 +218,14 @@ impl TryFrom<HttpPathAction> for TargetHttpActionData {
                 request_id_header_name,
                 response_id_header_name,
             }) => TargetHttpActionData::Forward {
+                id: {
+                    static NEXT_ACTION: AtomicUsize = AtomicUsize::new(0);
+                    NEXT_ACTION.fetch_add(1, Ordering::Relaxed)
+                },
+                upstream_protocol,
                 location_data: locations
                     .into_iter()
-                    .map(TargetLocationData::try_from)
+                    .map(|location| TargetLocationData::for_http(location, upstream_protocol))
                     .collect::<std::io::Result<_>>()?,
                 next_address_index: AtomicUsize::new(0),
                 replacement_path,
@@ -299,6 +335,7 @@ pub async fn prepare_tcp_server(
     tcp_keepalive: TcpKeepaliveOption,
     target_configs: Vec<TcpTargetConfig>,
 ) -> std::io::Result<impl std::future::Future<Output = std::io::Result<()>> + Send> {
+    let (generation, retired) = tokio::sync::watch::channel(());
     let mut non_tls_lookup_table: IpLookupTable<Ipv6Addr, Arc<TargetData>> = IpLookupTable::new();
 
     let mut tls_lookup_table: IpLookupTable<Ipv6Addr, bool> = IpLookupTable::new();
@@ -338,10 +375,13 @@ pub async fn prepare_tcp_server(
                 next_address_index: AtomicUsize::new(0),
             },
             TcpAction::Http(HttpTcpActionConfig {
+                http2,
                 http_timeouts,
                 http_paths,
                 default_http_action,
             }) => {
+                let http2 = *http2;
+                http2.validate()?;
                 let mut path_configs = Trie::new();
                 for (path, path_config_vec) in http_paths {
                     let path_data_vec = path_config_vec
@@ -356,12 +396,26 @@ pub async fn prepare_tcp_server(
                     path_configs.insert(path, path_data_vec);
                 }
                 TargetActionData::Http(Box::new(HttpTargetData {
+                    http2,
+                    h2_admission: crate::http::h2::Admission::new(http2, Some(retired.clone())),
                     path_configs,
                     default_http_action: default_http_action.try_into()?,
                     http_timeouts,
                 }))
             }
         };
+
+        if let TargetActionData::Http(http) = &action_data {
+            let h2_enabled = http.http2.prior_knowledge
+                || server_tls.as_ref().is_some_and(|tls| {
+                    tls.alpn_protocols
+                        .iter()
+                        .any(|value| matches!(value, AlpnValue::Specified(name) if name == "h2"))
+                });
+            if h2_enabled {
+                crate::http::h2::validate_config(http)?;
+            }
+        }
 
         // Create target_data (needed for both TLS and non-TLS targets)
         // Resolve keepalive config for target-side connections
@@ -501,6 +555,7 @@ pub async fn prepare_tcp_server(
     let no_sni_targets = Arc::new(no_sni_targets);
 
     Ok(async move {
+        let _generation = generation;
         let listener = TcpListener::bind(server_address).await?;
         if use_iptables {
             configure_iptables(Protocol::Tcp, server_address, &iptable_masks).await?;
@@ -676,7 +731,7 @@ async fn handle_terminate_with_parsed(
     client_hello_frame: Vec<u8>,
     target_data: Arc<TlsTargetData>,
     tls_config: Arc<rustls::ServerConfig>,
-) -> std::io::Result<(Box<dyn AsyncStream>, Arc<TargetData>)> {
+) -> std::io::Result<(EstablishedStream, Arc<TargetData>)> {
     use tokio_rustls::TlsAcceptor;
 
     debug!("Terminate TLS for {}", addr);
@@ -714,18 +769,23 @@ async fn handle_terminate_with_parsed(
         accept_future
     };
 
-    let tls_stream = Box::new(
-        crate::tokio_util::with_timeout(
-            target_data.handshake_timeout_secs,
-            "TLS handshake",
-            accept_future,
-        )
-        .await?,
-    );
+    let tls_stream = crate::tokio_util::with_timeout(
+        target_data.handshake_timeout_secs,
+        "TLS handshake",
+        accept_future,
+    )
+    .await?;
+    let negotiated_alpn = tls_stream.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
 
     debug!("Completed TLS handshake for {}", addr);
 
-    Ok((tls_stream, target_data.target_data.clone()))
+    Ok((
+        EstablishedStream {
+            io: Box::new(tls_stream),
+            negotiated_alpn,
+        },
+        target_data.target_data.clone(),
+    ))
 }
 
 /// Find matching passthrough target based on SNI and ALPN
@@ -915,7 +975,15 @@ async fn process_tls_stream(
     {
         let (tls_stream, target_data) =
             handle_terminate_with_parsed(stream, addr, buf, target, tls_config).await?;
-        return run_stream_action(tls_stream, addr, target_data, None).await;
+        return run_stream_action_with_protocol(
+            tls_stream.io,
+            addr,
+            target_data,
+            None,
+            tls_stream.negotiated_alpn,
+            true,
+        )
+        .await;
     }
 
     // No matching target found
@@ -926,10 +994,22 @@ async fn process_tls_stream(
 }
 
 async fn run_stream_action(
+    source_stream: Box<dyn AsyncStream>,
+    addr: &std::net::SocketAddr,
+    target_data: Arc<TargetData>,
+    initial_data: Option<Vec<u8>>,
+) -> std::io::Result<()> {
+    run_stream_action_with_protocol(source_stream, addr, target_data, initial_data, None, false)
+        .await
+}
+
+async fn run_stream_action_with_protocol(
     mut source_stream: Box<dyn AsyncStream>,
     addr: &std::net::SocketAddr,
     target_data: Arc<TargetData>,
     initial_data: Option<Vec<u8>>,
+    alpn: Option<Vec<u8>>,
+    tls: bool,
 ) -> std::io::Result<()> {
     match &target_data.action_data {
         TargetActionData::Raw {
@@ -990,13 +1070,18 @@ async fn run_stream_action(
             Ok(())
         }
         TargetActionData::Http(http) => {
-            handle_http_stream(
+            if alpn.as_deref() == Some(b"h2") || (!tls && http.http2.prior_knowledge) {
+                return crate::http::h2::handle(source_stream, *addr, target_data, initial_data)
+                    .await;
+            }
+            crate::http::handle_http_stream_with_tls(
                 target_data.tcp_nodelay,
                 target_data.tcp_keepalive,
                 http,
                 source_stream,
                 addr,
                 initial_data,
+                tls,
             )
             .await
         }
@@ -1035,7 +1120,7 @@ async fn maybe_wrap_tls<S: AsyncStream + 'static>(
     stream: S,
     target_location: &TargetLocationData,
     fallback_address: Option<&str>,
-) -> std::io::Result<Box<dyn AsyncStream>> {
+) -> std::io::Result<EstablishedStream> {
     if let Some(ref connector) = target_location.tls_connector {
         let server_name = resolve_server_name(&target_location.sni_hostname, fallback_address);
         let tls_stream = connector
@@ -1043,9 +1128,16 @@ async fn maybe_wrap_tls<S: AsyncStream + 'static>(
                 server_conn.set_buffer_limit(Some(32768));
             })
             .await?;
-        Ok(Box::new(tls_stream))
+        let negotiated_alpn = tls_stream.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
+        Ok(EstablishedStream {
+            io: Box::new(tls_stream),
+            negotiated_alpn,
+        })
     } else {
-        Ok(Box::new(stream))
+        Ok(EstablishedStream {
+            io: Box::new(stream),
+            negotiated_alpn: None,
+        })
     }
 }
 
@@ -1055,6 +1147,19 @@ pub async fn setup_target_stream(
     tcp_nodelay: bool,
     tcp_keepalive: Option<TcpKeepaliveConfig>,
 ) -> std::io::Result<Box<dyn AsyncStream>> {
+    Ok(
+        setup_http_target_stream(addr, target_location, tcp_nodelay, tcp_keepalive)
+            .await?
+            .io,
+    )
+}
+
+pub async fn setup_http_target_stream(
+    addr: &std::net::SocketAddr,
+    target_location: &TargetLocationData,
+    tcp_nodelay: bool,
+    tcp_keepalive: Option<TcpKeepaliveConfig>,
+) -> std::io::Result<EstablishedStream> {
     match target_location.location {
         Location::Address(NetLocation { ref address, port }) => {
             let target_addr = resolve_host((address.as_str(), port)).await?;

@@ -89,6 +89,42 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn http2_policy_is_explicit_and_bounded() {
+        use super::super::{Http2Config, HttpProtocol, HttpTcpActionConfig};
+        let config: HttpTcpActionConfig =
+            serde_json::from_value(json!({"default_http_action":"close"})).unwrap();
+        assert!(!config.http2.prior_knowledge);
+        assert_eq!(config.http2.max_concurrent_streams.get(), 64);
+        let HttpPathAction::Forward(config) =
+            serde_json::from_value(json!({"type":"forward", "location":"localhost:80"})).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(config.upstream_protocol, HttpProtocol::Http1);
+        for value in [
+            json!({"max_concurrent_streams":0}),
+            json!({"header_timeout_secs":0}),
+            json!({"typo":1}),
+        ] {
+            assert!(serde_json::from_value::<Http2Config>(value).is_err());
+        }
+        for value in [
+            json!({"max_concurrent_streams":4097}),
+            json!({"max_header_list_size":1048577}),
+            json!({"drain_timeout_secs":86401}),
+        ] {
+            assert!(serde_json::from_value::<Http2Config>(value)
+                .unwrap()
+                .validate()
+                .is_err());
+        }
+        assert!(serde_json::from_value::<HttpPathAction>(
+            json!({"type":"forward", "location":"localhost:80", "upstream_protocol":"http3"})
+        )
+        .is_err());
+    }
+
+    #[test]
     fn configured_http_metadata_cannot_inject_wire_lines() {
         for value in [
             json!({"type":"serve-message", "status_code":200, "status_message":"OK\r\nx-injected: yes"}),

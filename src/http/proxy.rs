@@ -88,6 +88,15 @@ impl<'a> Session<'a> {
     }
 
     pub(super) async fn forward(&mut self, mut request: Request<'a>) -> io::Result<Outcome> {
+        if matches!(
+            request.action,
+            TargetHttpActionData::Forward {
+                upstream_protocol: crate::config::HttpProtocol::Http2,
+                ..
+            }
+        ) {
+            return self.forward_h2(request).await;
+        }
         let TargetHttpActionData::Forward {
             replacement_path,
             request_header_patch,

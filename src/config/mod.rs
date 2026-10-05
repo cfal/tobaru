@@ -386,6 +386,8 @@ pub struct RawTcpActionConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct HttpTcpActionConfig {
     #[serde(default)]
+    pub http2: Box<Http2Config>,
+    #[serde(default)]
     pub http_timeouts: HttpTimeouts,
     #[serde(default)]
     pub http_paths: HashMap<String, OneOrSome<HttpPathConfig>>,
@@ -398,6 +400,67 @@ pub struct HttpTimeouts {
     pub request_header_timeout_secs: Option<std::num::NonZeroU64>,
     pub response_header_timeout_secs: Option<std::num::NonZeroU64>,
     pub keepalive_idle_timeout_secs: Option<std::num::NonZeroU64>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HttpProtocol {
+    #[default]
+    Http1,
+    Http2,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Http2Config {
+    pub prior_knowledge: bool,
+    pub max_concurrent_streams: std::num::NonZeroU32,
+    pub max_connections: std::num::NonZeroUsize,
+    pub max_backend_connections: std::num::NonZeroUsize,
+    pub max_header_list_size: std::num::NonZeroU32,
+    pub header_timeout_secs: std::num::NonZeroU64,
+    pub connect_timeout_secs: std::num::NonZeroU64,
+    pub body_progress_timeout_secs: std::num::NonZeroU64,
+    pub drain_timeout_secs: std::num::NonZeroU64,
+}
+
+impl Default for Http2Config {
+    fn default() -> Self {
+        Self {
+            prior_knowledge: false,
+            max_concurrent_streams: std::num::NonZeroU32::new(64).unwrap(),
+            max_connections: std::num::NonZeroUsize::new(256).unwrap(),
+            max_backend_connections: std::num::NonZeroUsize::new(256).unwrap(),
+            max_header_list_size: std::num::NonZeroU32::new(65536).unwrap(),
+            header_timeout_secs: std::num::NonZeroU64::new(10).unwrap(),
+            connect_timeout_secs: std::num::NonZeroU64::new(10).unwrap(),
+            body_progress_timeout_secs: std::num::NonZeroU64::new(30).unwrap(),
+            drain_timeout_secs: std::num::NonZeroU64::new(5).unwrap(),
+        }
+    }
+}
+
+impl Http2Config {
+    pub fn validate(&self) -> std::io::Result<()> {
+        if self.max_concurrent_streams.get() > 4096
+            || self.max_connections.get() > 65536
+            || self.max_backend_connections.get() > 65536
+            || !(1024..=1048576).contains(&self.max_header_list_size.get())
+            || [
+                self.header_timeout_secs,
+                self.connect_timeout_secs,
+                self.body_progress_timeout_secs,
+                self.drain_timeout_secs,
+            ]
+            .iter()
+            .any(|seconds| seconds.get() > 86400)
+        {
+            return Err(std::io::Error::other(
+                "HTTP/2 limits exceed supported bounds",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -597,6 +660,8 @@ pub struct HttpServeDirectoryConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct HttpForwardConfig {
+    #[serde(default)]
+    pub upstream_protocol: HttpProtocol,
     #[serde(alias = "location", alias = "addresses", alias = "address")]
     pub locations: OneOrSome<TcpTargetLocation>,
     #[serde(default)]
