@@ -14,6 +14,19 @@ Local receive-validation fixes are maintained as separate commits. Do not edit
 the Cargo registry copy or replace this dependency with upstream 0.4.19: it loses
 pseudoheaders and oversize information when exposing trailers to applications.
 
+Local changes:
+
+- `src/proto/streams/recv.rs`: reject oversized or pseudo-header-bearing trailers
+  with `PROTOCOL_ERROR` before receive-side closure and conversion to regular fields.
+- `src/server.rs`: reject raw `:path` fragments before `http::Uri` can discard them.
+
+The application depends directly on this path without a registry version.
+Cargo removes `[patch.crates-io]` overrides when packaging; a versioned fallback
+would silently restore the unpatched library. The unversioned path intentionally
+blocks `cargo package` and `cargo publish`. Source installs and release-binary
+builds remain supported. Restore registry publishing only after a released h2
+version contains equivalent fixes and passes the regression corpus.
+
 Before replacing this source, run `cargo test --locked http::h2::tests::wire`
 against the replacement as well as the full test suite and HTTP/2 smoke test.
 The raw-wire corpus covers request and response trailers, pre-normalization

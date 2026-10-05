@@ -9,6 +9,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixStream};
 use tokio::task::JoinHandle;
 
+mod wire;
+
 struct Task<T>(JoinHandle<T>);
 impl<T> Drop for Task<T> {
     fn drop(&mut self) {

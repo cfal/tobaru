@@ -257,7 +257,15 @@ pub(super) async fn forward(
                 return Ok(true);
             }
             tokio::select! {
-                result = message::copy_body(body, &mut send, expected, &activity, limit) => { result?; deadline.uploaded(); Ok(true) },
+                result = message::copy_body(body, &mut send, expected, &activity, limit) => {
+                    if let Err(error) = result {
+                        // An early response may need upload EOF before its body can finish.
+                        let _ = progress(seconds, send.io.shutdown()).await;
+                        return Err(error);
+                    }
+                    deadline.uploaded();
+                    Ok(true)
+                },
                 _ = async { if stop_rx.await.is_err() { std::future::pending::<()>().await; } } => {
                     progress(seconds, send.io.shutdown()).await?;
                     Ok(false)

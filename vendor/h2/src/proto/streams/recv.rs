@@ -421,6 +421,20 @@ impl Recv {
         frame: frame::Headers,
         stream: &mut store::Ptr,
     ) -> Result<(), Error> {
+        // Validate before closing the stream or discarding pseudo-header/size metadata.
+        let pseudo = frame.pseudo();
+        if frame.is_over_size()
+            || pseudo.method.is_some()
+            || pseudo.scheme.is_some()
+            || pseudo.authority.is_some()
+            || pseudo.path.is_some()
+            || pseudo.protocol.is_some()
+            || pseudo.status.is_some()
+        {
+            proto_err!(stream: "recv_trailers: malformed or oversized trailers; stream={:?};", stream.id);
+            return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR));
+        }
+
         // Transition the state
         stream.state.recv_close()?;
 
