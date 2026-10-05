@@ -259,11 +259,16 @@ rejected before the library can discard their validation metadata. Failed H1
 uploads never receive a synthesized terminal chunk and their backend sockets
 are not reused.
 
-Run `cargo test --locked http::h2::tests::wire` for the raw H2/HPACK adversarial
-corpus, then `node tests/http2_smoke.mjs target/release/tobaru` against a built
-binary for independent Node HTTP/1 and HTTP/2 interoperability checks. Both run
-in CI (the smoke uses the debug binary). Rerun them on dependency upgrades;
-regression coverage is not a substitute for fuzzing or a security audit.
+Run `cargo test --locked` for the complete regression suite. The
+`http::h2::tests::wire` corpus sends raw H2/HPACK adversarial inputs; the
+`http::h2::tests::forwarding` matrix covers H1-to-H2 uploads, pipelining, Expect,
+malformed framing and early closure, forwarded bodyless responses across all four
+protocol combinations, and H2 backend failure/backpressure with sibling reuse.
+Run `node tests/http2_smoke.mjs target/release/tobaru` against a built binary for
+independent Node HTTP/1 and HTTP/2 parsing, including uploads in both translation
+directions. These run in CI (the smoke uses the debug binary). Rerun them on
+dependency upgrades; regression coverage is not a substitute for fuzzing or a
+security audit.
 
 Optional `http2` settings and defaults:
 

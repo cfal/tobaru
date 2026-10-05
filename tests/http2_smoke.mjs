@@ -101,6 +101,42 @@ function h1Get(port, options = {}) {
   });
 }
 
+function h1ToH2Upload(port, payload, chunked) {
+  return new Promise((resolve, reject) => {
+    const information = [];
+    const request = https.request({
+      hostname: '127.0.0.1', port, path: '/ingress-upload', method: 'POST',
+      servername: 'localhost', ALPNProtocols: ['http/1.1'], rejectUnauthorized: false,
+      agent: false, signal,
+      headers: {
+        expect: '100-continue', connection: 'close, x-private', 'x-private': 'hidden',
+        ...(chunked ? { 'transfer-encoding': 'chunked', trailer: 'x-upload' } : { 'content-length': payload.length }),
+      },
+    }, response => {
+      const chunks = [];
+      response.on('data', chunk => chunks.push(chunk));
+      response.on('error', reject);
+      response.on('end', () => {
+        try {
+          assert.equal(response.statusCode, 200);
+          assert.deepEqual(information, [100, 103]);
+          assert.deepEqual(Buffer.concat(chunks), payload);
+          assert.equal(response.trailers['x-finished'], 'yes');
+          resolve();
+        } catch (error) { reject(error); }
+      });
+    });
+    request.on('error', reject);
+    request.on('information', response => information.push(response.statusCode));
+    request.on('continue', () => {
+      request.write(payload);
+      if (chunked) request.addTrailers({ 'x-upload': 'complete' });
+      request.end();
+    });
+    request.flushHeaders();
+  });
+}
+
 function clearH1Get(port, method = 'GET') {
   return new Promise((resolve, reject) => {
     const request = http.request({ hostname: '127.0.0.1', port, method, path: '/', agent: false, signal }, response => {
@@ -176,7 +212,24 @@ try {
     stream.on('error', () => {});
     assert.equal(stream.session.socket.authorized, true);
     assert.equal(stream.session.socket.servername, 'localhost');
-    if (headers[':path'] === '/duplex') {
+    if (headers[':path'] === '/ingress-upload') {
+      assert.equal(headers.connection, undefined);
+      assert.equal(headers['x-private'], undefined);
+      assert.equal(headers['transfer-encoding'], undefined);
+      stream.additionalHeaders({ ':status': 100 });
+      stream.additionalHeaders({ ':status': 103, link: '</asset>' });
+      const chunks = [];
+      let trailers;
+      stream.on('data', data => chunks.push(data));
+      stream.on('trailers', fields => { trailers = fields; });
+      stream.on('end', guard(() => {
+        if (headers['content-length'] === undefined) assert.equal(trailers['x-upload'], 'complete');
+        else assert.equal(Buffer.concat(chunks).length, Number(headers['content-length']));
+        stream.respond({ ':status': 200 }, { waitForTrailers: true });
+        stream.end(Buffer.concat(chunks));
+      }));
+      stream.on('wantTrailers', () => stream.sendTrailers({ 'x-finished': 'yes' }));
+    } else if (headers[':path'] === '/duplex') {
       stream.additionalHeaders({ ':status': 100 });
       stream.additionalHeaders({ ':status': 103, link: '</asset>' });
       stream.respond({ ':status': 200 }, { waitForTrailers: true });
@@ -340,6 +393,9 @@ try {
   assert.equal(fallback.response.socket?.alpnProtocol ?? 'http/1.1', 'http/1.1');
   assert.equal((await h1Get(tlsPort, { ALPNProtocols: [] })).body, 'h2 backend');
   assert.equal((await h1Get(tlsPort, { ALPNProtocols: ['legacy-http'] })).body, 'h2 backend');
+  for (const chunked of [false, true]) {
+    await h1ToH2Upload(tlsPort, Buffer.concat([Buffer.alloc(131072, 'u'), injection]), chunked);
+  }
   const clear = track(http2.connect(`http://127.0.0.1:${clearPort}`));
   assert.equal((await get(clear)).body, 'clear h2');
   for (const method of ['GET', 'POST', 'PUT', 'PATCH', 'PRINT']) {
@@ -386,7 +442,7 @@ try {
   await assert.rejects(get(anonymous));
   assert.doesNotMatch(logs, /panicked/);
   if (peerFailure) throw peerFailure;
-  console.log('HTTP/2 smoke passed: plaintext detection, protocol allowlists, derived TLS ALPN, optional TLS replay, H1 fallback, H2/H1/H2 translation, independent H1 upload parsing and isolation, duplex, 1xx, trailers, reuse, Unix, pins, verification, mTLS.');
+  console.log('HTTP/2 smoke passed: plaintext detection, protocol allowlists, derived TLS ALPN, optional TLS replay, H1 fallback, H2/H1/H2 translation, independent bidirectional upload parsing, isolation, duplex, 1xx, trailers, reuse, Unix, pins, verification, mTLS.');
 } catch (error) {
   console.error(logs);
   throw error;
