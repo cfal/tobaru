@@ -11,7 +11,7 @@ fn forwarding(addr: std::net::SocketAddr) -> HttpTargetData {
     )
 }
 
-fn h1_frontend(http: HttpTargetData) -> (UnixStream, Task<std::io::Result<()>>) {
+pub(super) fn h1_frontend(http: HttpTargetData) -> (UnixStream, Task<std::io::Result<()>>) {
     let (client, server) = UnixStream::pair().unwrap();
     let task = Task(tokio::spawn(async move {
         crate::http::handle_http_stream(
@@ -38,7 +38,7 @@ fn values(head: &[u8], name: &str) -> Vec<String> {
 }
 
 // Test-side wire decoder: do not validate the H1 encoder with its own body parser.
-async fn chunked(io: &mut UnixStream) -> (Vec<u8>, Vec<u8>) {
+pub(super) async fn chunked(io: &mut UnixStream) -> (Vec<u8>, Vec<u8>) {
     let mut body = Vec::new();
     loop {
         let mut line = Vec::new();
@@ -485,7 +485,12 @@ async fn h2_upstream_early_final_completes_before_upload_cancellation() {
                     client.write_all(b"GET /smuggled HTTP/1.1\r\nHost: example.test\r\n\r\n").await.unwrap();
                     finish.notify_one();
                     assert_eq!(chunked(&mut client).await.0, b"complete response");
-                    eof(&mut client).await;
+                    // An Expect-final leaves the unsolicited upload unread; close may reset it.
+                    match client.read(&mut [0; 1]).await {
+                        Ok(0) => {},
+                        Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset),
+                        result => panic!("expected connection closure: {result:?}"),
+                    }
                     (&mut session.0).await.unwrap().unwrap();
                     // Closing the H1 owner may retire its entire backend driver before RST flushes.
                     let reset = resets.recv().await.unwrap();

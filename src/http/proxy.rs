@@ -151,6 +151,7 @@ impl<'a> Session<'a> {
             target.reader,
             request_body,
             self.timeouts.response_header_timeout_secs,
+            self.timeouts.upstream_body_progress_timeout_secs,
         )
         .await?;
         let upload_complete = reader.is_some();
@@ -211,6 +212,10 @@ impl<'a> Session<'a> {
         write_head(&mut self.stream, &response).await?;
         target.reader = {
             let (mut target_read, mut target_write) = tokio::io::split(&mut target.stream);
+            let mut target_read = super::body_io::UpstreamIo::new(
+                &mut target_read,
+                self.timeouts.upstream_body_progress_timeout_secs,
+            );
             let drain = forward_body(
                 &mut target_read,
                 Some(&mut self.stream),
@@ -265,9 +270,11 @@ async fn exchange(
     response_reader: LineReader,
     framing: Framing,
     response_timeout_secs: Option<std::num::NonZeroU64>,
+    body_timeout_secs: Option<std::num::NonZeroU64>,
 ) -> io::Result<(Option<LineReader>, ParsedHttpData)> {
     let (mut client_read, mut client_write) = tokio::io::split(client);
     let (mut target_read, mut target_write) = tokio::io::split(target);
+    let mut target_write = super::body_io::UpstreamIo::new(&mut target_write, body_timeout_secs);
     let upload = async {
         let reader = forward_body(
             &mut client_read,

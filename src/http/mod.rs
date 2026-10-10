@@ -1,4 +1,5 @@
 mod body;
+mod body_io;
 mod bridge;
 mod chunk_transfer;
 pub(crate) mod detect;
@@ -13,6 +14,7 @@ mod proxy;
 mod routing;
 mod string_util;
 pub(crate) mod syntax;
+mod upload;
 
 #[cfg(test)]
 mod idle_tests;

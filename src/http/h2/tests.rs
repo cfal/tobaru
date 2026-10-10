@@ -10,6 +10,7 @@ use tokio::net::{TcpListener, UnixStream};
 use tokio::task::JoinHandle;
 
 mod forwarding;
+mod timeouts;
 mod wire;
 
 struct Task<T>(JoinHandle<T>);

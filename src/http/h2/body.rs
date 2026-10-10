@@ -52,26 +52,43 @@ impl ReceiveBody for H2Body {
 pub(super) struct H2Send {
     pub stream: h2::SendStream<Bytes>,
     finished: bool,
+    timeout: Option<std::num::NonZeroU64>,
 }
 impl H2Send {
-    pub fn new(stream: h2::SendStream<Bytes>, finished: bool) -> Self {
-        Self { stream, finished }
+    pub fn new(
+        stream: h2::SendStream<Bytes>,
+        finished: bool,
+        timeout: Option<std::num::NonZeroU64>,
+    ) -> Self {
+        Self {
+            stream,
+            finished,
+            timeout,
+        }
     }
 }
 
-async fn send_data(send: &mut h2::SendStream<Bytes>, mut data: Bytes) -> io::Result<()> {
+async fn send_data(
+    send: &mut h2::SendStream<Bytes>,
+    mut data: Bytes,
+    timeout: Option<std::num::NonZeroU64>,
+) -> io::Result<()> {
     while !data.is_empty() {
         send.reserve_capacity(data.len().min(CHUNK_SIZE));
-        let capacity = poll_fn(|cx| {
-            if send.capacity() > 0 {
-                return Poll::Ready(Ok(send.capacity()));
-            }
-            match send.poll_capacity(cx) {
-                Poll::Ready(Some(Ok(0))) | Poll::Pending => Poll::Pending,
-                Poll::Ready(Some(result)) => Poll::Ready(result.map_err(io_error)),
-                Poll::Ready(None) => Poll::Ready(Err(invalid("HTTP/2 send stream closed"))),
-            }
-        })
+        let capacity = crate::tokio_util::with_timeout(
+            timeout,
+            "Upstream HTTP/2 body write capacity",
+            poll_fn(|cx| {
+                if send.capacity() > 0 {
+                    return Poll::Ready(Ok(send.capacity()));
+                }
+                match send.poll_capacity(cx) {
+                    Poll::Ready(Some(Ok(0))) | Poll::Pending => Poll::Pending,
+                    Poll::Ready(Some(result)) => Poll::Ready(result.map_err(io_error)),
+                    Poll::Ready(None) => Poll::Ready(Err(invalid("HTTP/2 send stream closed"))),
+                }
+            }),
+        )
         .await?;
         let n = capacity.min(data.len()).min(CHUNK_SIZE);
         send.send_data(data.split_to(n), false).map_err(io_error)?;
@@ -83,7 +100,7 @@ async fn send_data(send: &mut h2::SendStream<Bytes>, mut data: Bytes) -> io::Res
 #[async_trait]
 impl SendBody for H2Send {
     async fn data(&mut self, data: Bytes) -> io::Result<()> {
-        send_data(&mut self.stream, data).await
+        send_data(&mut self.stream, data, self.timeout).await
     }
     async fn trailers(&mut self, trailers: HeaderMap) -> io::Result<()> {
         self.stream.send_trailers(trailers).map_err(io_error)?;
