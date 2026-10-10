@@ -5,6 +5,8 @@ mod location;
 mod option_util;
 mod sni_value;
 mod validation;
+#[cfg(test)]
+mod yaml_tests;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
