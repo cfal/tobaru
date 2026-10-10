@@ -60,14 +60,14 @@ async function waitForLog(message) {
   }
 }
 
-async function assertAcceptFailure(configPath, config) {
+async function assertAcceptRecovery(configPath, config) {
   const reservation = net.createServer();
   const port = await listen(reservation);
   await close(reservation);
   writeFileSync(configPath, JSON.stringify([{ ...config, address: `0.0.0.0:${port}` }]));
   const limited = spawn('/bin/sh', ['-c', 'ulimit -n 64; exec "$@"', 'listener-test', binary, '-t', '1', configPath]);
   const closed = new Promise(resolve => limited.once('close', resolve));
-  const deadline = AbortSignal.timeout(5000);
+  const deadline = AbortSignal.timeout(10000);
   const clients = [];
   let output = '';
   const capture = bytes => { output = (output + bytes).slice(-16384); };
@@ -84,9 +84,22 @@ async function assertAcceptFailure(configPath, config) {
       client.on('error', () => {});
       clients.push(client);
     }
-    await once(limited, 'close', { signal: deadline });
-    assert.equal(limited.exitCode, 1, output);
-    assert.match(output, /Listener .* failed:/);
+    while (!output.includes('TCP accept failed')) {
+      assert.equal(limited.exitCode, null, output);
+      await delay(20, undefined, { signal: deadline });
+    }
+    await delay(200, undefined, { signal: deadline });
+    assert.equal(limited.exitCode, null, output);
+    const disconnected = clients.map(client => once(client, 'close'));
+    for (const client of clients) client.destroy();
+    await Promise.all(disconnected);
+    while (!output.includes('TCP accept recovered')) {
+      assert.equal(limited.exitCode, null, output);
+      await delay(20, undefined, { signal: deadline });
+    }
+    const recovered = await request(port, 'GET', '/after-exhaustion');
+    assert.equal(recovered.response.statusCode, 200);
+    assert.equal(recovered.body.toString(), 'working');
     assert.doesNotMatch(output, /panicked/);
   } finally {
     for (const client of clients) client.destroy();
@@ -192,7 +205,7 @@ try {
   assertFailure([failurePath]);
   writeFileSync(failurePath, JSON.stringify([{ ...config[0], target: { allowlist: '127.0.0.1/32', location: 'backend:abc' } }]));
   assertFailure(['--dry-run', failurePath]);
-  await assertAcceptFailure(failurePath, config[0]);
+  await assertAcceptRecovery(failurePath, config[0]);
 
   writeFileSync(configPath, '{invalid');
   await waitForLog('Config reload rejected');
@@ -220,7 +233,7 @@ try {
     agent.destroy();
     assert.equal((await request(port, 'GET', '/')).body.toString(), content);
   }
-  console.log('HTTP CLI smoke passed: dispatch, reuse, HEAD, ordered cookies, Expect, echo, pipelining, listener failures, last-good reload, repeated atomic saves.');
+  console.log('HTTP CLI smoke passed: dispatch, reuse, HEAD, ordered cookies, Expect, echo, pipelining, bind failures, FD exhaustion recovery, last-good reload, repeated atomic saves.');
 } catch (error) {
   console.error(logs);
   throw error;

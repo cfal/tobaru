@@ -564,8 +564,29 @@ pub async fn prepare_tcp_server(
         }
         println!("Listening (TCP): {}", listener.local_addr()?);
 
+        let mut accept_failed = false;
         loop {
-            let (stream, addr) = listener.accept().await?;
+            let (stream, addr) = match listener.accept().await {
+                Ok(accepted) => {
+                    if accept_failed {
+                        log::info!("TCP accept recovered on {}", server_address);
+                        accept_failed = false;
+                    }
+                    accepted
+                }
+                Err(error) => {
+                    if !accept_failed {
+                        warn!(
+                            "TCP accept failed on {}: {}; retrying",
+                            server_address, error
+                        );
+                        accept_failed = true;
+                    }
+                    // Resource exhaustion and aborted connections must not kill other listeners.
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+            };
 
             let ip = match addr.ip() {
                 IpAddr::V4(a) => a.to_ipv6_mapped(),
