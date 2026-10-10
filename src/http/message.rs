@@ -9,6 +9,7 @@ use crate::config::HttpHeaderPatch;
 
 pub(super) const CHUNK_SIZE: usize = 16 * 1024;
 pub(super) const MAX_FIELDS: usize = 128;
+pub(super) const MAX_INFORMATIONAL_RESPONSES: usize = 16;
 pub(super) const HOP_HEADERS: &[&str] = &[
     "connection",
     "keep-alive",

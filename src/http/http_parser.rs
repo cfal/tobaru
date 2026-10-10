@@ -9,8 +9,50 @@ pub struct ParsedHttpData {
     line_reader: LineReader,
 }
 
+struct HeadLimits {
+    line_bytes: usize,
+    lines: usize,
+    bytes: usize,
+}
+
 impl ParsedHttpData {
-    pub async fn parse<T>(stream: &mut T, mut line_reader: LineReader) -> std::io::Result<Self>
+    pub async fn parse<T>(stream: &mut T, line_reader: LineReader) -> std::io::Result<Self>
+    where
+        T: AsyncRead + Unpin,
+    {
+        Self::parse_bounded(
+            stream,
+            line_reader,
+            HeadLimits {
+                line_bytes: 4095,
+                lines: 39,
+                bytes: 39 * 4097 + 2,
+            },
+        )
+        .await
+    }
+
+    pub async fn parse_response<T>(stream: &mut T, line_reader: LineReader) -> std::io::Result<Self>
+    where
+        T: AsyncRead + Unpin,
+    {
+        Self::parse_bounded(
+            stream,
+            line_reader,
+            HeadLimits {
+                line_bytes: 16384,
+                lines: super::message::MAX_FIELDS + 1,
+                bytes: 65536,
+            },
+        )
+        .await
+    }
+
+    async fn parse_bounded<T>(
+        stream: &mut T,
+        mut line_reader: LineReader,
+        limits: HeadLimits,
+    ) -> std::io::Result<Self>
     where
         T: AsyncRead + Unpin,
     {
@@ -18,14 +60,19 @@ impl ParsedHttpData {
         let mut headers = Headers::default();
 
         let mut line_count = 0;
+        let mut byte_count = 0;
         loop {
             let line = line_reader.read_line(stream).await?;
+            byte_count += line.len() + 2;
+            if byte_count > limits.bytes {
+                return Err(std::io::Error::other("HTTP head exceeds byte limit"));
+            }
             if line.is_empty() {
                 break;
             }
 
-            if line.len() >= 4096 {
-                return Err(std::io::Error::other("http request line is too long"));
+            if line.len() > limits.line_bytes {
+                return Err(std::io::Error::other("HTTP head line is too long"));
             }
 
             if first_line.is_none() {
@@ -47,8 +94,8 @@ impl ParsedHttpData {
             }
 
             line_count += 1;
-            if line_count >= 40 {
-                return Err(std::io::Error::other("http request is too long"));
+            if line_count > limits.lines {
+                return Err(std::io::Error::other("HTTP head has too many lines"));
             }
         }
 
@@ -104,6 +151,48 @@ mod tests {
     use crate::http::header_map::HeaderMap;
     use crate::http::test_io::{ReadStep, ScriptedIo};
     use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn responses_have_separate_bounded_limits_without_relaxing_requests() {
+        for (field, count, accepted) in [
+            ("set-cookie: key=value\r\n".to_string(), 128, true),
+            ("set-cookie: key=value\r\n".to_string(), 129, false),
+            (format!("x: {}\r\n", "a".repeat(16381)), 1, true),
+            (format!("x: {}\r\n", "a".repeat(16382)), 1, false),
+        ] {
+            let wire = format!("HTTP/1.1 200 OK\r\n{}\r\n", field.repeat(count));
+            assert_eq!(
+                ParsedHttpData::parse_response(&mut wire.as_bytes(), LineReader::new())
+                    .await
+                    .is_ok(),
+                accepted
+            );
+            assert!(
+                ParsedHttpData::parse(&mut wire.as_bytes(), LineReader::new())
+                    .await
+                    .is_err()
+            );
+        }
+        let long_field = format!("x: {}\r\n", "a".repeat(16381));
+        let mut wire = format!("HTTP/1.1 200 OK\r\n{}", long_field.repeat(3));
+        let remaining = 65536 - wire.len() - 2;
+        wire.push_str(&format!("x: {}\r\n\r\n", "a".repeat(remaining - 5)));
+        assert_eq!(wire.len(), 65536);
+        for split in [0, 1, 16384, 32768, wire.len()] {
+            assert!(ParsedHttpData::parse_response(
+                &mut ScriptedIo::split(wire.as_bytes(), split),
+                LineReader::new()
+            )
+            .await
+            .is_ok());
+        }
+        wire.insert(wire.len() - 4, 'a');
+        assert!(
+            ParsedHttpData::parse_response(&mut wire.as_bytes(), LineReader::new())
+                .await
+                .is_err()
+        );
+    }
 
     #[tokio::test]
     async fn malformed_fields_are_rejected_for_requests_and_responses_at_every_split() {
@@ -176,11 +265,11 @@ mod tests {
             ),
             (
                 format!("{}\r\n\r\n", "x".repeat(4096)),
-                "http request line is too long",
+                "HTTP head line is too long",
             ),
             (
                 format!("GET / HTTP/1.1\r\n{}\r\n", "x: y\r\n".repeat(39)),
-                "http request is too long",
+                "HTTP head has too many lines",
             ),
         ];
         for (wire, expected) in cases {

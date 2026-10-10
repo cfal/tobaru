@@ -284,7 +284,7 @@ pub(super) async fn forward(
                             return Ok(response);
                         }
                         informational += 1;
-                        if informational > 16 {
+                        if informational > message::MAX_INFORMATIONAL_RESPONSES {
                             return Err(invalid("Too many informational responses"));
                         }
                         bridge::framing(response.headers(), true)?;
@@ -386,7 +386,9 @@ async fn response_h2(
                 match event {
                     Head::Informational(mut head) => {
                         informational += 1;
-                        if informational > 16 || head.status().as_u16() == 101 {
+                        if informational > message::MAX_INFORMATIONAL_RESPONSES
+                            || head.status().as_u16() == 101
+                        {
                             return Err(invalid("Invalid informational response sequence"));
                         }
                         message::validate_response(&mut head, limit)?;

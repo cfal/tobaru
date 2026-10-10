@@ -151,7 +151,9 @@ impl<T> TimedIo<T> {
                         }
                         if let Some(count) = sections.get_mut(&stream) {
                             *count += 1;
-                            if *count > 18 {
+                            if usize::from(*count)
+                                > crate::http::message::MAX_INFORMATIONAL_RESPONSES + 2
+                            {
                                 return Err(io::Error::other(
                                     "Too many HTTP/2 response field sections",
                                 ));
