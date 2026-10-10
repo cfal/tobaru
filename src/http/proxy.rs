@@ -306,6 +306,7 @@ async fn read_response<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         if status >= 200 || status == 101 {
             return Ok(response);
         }
+        response_framing(response.headers(), "GET", status)?;
         write_head(client, &response).await?;
         client.flush().await?;
         reader = response.into_reader();

@@ -160,6 +160,10 @@ async fn malformed_request_metadata_never_reaches_a_backend() {
             "GET / HTTP/1.1\r\nHost: a.test\r\nX: a\rTransfer-Encoding: chunked\r\n\r\n",
             "GET / HTTP/1.1\r\nHost: a.test\r\n Transfer-Encoding: chunked\r\n\r\n",
             "GET / HTTP/1.1\r\nHost: a.test\r\nTransfer-Encoding : chunked\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: a.test\r\nTransfer-Encoding: chunked\u{a0}, chunked\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: a.test\r\nTransfer-Encoding: \u{a0}chunked, chunked\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: a.test\r\nTransfer-Encoding: chunked\u{a0}\r\nTransfer-Encoding: chunked\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: a.test\r\nTransfer-Encoding: \u{a0}chunked\r\nTransfer-Encoding: chunked\r\n\r\n",
             "GET /extra path HTTP/1.1\r\nHost: a.test\r\n\r\n",
             "GET /x#fragment HTTP/1.1\r\nHost: a.test\r\n\r\n",
             "G\tET / HTTP/1.1\r\nHost: a.test\r\n\r\n",
@@ -187,28 +191,61 @@ async fn malformed_response_metadata_never_reaches_the_client() {
             " X-Key: value",
             "Content-Length : 0",
             "X-Key: a\rInjected: value",
+            "Transfer-Encoding: chunked\u{a0}, chunked",
+            "Transfer-Encoding: \u{a0}chunked, chunked",
+            "Transfer-Encoding: chunked\u{a0}\r\nTransfer-Encoding: chunked",
+            "Transfer-Encoding: \u{a0}chunked\r\nTransfer-Encoding: chunked",
         ] {
-            let (listener, address) = backend().await;
-            let upstream = Task(tokio::spawn(async move {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                head(&mut stream).await;
-                stream
-                    .write_all(format!("HTTP/1.1 200 OK\r\n{field}\r\n\r\n").as_bytes())
+            for (method, status) in [("GET", 200), ("HEAD", 200), ("GET", 103), ("GET", 304)] {
+                let (listener, address) = backend().await;
+                let upstream = Task(tokio::spawn(async move {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    head(&mut stream).await;
+                    stream
+                        .write_all(format!("HTTP/1.1 {status} Test\r\n{field}\r\n\r\n").as_bytes())
+                        .await
+                        .unwrap();
+                    Ok(())
+                }));
+                let (mut client, mut task) = session(forward(address), Trie::new(), None);
+                client
+                    .write_all(format!("{method} / HTTP/1.1\r\nHost: a.test\r\n\r\n").as_bytes())
                     .await
                     .unwrap();
-                Ok(())
-            }));
-            let (mut client, mut task) = session(forward(address), Trie::new(), None);
-            client
-                .write_all(b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n")
-                .await
-                .unwrap();
-            assert!(rest(&mut client).await.is_empty());
-            assert!((&mut task.0).await.unwrap().is_err());
-            upstream.finish().await;
+                assert!(rest(&mut client).await.is_empty());
+                assert!((&mut task.0).await.unwrap().is_err());
+                upstream.finish().await;
+            }
         }
     })
     .await;
+}
+
+#[tokio::test]
+async fn quoted_transfer_parameters_survive_request_and_response_forwarding() {
+    checked(async {
+        let coding = "x-dictionary; key=\"A, chunked, B\"; other=\"a;\\\"b\", chunked";
+        let (listener, address) = backend().await;
+        let upstream = Task(tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            assert_eq!(values(&head(&mut stream).await, "transfer-encoding"), [coding]);
+            let mut body = [0; 5];
+            stream.read_exact(&mut body).await.unwrap();
+            assert_eq!(&body, b"0\r\n\r\n");
+            stream.write_all(format!(
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: {coding}\r\nConnection: close\r\n\r\n0\r\n\r\n"
+            ).as_bytes()).await.unwrap();
+            Ok(())
+        }));
+        let (mut client, task) = session(forward(address), Trie::new(), None);
+        client.write_all(format!(
+            "POST / HTTP/1.1\r\nHost: a.test\r\nTransfer-Encoding: {coding}\r\n\r\n0\r\n\r\n"
+        ).as_bytes()).await.unwrap();
+        assert_eq!(values(&head(&mut client).await, "transfer-encoding"), [coding]);
+        assert_eq!(rest(&mut client).await, b"0\r\n\r\n");
+        task.finish().await;
+        upstream.finish().await;
+    }).await;
 }
 
 #[tokio::test]
