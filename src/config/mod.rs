@@ -434,13 +434,24 @@ where
     Ok(paths)
 }
 
-#[derive(Debug, Clone, Copy, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct HttpTimeouts {
-    pub request_header_timeout_secs: Option<std::num::NonZeroU64>,
+    pub request_header_timeout_secs: NoneOrOne<std::num::NonZeroU64>,
     pub response_header_timeout_secs: Option<std::num::NonZeroU64>,
     pub keepalive_idle_timeout_secs: Option<std::num::NonZeroU64>,
     pub local_body_timeout_secs: Option<std::num::NonZeroU64>,
+}
+
+impl Default for HttpTimeouts {
+    fn default() -> Self {
+        Self {
+            request_header_timeout_secs: NoneOrOne::Unspecified,
+            response_header_timeout_secs: None,
+            keepalive_idle_timeout_secs: std::num::NonZeroU64::new(60),
+            local_body_timeout_secs: std::num::NonZeroU64::new(10),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -958,7 +969,7 @@ pub struct ServerTlsConfig {
     pub mode: TlsMode,
 
     #[serde(default)]
-    pub handshake_timeout_secs: Option<std::num::NonZeroU64>,
+    pub handshake_timeout_secs: NoneOrOne<std::num::NonZeroU64>,
 
     #[serde(default, alias = "sni_hostname")]
     pub sni_hostnames: NoneOrSome<SniValue>,
@@ -991,6 +1002,14 @@ pub struct ServerTlsConfig {
 }
 
 impl ServerTlsConfig {
+    pub fn handshake_timeout(&self) -> Option<std::num::NonZeroU64> {
+        self.handshake_timeout_secs.resolve(if self.is_terminate() {
+            std::num::NonZeroU64::new(10)
+        } else {
+            None
+        })
+    }
+
     pub fn is_passthrough(&self) -> bool {
         self.mode == TlsMode::Passthrough
     }
@@ -1003,7 +1022,7 @@ impl ServerTlsConfig {
         // Note: optional flag is now handled by auto-expansion in load_server_configs
         // so we don't validate it here
 
-        if self.is_passthrough() && self.handshake_timeout_secs.is_some() {
+        if self.is_passthrough() && self.handshake_timeout().is_some() {
             return Err("handshake_timeout_secs requires TLS terminate mode".into());
         }
         if self.is_terminate() {

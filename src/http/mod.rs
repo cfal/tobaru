@@ -145,7 +145,9 @@ impl<'a> Session<'a> {
                 }
             }
             with_timeout(
-                self.timeouts.request_header_timeout_secs,
+                self.timeouts
+                    .request_header_timeout_secs
+                    .resolve(std::num::NonZeroU64::new(10)),
                 "HTTP request headers",
                 http_parser::ParsedHttpData::parse(&mut self.stream, reader),
             )

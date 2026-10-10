@@ -392,11 +392,9 @@ pub async fn prepare_tcp_server(
                 let disabled: Vec<_> = [
                     (
                         "request_header_timeout_secs",
-                        http_timeouts.request_header_timeout_secs,
-                    ),
-                    (
-                        "response_header_timeout_secs",
-                        http_timeouts.response_header_timeout_secs,
+                        http_timeouts
+                            .request_header_timeout_secs
+                            .resolve(Some(http2.header_timeout_secs)),
                     ),
                     (
                         "keepalive_idle_timeout_secs",
@@ -404,7 +402,11 @@ pub async fn prepare_tcp_server(
                     ),
                     (
                         "local_body_timeout_secs",
-                        http_timeouts.local_body_timeout_secs,
+                        if http_protocols.http1 {
+                            http_timeouts.local_body_timeout_secs
+                        } else {
+                            Some(http2.body_progress_timeout_secs)
+                        },
                     ),
                 ]
                 .into_iter()
@@ -474,7 +476,7 @@ pub async fn prepare_tcp_server(
                 let tls_mode = if tls_config.is_passthrough() {
                     TlsMode::Passthrough
                 } else {
-                    if tls_config.handshake_timeout_secs.is_none() {
+                    if tls_config.handshake_timeout().is_none() {
                         warn!(
                             "TLS target on {} has no handshake_timeout_secs",
                             server_address
@@ -533,7 +535,7 @@ pub async fn prepare_tcp_server(
 
                 // Create unified TlsTargetData
                 let tls_target_data = Arc::new(TlsTargetData {
-                    handshake_timeout_secs: tls_config.handshake_timeout_secs,
+                    handshake_timeout_secs: tls_config.handshake_timeout(),
                     allow_no_alpn,
                     allow_any_alpn,
                     alpn_protocols,
@@ -1139,12 +1141,11 @@ async fn run_stream_action_with_protocol(
                 let seconds = http
                     .http_timeouts
                     .request_header_timeout_secs
-                    .unwrap_or(http.http2.header_timeout_secs)
-                    .get();
+                    .resolve(Some(http.http2.header_timeout_secs));
                 crate::http::detect::protocol(
                     &mut source_stream,
                     &mut initial_data,
-                    Duration::from_secs(seconds),
+                    seconds.map(|seconds| Duration::from_secs(seconds.get())),
                 )
                 .await?
             } else if http.http_protocols.http2 {
