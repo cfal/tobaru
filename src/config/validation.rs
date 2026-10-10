@@ -402,6 +402,8 @@ mod tests {
             json!({"request_header_timeout_secs":null}),
             json!({"local_body_timeout_secs":null}),
             json!({"local_body_timeout_secs":60}),
+            json!({"upstream_body_progress_timeout_secs":null}),
+            json!({"upstream_body_progress_timeout_secs":17}),
             json!({"request_header_timeout_secs":15, "response_header_timeout_secs":30, "keepalive_idle_timeout_secs":60}),
         ] {
             assert!(config(value).is_ok());
@@ -409,6 +411,7 @@ mod tests {
         for value in [
             json!({"request_header_timeout_secs":0}),
             json!({"local_body_timeout_secs":0}),
+            json!({"upstream_body_progress_timeout_secs":0}),
             json!({"response_header_timeout_secs":-1}),
             json!({"keepalive_idle_timeout_secs":1.5}),
             json!({"typo":1}),
@@ -429,6 +432,7 @@ mod tests {
         assert_eq!(defaults.keepalive_idle_timeout_secs.unwrap().get(), 60);
         assert_eq!(defaults.local_body_timeout_secs.unwrap().get(), 10);
         assert!(defaults.response_header_timeout_secs.is_none());
+        assert!(defaults.upstream_body_progress_timeout_secs.is_none());
         for value in [json!({}), json!({"response_header_timeout_secs":17})] {
             let parsed: super::super::HttpTimeouts = serde_json::from_value(value).unwrap();
             assert_eq!(

@@ -439,6 +439,7 @@ where
 pub struct HttpTimeouts {
     pub request_header_timeout_secs: NoneOrOne<std::num::NonZeroU64>,
     pub response_header_timeout_secs: Option<std::num::NonZeroU64>,
+    pub upstream_body_progress_timeout_secs: Option<std::num::NonZeroU64>,
     pub keepalive_idle_timeout_secs: Option<std::num::NonZeroU64>,
     pub local_body_timeout_secs: Option<std::num::NonZeroU64>,
 }
@@ -448,6 +449,7 @@ impl Default for HttpTimeouts {
         Self {
             request_header_timeout_secs: NoneOrOne::Unspecified,
             response_header_timeout_secs: None,
+            upstream_body_progress_timeout_secs: None,
             keepalive_idle_timeout_secs: std::num::NonZeroU64::new(60),
             local_body_timeout_secs: std::num::NonZeroU64::new(10),
         }

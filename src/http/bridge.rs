@@ -108,6 +108,7 @@ pub(super) struct H1Body<R> {
     chunk_crlf: bool,
     pub done: bool,
     limit: usize,
+    upload: Option<super::upload::Upload>,
 }
 
 impl<R> H1Body<R> {
@@ -120,21 +121,35 @@ impl<R> H1Body<R> {
             chunk_crlf: false,
             done: framing == Framing::Empty,
             limit,
+            upload: None,
         }
     }
 }
 
 #[async_trait]
 impl<R: AsyncRead + Unpin + Send> ReceiveBody for H1Body<R> {
+    fn watch_upload(&mut self, upload: super::upload::Upload) {
+        self.upload = Some(upload);
+    }
+
     async fn next(&mut self) -> io::Result<Option<BodyFrame>> {
         if self.done {
             return Ok(None);
         }
+        if !self.reader.unparsed_data().is_empty() {
+            if let Some(upload) = &self.upload {
+                upload.started();
+            }
+        }
+        let mut io = super::upload::StartedRead {
+            io: &mut self.io,
+            upload: self.upload.as_ref(),
+        };
         if self.framing == Framing::Chunked && self.chunk_remaining == 0 {
-            if self.chunk_crlf && !self.reader.read_line_bytes(&mut self.io).await?.is_empty() {
+            if self.chunk_crlf && !self.reader.read_line_bytes(&mut io).await?.is_empty() {
                 return Err(invalid("Missing chunk terminator"));
             }
-            let line = self.reader.read_line_bytes(&mut self.io).await?;
+            let line = self.reader.read_line_bytes(&mut io).await?;
             let size = line.split(|byte| *byte == b';').next().unwrap();
             if size.is_empty() || !size.iter().all(u8::is_ascii_hexdigit) {
                 return Err(invalid("Invalid chunk size"));
@@ -144,14 +159,13 @@ impl<R: AsyncRead + Unpin + Send> ReceiveBody for H1Body<R> {
                     .map_err(io_error)?;
             self.chunk_crlf = true;
             if self.chunk_remaining == 0 {
-                let trailers = read_fields(&mut self.io, &mut self.reader, self.limit).await?;
+                let trailers = read_fields(&mut io, &mut self.reader, self.limit).await?;
                 message::validate_trailers(&trailers, self.limit)?;
                 self.done = true;
                 return Ok(Some(BodyFrame::Trailers(trailers)));
             }
         }
-        if self.reader.unparsed_data().is_empty() && self.reader.read_more(&mut self.io).await? == 0
-        {
+        if self.reader.unparsed_data().is_empty() && self.reader.read_more(&mut io).await? == 0 {
             if self.framing != Framing::Eof {
                 return Err(invalid("Truncated HTTP body"));
             }

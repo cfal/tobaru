@@ -34,6 +34,7 @@ pub(super) enum BodyFrame {
 
 #[async_trait]
 pub(super) trait ReceiveBody: Send {
+    fn watch_upload(&mut self, _upload: super::upload::Upload) {}
     async fn next(&mut self) -> io::Result<Option<BodyFrame>>;
     fn release(&mut self, _bytes: usize) -> io::Result<()> {
         Ok(())
@@ -83,13 +84,17 @@ impl Activity {
         &self,
         operation: impl std::future::Future<Output = io::Result<T>>,
     ) -> io::Result<T> {
+        let started = tokio::time::Instant::now();
         tokio::pin!(operation);
         loop {
-            let deadline = *self.last.lock() + self.timeout;
+            let last = started.max(*self.last.lock());
+            let deadline = last.checked_add(self.timeout).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "Timeout is too large")
+            })?;
             tokio::select! {
                 result = &mut operation => { self.touch(); return result; }
                 _ = tokio::time::sleep_until(deadline) => {
-                    if tokio::time::Instant::now() >= *self.last.lock() + self.timeout {
+                    if started.max(*self.last.lock()) <= last {
                         return Err(io::Error::new(io::ErrorKind::TimedOut, "HTTP exchange made no progress"));
                     }
                 }
@@ -98,16 +103,52 @@ impl Activity {
     }
 }
 
+pub(super) struct BodyPolicy<'a> {
+    pub activity: &'a Activity,
+    pub upstream_seconds: Option<std::num::NonZeroU64>,
+    pub upload: Option<&'a super::upload::Upload>,
+}
+
+impl BodyPolicy<'_> {
+    async fn read(&self, from: &mut (impl ReceiveBody + ?Sized)) -> io::Result<Option<BodyFrame>> {
+        if let Some(upload) = self.upload {
+            upload.read(self.activity, from.next()).await
+        } else {
+            let result = crate::tokio_util::with_timeout(
+                self.upstream_seconds,
+                "Upstream response body read",
+                from.next(),
+            )
+            .await;
+            self.activity.touch();
+            result
+        }
+    }
+
+    async fn write<T>(
+        &self,
+        operation: impl std::future::Future<Output = io::Result<T>>,
+    ) -> io::Result<T> {
+        if self.upload.is_some() {
+            let result = operation.await;
+            self.activity.touch();
+            result
+        } else {
+            self.activity.wait(operation).await
+        }
+    }
+}
+
 pub(super) async fn copy_body(
     from: &mut (impl ReceiveBody + ?Sized),
     to: &mut (impl SendBody + ?Sized),
     expected: Option<u64>,
-    activity: &Activity,
+    policy: &BodyPolicy<'_>,
     header_limit: usize,
 ) -> io::Result<()> {
     let mut received = 0u64;
     loop {
-        match activity.wait(from.next()).await? {
+        match policy.read(from).await? {
             Some(BodyFrame::Data(data)) => {
                 let len = data.len();
                 received = received
@@ -116,17 +157,17 @@ pub(super) async fn copy_body(
                 if expected.is_some_and(|length| received > length) {
                     return Err(invalid("Body exceeds Content-Length"));
                 }
-                activity.wait(to.data(data)).await?;
+                policy.write(to.data(data)).await?;
                 from.release(len)?;
             }
             Some(BodyFrame::Trailers(trailers)) => {
                 validate_trailers(&trailers, header_limit)?;
                 check_length(expected, received)?;
-                return activity.wait(to.trailers(trailers)).await;
+                return policy.write(to.trailers(trailers)).await;
             }
             None => {
                 check_length(expected, received)?;
-                return activity.wait(to.finish()).await;
+                return policy.write(to.finish()).await;
             }
         }
     }
@@ -428,6 +469,29 @@ pub(super) fn update_request_uri(request: &mut Request<()>, path: &str) -> io::R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn a_new_frontend_wait_gets_a_fresh_budget_after_backend_silence() {
+        let activity = Activity::new(10);
+        tokio::time::advance(Duration::from_secs(100)).await;
+        activity
+            .wait(async {
+                tokio::time::sleep(Duration::from_secs(9)).await;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            activity
+                .wait(std::future::pending::<io::Result<()>>())
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(10));
+    }
 
     #[tokio::test(start_paused = true)]
     async fn duplex_progress_keeps_a_quiet_direction_alive() {
