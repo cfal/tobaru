@@ -229,6 +229,35 @@ async fn initial_bytes_and_segment_routing_are_preserved() {
 }
 
 #[tokio::test]
+async fn duplicate_routing_headers_cannot_fall_through_to_the_default_action() {
+    checked(async {
+        for fields in [
+            "X-Key: wrong\r\nX-Key: secret\r\n",
+            "X-Key: secret\r\nx-key: wrong\r\n",
+            "X-Key: secret\r\nx-key: secret\r\n",
+        ] {
+            let mut paths = Trie::new();
+            let mut matched = route(message("matched"));
+            matched
+                .required_request_headers
+                .insert("x-key".into(), HttpValueMatch::Single("secret".into()));
+            paths.insert("/".into(), vec![matched]);
+            let (mut client, mut task) = session(message("default"), paths, None);
+            client
+                .write_all(format!("GET / HTTP/1.1\r\nHost: a.test\r\n{fields}\r\n").as_bytes())
+                .await
+                .unwrap();
+            assert!(rest(&mut client).await.is_empty());
+            let error = (&mut task.0).await.unwrap().unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("Multiple fields for required request header"));
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn forward_rewrites_patches_and_correlates_ids() {
     checked(async {
         let (listener, address) = backend().await;

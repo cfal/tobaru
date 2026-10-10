@@ -1,9 +1,11 @@
+use super::header_map::HeaderMap;
 use super::http_parser;
 use super::string_util::path_prefix_matches;
 use crate::config::HttpValueMatch;
 use crate::hostname_util::{matches_host_header, strip_host_port, validate_host_header};
 use crate::tcp::{TargetHttpActionData, TargetHttpPathData};
 use radix_trie::{Trie, TrieCommon};
+use std::collections::HashMap;
 
 pub(super) fn find_matching_action<'a>(
     path_configs: &'a Trie<String, Vec<TargetHttpPathData>>,
@@ -12,7 +14,12 @@ pub(super) fn find_matching_action<'a>(
     request_data: &http_parser::ParsedHttpData,
 ) -> std::io::Result<(&'a str, &'a TargetHttpActionData)> {
     find_matching_headers(path_configs, default_action, request_path, |key| {
-        Ok(request_data.headers().get(key).map(String::as_str))
+        single_required_header(
+            key,
+            request_data.headers().fields()
+                .filter(|(name, _)| name.eq_ignore_ascii_case(key))
+                .map(|(_, value)| Ok(value)),
+        )
     })
 }
 
@@ -43,14 +50,7 @@ pub(super) fn find_matching_headers<'a, 'h>(
             continue;
         }
         for path_config in t.value().unwrap().iter() {
-            let mut matched = true;
-            for (key, rule) in &path_config.required_request_headers {
-                if !matches_http_value(rule, header(key)?)? {
-                    matched = false;
-                    break;
-                }
-            }
-            if !matched {
+            if !has_required_headers(&header, &path_config.required_request_headers)? {
                 continue;
             }
             return Ok((key, &path_config.http_action));
@@ -59,6 +59,30 @@ pub(super) fn find_matching_headers<'a, 'h>(
     }
 
     Ok(("/", default_action))
+}
+
+pub(super) fn single_required_header<'h>(
+    key: &str,
+    mut values: impl Iterator<Item = std::io::Result<&'h str>>,
+) -> std::io::Result<Option<&'h str>> {
+    let value = values.next().transpose()?;
+    if values.next().is_some() {
+        return Err(std::io::Error::other(format!(
+            "Multiple fields for required request header: {key}"
+        )));
+    }
+    Ok(value)
+}
+
+fn has_required_headers<'h>(
+    header: impl Fn(&str) -> std::io::Result<Option<&'h str>>,
+    required: &HashMap<String, HttpValueMatch>,
+) -> std::io::Result<bool> {
+    let mut matches = true;
+    for (key, rule) in required.iter() {
+        matches &= matches_http_value(rule, header(key)?)?;
+    }
+    Ok(matches)
 }
 
 /// Checks whether a header value matches an `HttpValueMatch` rule.
@@ -85,6 +109,46 @@ pub fn matches_http_value(rule: &HttpValueMatch, value: Option<&str>) -> std::io
 mod tests {
     use super::matches_http_value;
     use crate::config::HttpValueMatch;
+
+    #[test]
+    fn required_headers_reject_duplicates_in_either_order() {
+        use super::*;
+        use crate::http::header_map::Headers;
+        let required = HashMap::from([
+            ("x-key".into(), HttpValueMatch::Single("secret".into())),
+            ("x-other".into(), HttpValueMatch::Any),
+        ]);
+        let matches = |headers: &Headers| {
+            has_required_headers(
+                |key| single_required_header(
+                    key,
+                    headers.fields()
+                        .filter(|(name, _)| name.eq_ignore_ascii_case(key))
+                        .map(|(_, value)| Ok(value)),
+                ),
+                &required,
+            )
+        };
+        for values in [
+            ["wrong", "secret"],
+            ["secret", "wrong"],
+            ["secret", "secret"],
+        ] {
+            let mut headers = Headers::default();
+            for value in values {
+                headers.append("X-Key".into(), value.into());
+            }
+            assert!(matches(&headers).is_err());
+        }
+        let mut headers = Headers::default();
+        headers.append("x-key".into(), "secret".into());
+        assert!(!matches(&headers).unwrap());
+        headers.append("x-other".into(), "present".into());
+        assert!(matches(&headers).unwrap());
+        headers.append("unrelated".into(), "one".into());
+        headers.append("unrelated".into(), "two".into());
+        assert!(matches(&headers).unwrap());
+    }
 
     #[test]
     fn any_variant() {

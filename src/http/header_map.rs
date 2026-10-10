@@ -11,15 +11,6 @@ impl Headers {
         self.0.push((name.to_ascii_lowercase(), value));
     }
 
-    pub fn get(&self, name: &str) -> Option<&String> {
-        // Routing previously used the last occurrence of a repeated field.
-        self.0
-            .iter()
-            .rev()
-            .find(|(key, _)| key.eq_ignore_ascii_case(name))
-            .map(|(_, value)| value)
-    }
-
     pub fn insert(&mut self, name: String, value: String) {
         self.remove_header(&name);
         self.append(name, value);
