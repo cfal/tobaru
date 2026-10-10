@@ -11,6 +11,22 @@ pub fn create_message(data: &ParsedHttpData) -> String {
 }
 
 pub fn update_base_path(request_path: &str, base_path: &str, new_base_path: &str) -> String {
+    let suffix_start = request_path.find(['?', '#']).unwrap_or(request_path.len());
+    let (path, suffix) = request_path.split_at(suffix_start);
+    let mut rewritten = replace_path_prefix(path, base_path, new_base_path);
+    rewritten.push_str(suffix);
+    rewritten
+}
+
+pub(super) fn path_prefix_matches(path: &str, prefix: &str) -> bool {
+    let path = path.split(['?', '#']).next().unwrap();
+    path == prefix.strip_suffix('/').unwrap_or(prefix)
+        || path.strip_prefix(prefix).is_some_and(|suffix| {
+            suffix.is_empty() || prefix.ends_with('/') || suffix.starts_with('/')
+        })
+}
+
+fn replace_path_prefix(request_path: &str, base_path: &str, new_base_path: &str) -> String {
     // if the request path is the base path, just return the new base path.
     // it's possible that base path has a trailing slash (eg /a/), while the request path is
     // /a, so check with starts_with.
@@ -48,6 +64,19 @@ pub fn update_base_path(request_path: &str, base_path: &str, new_base_path: &str
             new_path
         }
     }
+}
+
+#[test]
+fn query_and_fragment_are_not_path_segments() {
+    assert_eq!(update_base_path("/a?x=/a", "/a/", "/v1"), "/v1?x=/a");
+    assert_eq!(update_base_path("/a/?x=1", "/a", "/v1"), "/v1/?x=1");
+    assert_eq!(update_base_path("/a#part", "/a/", "/v1"), "/v1#part");
+    for path in ["/a", "/a/", "/a/x", "/a?x=1", "/a#part"] {
+        assert!(path_prefix_matches(path, "/a"));
+        assert!(path_prefix_matches(path, "/a/"));
+    }
+    assert!(!path_prefix_matches("/abc", "/a"));
+    assert!(!path_prefix_matches("/abc?x=/a", "/a"));
 }
 
 #[test]

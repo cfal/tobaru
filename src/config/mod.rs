@@ -391,9 +391,29 @@ pub struct HttpTcpActionConfig {
     pub http2: Box<Http2Config>,
     #[serde(default)]
     pub http_timeouts: HttpTimeouts,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_http_paths")]
     pub http_paths: HashMap<String, OneOrSome<HttpPathConfig>>,
     pub default_http_action: HttpPathAction,
+}
+
+fn deserialize_http_paths<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<String, OneOrSome<HttpPathConfig>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let paths = HashMap::<String, OneOrSome<HttpPathConfig>>::deserialize(deserializer)?;
+    for path in paths.keys() {
+        if !path.starts_with('/')
+            || path.contains(['?', '#'])
+            || path.chars().any(|c| c.is_whitespace() || c.is_control())
+        {
+            return Err(serde::de::Error::custom(format!(
+                "http_paths key must be an absolute path without a query, fragment, whitespace or control characters: {path:?}"
+            )));
+        }
+    }
+    Ok(paths)
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]

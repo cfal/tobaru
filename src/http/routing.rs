@@ -1,4 +1,5 @@
 use super::http_parser;
+use super::string_util::path_prefix_matches;
 use crate::config::HttpValueMatch;
 use crate::hostname_util::{matches_host_header, strip_host_port, validate_host_header};
 use crate::tcp::{TargetHttpActionData, TargetHttpPathData};
@@ -21,6 +22,9 @@ pub(super) fn find_matching_headers<'a, 'h>(
     request_path: &str,
     header: impl Fn(&str) -> std::io::Result<Option<&'h str>>,
 ) -> std::io::Result<(&'a str, &'a TargetHttpActionData)> {
+    let request_path = request_path
+        .split_once('?')
+        .map_or(request_path, |(path, _)| path);
     let mut lookup_path;
     let lookup = if request_path.ends_with('/') {
         request_path
@@ -30,9 +34,14 @@ pub(super) fn find_matching_headers<'a, 'h>(
         lookup_path.push('/');
         &lookup_path
     };
-    let matching_configs = path_configs.get_ancestor(lookup);
-
-    if let Some(t) = matching_configs {
+    let mut lookup = lookup;
+    while let Some(t) = path_configs.get_ancestor(lookup) {
+        let key = t.key().unwrap();
+        if !path_prefix_matches(request_path, key) {
+            // A byte-prefix sibling must not hide a valid parent route.
+            lookup = &key[..=key.rfind('/').unwrap()];
+            continue;
+        }
         for path_config in t.value().unwrap().iter() {
             let mut matched = true;
             for (key, rule) in &path_config.required_request_headers {
@@ -44,8 +53,9 @@ pub(super) fn find_matching_headers<'a, 'h>(
             if !matched {
                 continue;
             }
-            return Ok((t.key().unwrap(), &path_config.http_action));
+            return Ok((key, &path_config.http_action));
         }
+        break;
     }
 
     Ok(("/", default_action))

@@ -248,6 +248,28 @@ mod tests {
     }
 
     #[test]
+    fn http_route_keys_are_paths_not_request_targets() {
+        for path in ["", "api", "/api?x=1", "/api#x", "/a b", "/a\r\n"] {
+            let config = json!({"default_http_action":"close", "http_paths":{
+                path:{"http_action":"close"}
+            }});
+            assert!(
+                serde_json::from_value::<super::super::HttpTcpActionConfig>(config).is_err(),
+                "{path:?}"
+            );
+        }
+        for path in ["/", "/api", "/api/", "/a%20b"] {
+            let config = json!({"default_http_action":"close", "http_paths":{
+                path:{"http_action":"close"}
+            }});
+            assert!(
+                serde_json::from_value::<super::super::HttpTcpActionConfig>(config).is_ok(),
+                "{path:?}"
+            );
+        }
+    }
+
+    #[test]
     fn configured_http_metadata_cannot_inject_wire_lines() {
         for value in [
             json!({"type":"serve-message", "status_code":200, "status_message":"OK\r\nx-injected: yes"}),

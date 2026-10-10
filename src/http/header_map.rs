@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use super::string_util::update_base_path;
+use super::string_util::{path_prefix_matches, update_base_path};
 use crate::config::HttpHeaderPatch;
 
 #[derive(Default)]
@@ -111,7 +111,9 @@ pub trait HeaderMap {
     fn update_path_headers(&mut self, base_path: &str, target_base_path: &Option<String>) {
         if let Some(prefix) = target_base_path {
             let location = self.header_values("location").last().map(str::to_owned);
-            if let Some(location) = location.filter(|location| location.starts_with(prefix)) {
+            if let Some(location) =
+                location.filter(|location| path_prefix_matches(location, prefix))
+            {
                 self.set_header(
                     "location".into(),
                     update_base_path(&location, prefix, base_path),
@@ -171,6 +173,24 @@ impl HeaderMap for HashMap<String, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn redirect_rewriting_respects_path_boundaries() {
+        use super::HeaderMap;
+        for (location, expected) in [
+            ("/internal/next", "/public/next"),
+            ("/internal?x=1", "/public?x=1"),
+            ("/internal-other", "/internal-other"),
+            (
+                "https://example.com/internal",
+                "https://example.com/internal",
+            ),
+        ] {
+            let mut headers =
+                std::collections::HashMap::from([("location".into(), location.into())]);
+            headers.update_path_headers("/public", &Some("/internal".into()));
+            assert_eq!(headers["location"], expected);
+        }
+    }
     use super::*;
     use crate::config::HttpPathAction;
     use crate::tcp::TargetHttpActionData;

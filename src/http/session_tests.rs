@@ -188,12 +188,16 @@ async fn local_message_and_head_preserve_headers_and_ids() {
 }
 
 #[tokio::test]
-async fn initial_bytes_and_raw_routing_semantics_are_preserved() {
+async fn initial_bytes_and_segment_routing_are_preserved() {
     checked(async {
         for (target, expected) in [
-            ("/prefix-extra", "prefix"),
+            ("/prefix-extra", "default"),
+            ("/prefix", "prefix"),
+            ("/prefix?x=1", "prefix"),
+            ("/prefix/x", "prefix"),
             ("/segment", "segment"),
-            ("/segment?x=1", "default"),
+            ("/segment?x=1", "segment"),
+            ("/parent/childishly/x", "parent"),
             ("/parent/child/x", "default"),
         ] {
             let mut paths = Trie::new();
@@ -205,6 +209,7 @@ async fn initial_bytes_and_raw_routing_semantics_are_preserved() {
                 .required_request_headers
                 .insert("x-key".into(), HttpValueMatch::Single("secret".into()));
             paths.insert("/parent/child/".into(), vec![child]);
+            paths.insert("/parent/childish".into(), vec![route(message("sibling"))]);
             let raw = format!("GET {target} HTTP/1.1\r\nHost: a.test\r\n\r\n");
             let (mut client, task) = session(
                 message("default"),
