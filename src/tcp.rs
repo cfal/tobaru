@@ -1,9 +1,7 @@
-use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet};
-use std::hash::{BuildHasher, Hash};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use futures::join;
 use ip_network_table_deps_treebitmap::IpLookupTable;
@@ -32,6 +30,8 @@ use crate::tokio_util::resolve_host;
 
 #[cfg(test)]
 mod protocol_tests;
+#[cfg(test)]
+mod security_tests;
 
 pub struct TargetLocationData {
     pub location: Location,
@@ -255,24 +255,19 @@ struct TlsTargetData {
     pub handshake_timeout_secs: Option<std::num::NonZeroU64>,
     pub allow_no_alpn: bool,
     pub allow_any_alpn: bool,
-    pub alpn_protocol_hashes: HashSet<u64>,
+    pub alpn_protocols: HashSet<Vec<u8>>,
     pub ip_lookup_table: IpLookupTable<Ipv6Addr, bool>,
     pub tls_mode: TlsMode,
     pub target_data: Arc<TargetData>,
 }
 
-fn hash_alpn<T: Hash>(x: T) -> u64 {
-    static ALPN_HASHER: OnceLock<RandomState> = OnceLock::new();
-    ALPN_HASHER.get_or_init(RandomState::new).hash_one(x)
-}
-
-/// Parse ALPN configuration into flags and hashes (common for both modes)
+/// Parse ALPN configuration into flags and exact protocol identifiers.
 fn parse_alpn_config(
     alpn_protocols: &crate::config::NoneOrSome<AlpnValue>,
-) -> (bool, bool, HashSet<u64>) {
+) -> (bool, bool, HashSet<Vec<u8>>) {
     let mut allow_no_alpn = false;
     let mut allow_any_alpn = false;
-    let mut alpn_protocol_hashes = HashSet::new();
+    let mut protocols = HashSet::new();
 
     let alpn_list = if alpn_protocols.is_empty() {
         vec![AlpnValue::Any, AlpnValue::None]
@@ -285,12 +280,12 @@ fn parse_alpn_config(
             AlpnValue::None => allow_no_alpn = true,
             AlpnValue::Any => allow_any_alpn = true,
             AlpnValue::Specified(s) => {
-                alpn_protocol_hashes.insert(hash_alpn(s.as_bytes()));
+                protocols.insert(s.into_bytes());
             }
         }
     }
 
-    (allow_no_alpn, allow_any_alpn, alpn_protocol_hashes)
+    (allow_no_alpn, allow_any_alpn, protocols)
 }
 
 /// Build rustls configs for terminate mode
@@ -467,7 +462,7 @@ pub async fn prepare_tcp_server(
                 }
 
                 // Parse ALPN configuration (common for both modes)
-                let (allow_no_alpn, allow_any_alpn, alpn_protocol_hashes) =
+                let (allow_no_alpn, allow_any_alpn, alpn_protocols) =
                     parse_alpn_config(&tls_config.alpn_protocols);
 
                 // Build mode-specific TLS configuration
@@ -536,7 +531,7 @@ pub async fn prepare_tcp_server(
                     handshake_timeout_secs: tls_config.handshake_timeout_secs,
                     allow_no_alpn,
                     allow_any_alpn,
-                    alpn_protocol_hashes,
+                    alpn_protocols,
                     ip_lookup_table: config_lookup_table,
                     tls_mode,
                     target_data: target_data.clone(),
@@ -689,12 +684,12 @@ pub async fn prepare_tcp_server(
     })
 }
 
-/// Resolves SNI candidates and computes ALPN hashes from a parsed ClientHello.
+/// Resolves SNI candidates from a parsed ClientHello.
 fn resolve_tls_candidates<'a>(
     parsed: &crate::tls_parser::ParsedClientHello,
     sni_trie: &'a DomainTrie<Vec<Arc<TlsTargetData>>>,
     no_sni_targets: &'a [Arc<TlsTargetData>],
-) -> Option<(&'a [Arc<TlsTargetData>], HashSet<u64>)> {
+) -> Option<&'a [Arc<TlsTargetData>]> {
     let candidates = match &parsed.server_name {
         Some(hostname) => sni_trie.lookup(hostname)?,
         None => {
@@ -705,21 +700,18 @@ fn resolve_tls_candidates<'a>(
         }
     };
 
-    let alpn_hashes: HashSet<u64> = parsed
-        .alpn_protocols
-        .iter()
-        .map(|s| hash_alpn(s.as_bytes()))
-        .collect();
-
-    Some((candidates, alpn_hashes))
+    Some(candidates)
 }
 
 /// Returns true if the candidate matches the client's ALPN offer.
-fn alpn_matches(candidate: &TlsTargetData, alpn_hashes: &HashSet<u64>) -> bool {
-    if alpn_hashes.is_empty() {
+fn alpn_matches(candidate: &TlsTargetData, protocols: &[Vec<u8>]) -> bool {
+    if protocols.is_empty() {
         candidate.allow_no_alpn
     } else {
-        !alpn_hashes.is_disjoint(&candidate.alpn_protocol_hashes) || candidate.allow_any_alpn
+        protocols
+            .iter()
+            .any(|p| candidate.alpn_protocols.contains(p))
+            || candidate.allow_any_alpn
     }
 }
 
@@ -730,7 +722,7 @@ fn find_matching_terminate_target(
     sni_trie: &DomainTrie<Vec<Arc<TlsTargetData>>>,
     no_sni_targets: &[Arc<TlsTargetData>],
 ) -> Option<(Arc<TlsTargetData>, Arc<rustls::ServerConfig>)> {
-    let (candidates, alpn_hashes) = resolve_tls_candidates(parsed, sni_trie, no_sni_targets)?;
+    let candidates = resolve_tls_candidates(parsed, sni_trie, no_sni_targets)?;
 
     for candidate in candidates {
         let (alpn_tls_config, no_alpn_tls_config) = match &candidate.tls_mode {
@@ -746,11 +738,15 @@ fn find_matching_terminate_target(
         }
 
         // Select the appropriate rustls config based on ALPN match type
-        if alpn_hashes.is_empty() {
+        if parsed.alpn_protocols.is_empty() {
             if candidate.allow_no_alpn {
                 return Some((candidate.clone(), no_alpn_tls_config.clone()));
             }
-        } else if !alpn_hashes.is_disjoint(&candidate.alpn_protocol_hashes) {
+        } else if parsed
+            .alpn_protocols
+            .iter()
+            .any(|p| candidate.alpn_protocols.contains(p))
+        {
             return Some((candidate.clone(), alpn_tls_config.clone()));
         } else if candidate.allow_any_alpn {
             return Some((candidate.clone(), no_alpn_tls_config.clone()));
@@ -776,7 +772,16 @@ fn feed_server_connection(
                 format!("Failed to feed server connection: {e}"),
             )
         })?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "TLS replay made no progress",
+            ));
+        }
         i += n;
+        server_conn
+            .process_new_packets()
+            .map_err(std::io::Error::other)?;
     }
     Ok(())
 }
@@ -852,7 +857,7 @@ fn find_matching_passthrough_target(
     sni_trie: &DomainTrie<Vec<Arc<TlsTargetData>>>,
     no_sni_targets: &[Arc<TlsTargetData>],
 ) -> Option<Arc<TlsTargetData>> {
-    let (candidates, alpn_hashes) = resolve_tls_candidates(parsed, sni_trie, no_sni_targets)?;
+    let candidates = resolve_tls_candidates(parsed, sni_trie, no_sni_targets)?;
 
     for candidate in candidates {
         if !matches!(candidate.tls_mode, TlsMode::Passthrough) {
@@ -861,7 +866,7 @@ fn find_matching_passthrough_target(
         if candidate.ip_lookup_table.longest_match(ip).is_none() {
             continue;
         }
-        if alpn_matches(candidate, &alpn_hashes) {
+        if alpn_matches(candidate, &parsed.alpn_protocols) {
             return Some(candidate.clone());
         }
     }
@@ -942,7 +947,7 @@ async fn handle_passthrough_stream(
     copy_result.map(|_| ())
 }
 
-/// Falls back to non-TLS handling when ClientHello parsing fails or times out.
+/// Replay plaintext, including any bytes read ahead during protocol detection.
 async fn fallback_to_non_tls(
     stream: TcpStream,
     addr: &std::net::SocketAddr,
@@ -978,7 +983,7 @@ async fn process_tls_stream(
     let parsed = match parse_timeout.await {
         Ok(Ok(parsed)) => parsed,
         Ok(Err(e)) => {
-            if let Some(non_tls_data) = non_tls_data {
+            if let Some(non_tls_data) = non_tls_data.filter(|_| !reader.starts_with_tls()) {
                 debug!(
                     "Failed to parse TLS ClientHello from {}: {}, trying non-TLS target",
                     addr, e
@@ -988,7 +993,7 @@ async fn process_tls_stream(
             return Err(e);
         }
         Err(elapsed) => {
-            if let Some(non_tls_data) = non_tls_data {
+            if let Some(non_tls_data) = non_tls_data.filter(|_| !reader.starts_with_tls()) {
                 warn!(
                     "TLS ClientHello parse timed out for {}, assuming non-TLS connection",
                     addr
@@ -1001,15 +1006,6 @@ async fn process_tls_stream(
             ));
         }
     };
-
-    if let Some(ref sni) = parsed.server_name {
-        crate::hostname_util::validate_sni_hostname(sni).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("Invalid SNI from {}: {:?} ({})", addr, sni, e),
-            )
-        })?;
-    }
 
     debug!(
         "Parsed ClientHello from {} - SNI: {:?}, ALPN: {:?}",
@@ -1315,6 +1311,12 @@ mod tests {
         .unwrap();
         let mut hello = Vec::new();
         client_tls.write_tls(&mut hello).unwrap();
+        let mut fragmented = Vec::new();
+        for payload in hello[5..].chunks(7) {
+            fragmented.extend([0x16, 3, 3]);
+            fragmented.extend((payload.len() as u16).to_be_bytes());
+            fragmented.extend(payload);
+        }
         let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
         let address: SocketAddr = ([127, 0, 0, 1], listener.local_addr().unwrap().port()).into();
         let (client, accepted) = tokio::join!(TcpStream::connect(address), listener.accept());
@@ -1324,7 +1326,7 @@ mod tests {
             handshake_timeout_secs: std::num::NonZeroU64::new(1),
             allow_no_alpn: true,
             allow_any_alpn: true,
-            alpn_protocol_hashes: HashSet::new(),
+            alpn_protocols: HashSet::new(),
             ip_lookup_table: IpLookupTable::new(),
             tls_mode: TlsMode::Terminate {
                 alpn_tls_config: tls_config.clone(),
@@ -1339,7 +1341,7 @@ mod tests {
                 },
             }),
         });
-        let error = handle_terminate_with_parsed(server, &peer, hello, target, tls_config)
+        let error = handle_terminate_with_parsed(server, &peer, fragmented, target, tls_config)
             .await
             .err()
             .unwrap();
