@@ -165,6 +165,23 @@ impl HeaderMap for HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn root_redirect_rewriting_preserves_empty_path_references() {
+        use super::HeaderMap;
+        for (location, expected) in [
+            ("?step=2", "?step=2"),
+            ("#section", "#section"),
+            ("", ""),
+            ("/next?step=2", "/public/next?step=2"),
+            ("/?step=2", "/public/?step=2"),
+        ] {
+            let mut headers =
+                std::collections::HashMap::from([("location".into(), location.into())]);
+            headers.update_path_headers("/public/", &Some("/".into()));
+            assert_eq!(headers["location"], expected);
+        }
+    }
+
+    #[test]
     fn redirect_rewriting_respects_path_boundaries() {
         use super::HeaderMap;
         for (location, expected) in [

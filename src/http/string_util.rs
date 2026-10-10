@@ -20,6 +20,9 @@ pub fn update_base_path(request_path: &str, base_path: &str, new_base_path: &str
 
 pub(super) fn path_prefix_matches(path: &str, prefix: &str) -> bool {
     let path = path.split(['?', '#']).next().unwrap();
+    if path.is_empty() {
+        return false;
+    }
     path == prefix.strip_suffix('/').unwrap_or(prefix)
         || path.strip_prefix(prefix).is_some_and(|suffix| {
             suffix.is_empty() || prefix.ends_with('/') || suffix.starts_with('/')
