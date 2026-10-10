@@ -300,7 +300,7 @@ impl IpMaskSelection {
                     let ip_masks = groups.get(group_name.as_str()).ok_or_else(|| {
                         std::io::Error::new(
                             std::io::ErrorKind::InvalidInput,
-                            format!("No such ip group: {}", group_name),
+                            format!("Unknown IP group or invalid IP/CIDR address: {group_name}"),
                         )
                     })?;
                     ret.extend(ip_masks.iter().cloned().map(IpMaskSelection::Literal));
@@ -1489,7 +1489,7 @@ pub async fn load_url(config_url: &str) -> std::io::Result<ServerConfig> {
             )
         })?;
 
-    match url.scheme() {
+    let config = match url.scheme() {
         "tcp" => {
             let mut locations = vec![];
 
@@ -1589,12 +1589,42 @@ pub async fn load_url(config_url: &str) -> std::io::Result<ServerConfig> {
             std::io::ErrorKind::InvalidInput,
             format!("Unknown URL scheme: {}", unknown_scheme),
         )),
+    }?;
+    if !address.ip().to_canonical().is_loopback() {
+        warn!(
+            "URL shortcut on {} allows all source addresses with built-in firewall rules disabled",
+            address
+        );
     }
+    Ok(config)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn group_errors_include_invalid_addresses_without_banning_group_names() {
+        for name in ["missing", "127.0.0.1/33", "127.0.0.999"] {
+            let mut selection: OneOrSome<IpMaskSelection> =
+                serde_json::from_value(serde_json::json!(name)).unwrap();
+            let error =
+                IpMaskSelection::replace_groups(&mut selection, &HashMap::new()).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!("Unknown IP group or invalid IP/CIDR address: {name}")
+            );
+            let groups = HashMap::from([(
+                name.to_owned(),
+                vec![IpMask::try_from("127.0.0.1").unwrap()],
+            )]);
+            IpMaskSelection::replace_groups(&mut selection, &groups).unwrap();
+            assert!(matches!(
+                selection.iter().next().unwrap(),
+                IpMaskSelection::Literal(_)
+            ));
+        }
+    }
 
     #[tokio::test]
     async fn url_queries_are_decoded_once_and_reject_invalid_utf8() {
