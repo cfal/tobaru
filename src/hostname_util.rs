@@ -86,21 +86,43 @@ pub fn validate_sni_hostname(hostname: &str) -> std::io::Result<()> {
 
 /// Strips the port suffix from a Host header value.
 /// Handles bracketed IPv6 (e.g. "[::1]:8080" -> "[::1]").
-pub fn strip_host_port(host: &str) -> &str {
-    if let Some(bracket_end) = host.rfind(']') {
-        match host[bracket_end + 1..].find(':') {
-            Some(offset) => &host[..bracket_end + 1 + offset],
-            None => host,
-        }
-    } else if let Some(colon) = host.rfind(':') {
-        if host[colon + 1..].bytes().all(|b| b.is_ascii_digit()) {
-            &host[..colon]
+pub fn strip_host_port(host: &str) -> std::io::Result<&str> {
+    let (hostname, port) = if host.starts_with('[') {
+        let end = host
+            .find(']')
+            .ok_or_else(|| std::io::Error::other("Unclosed IPv6 Host header"))?;
+        host[1..end]
+            .parse::<std::net::Ipv6Addr>()
+            .map_err(std::io::Error::other)?;
+        let suffix = &host[end + 1..];
+        let port = if suffix.is_empty() {
+            None
         } else {
-            host
-        }
+            Some(
+                suffix
+                    .strip_prefix(':')
+                    .ok_or_else(|| std::io::Error::other("Invalid IPv6 Host suffix"))?,
+            )
+        };
+        (&host[..=end], port)
     } else {
-        host
+        let (hostname, port) = host
+            .split_once(':')
+            .map_or((host, None), |(hostname, port)| (hostname, Some(port)));
+        if hostname.contains(['[', ']']) {
+            return Err(std::io::Error::other("Invalid Host header brackets"));
+        }
+        (hostname, port)
+    };
+    if let Some(port) = port {
+        if !port.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(std::io::Error::other("Invalid Host header port"));
+        }
+        if !port.is_empty() {
+            port.parse::<u16>().map_err(std::io::Error::other)?;
+        }
     }
+    Ok(hostname)
 }
 
 /// Matches a hostname from an HTTP Host header against a domain pattern.
@@ -611,88 +633,98 @@ mod tests {
 
         #[test]
         fn plain_hostname() {
-            assert_eq!(strip_host_port("example.com"), "example.com");
+            assert_eq!(strip_host_port("example.com").unwrap(), "example.com");
         }
 
         #[test]
         fn hostname_with_port() {
-            assert_eq!(strip_host_port("example.com:8080"), "example.com");
+            assert_eq!(strip_host_port("example.com:8080").unwrap(), "example.com");
         }
 
         #[test]
         fn hostname_with_default_port() {
-            assert_eq!(strip_host_port("example.com:443"), "example.com");
+            assert_eq!(strip_host_port("example.com:443").unwrap(), "example.com");
         }
 
         #[test]
         fn ipv4_with_port() {
-            assert_eq!(strip_host_port("192.168.1.1:80"), "192.168.1.1");
+            assert_eq!(strip_host_port("192.168.1.1:80").unwrap(), "192.168.1.1");
         }
 
         #[test]
         fn ipv4_without_port() {
-            assert_eq!(strip_host_port("192.168.1.1"), "192.168.1.1");
+            assert_eq!(strip_host_port("192.168.1.1").unwrap(), "192.168.1.1");
         }
 
         #[test]
         fn bracketed_ipv6_with_port() {
-            assert_eq!(strip_host_port("[::1]:8080"), "[::1]");
+            assert_eq!(strip_host_port("[::1]:8080").unwrap(), "[::1]");
         }
 
         #[test]
         fn bracketed_ipv6_without_port() {
-            assert_eq!(strip_host_port("[::1]"), "[::1]");
+            assert_eq!(strip_host_port("[::1]").unwrap(), "[::1]");
         }
 
         #[test]
         fn empty_string() {
-            assert_eq!(strip_host_port(""), "");
+            assert_eq!(strip_host_port("").unwrap(), "");
         }
 
         #[test]
         fn colon_only() {
             // ":8080" -- no hostname, colon at start
-            assert_eq!(strip_host_port(":8080"), "");
+            assert_eq!(strip_host_port(":8080").unwrap(), "");
         }
 
         #[test]
         fn trailing_colon_no_port() {
-            // "example.com:" -- colon but empty port (all-digit check on empty is true)
-            assert_eq!(strip_host_port("example.com:"), "example.com");
+            assert_eq!(strip_host_port("example.com:").unwrap(), "example.com");
         }
 
         #[test]
         fn non_numeric_port() {
-            // Not a valid port, so colon is kept (could be IPv6 without brackets)
-            assert_eq!(strip_host_port("example.com:abc"), "example.com:abc");
+            assert!(strip_host_port("example.com:abc").is_err());
         }
 
         #[test]
         fn port_with_spaces() {
-            assert_eq!(strip_host_port("example.com: 80"), "example.com: 80");
+            assert!(strip_host_port("example.com: 80").is_err());
         }
 
         #[test]
         fn multiple_colons_not_bracketed() {
-            // Bare IPv6 without brackets -- rfind(':') finds the last colon, "1" is digits
-            assert_eq!(strip_host_port("::1"), ":");
+            assert!(strip_host_port("::1").is_err());
         }
 
         #[test]
         fn bracketed_ipv6_full() {
-            assert_eq!(strip_host_port("[2001:db8::1]:443"), "[2001:db8::1]");
+            assert_eq!(
+                strip_host_port("[2001:db8::1]:443").unwrap(),
+                "[2001:db8::1]"
+            );
         }
 
         #[test]
         fn trailing_dot_with_port() {
-            assert_eq!(strip_host_port("example.com.:8080"), "example.com.");
+            assert_eq!(
+                strip_host_port("example.com.:8080").unwrap(),
+                "example.com."
+            );
         }
 
         #[test]
         fn unmatched_bracket() {
-            // No closing bracket, so rfind(':') finds the last colon in the
-            // IPv6 address; "1" is all-digits so it looks like a port.
-            assert_eq!(strip_host_port("[::1"), "[:");
+            for host in [
+                "[::1",
+                "::1]",
+                "[bad]:443",
+                "[::1]extra:443",
+                "[::1]:bad",
+                "host:65536",
+            ] {
+                assert!(strip_host_port(host).is_err(), "{host}");
+            }
         }
     }
 

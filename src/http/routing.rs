@@ -96,7 +96,7 @@ pub fn matches_http_value(rule: &HttpValueMatch, value: Option<&str>) -> std::io
         }
         HttpValueMatch::Hostnames(patterns) => match value {
             Some(v) => {
-                let hostname = strip_host_port(v);
+                let hostname = strip_host_port(v)?;
                 validate_host_header(hostname)?;
                 Ok(patterns.iter().any(|p| matches_host_header(hostname, p)))
             }
@@ -234,6 +234,24 @@ mod tests {
     fn empty_host_header() {
         let m = HttpValueMatch::Hostnames(vec!["example.com".into()]);
         assert!(matches_http_value(&m, Some("")).is_err());
+    }
+
+    #[test]
+    fn wildcard_hosts_do_not_accept_malformed_authorities() {
+        let rule = HttpValueMatch::Hostnames(vec!["*".into()]);
+        for host in [
+            "::1",
+            "[::1",
+            "[::1]:abc",
+            "[::1]suffix:443",
+            "host:65536",
+            "host:abc",
+        ] {
+            assert!(matches_http_value(&rule, Some(host)).is_err(), "{host}");
+        }
+        for host in ["[::1]", "[::1]:443", "example.com", "example.com:443"] {
+            assert!(matches_http_value(&rule, Some(host)).unwrap(), "{host}");
+        }
     }
 
     #[test]
