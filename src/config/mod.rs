@@ -422,6 +422,7 @@ pub struct HttpTimeouts {
     pub request_header_timeout_secs: Option<std::num::NonZeroU64>,
     pub response_header_timeout_secs: Option<std::num::NonZeroU64>,
     pub keepalive_idle_timeout_secs: Option<std::num::NonZeroU64>,
+    pub local_body_timeout_secs: Option<std::num::NonZeroU64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]

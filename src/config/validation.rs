@@ -407,12 +407,15 @@ mod tests {
         for value in [
             json!({}),
             json!({"request_header_timeout_secs":null}),
+            json!({"local_body_timeout_secs":null}),
+            json!({"local_body_timeout_secs":60}),
             json!({"request_header_timeout_secs":15, "response_header_timeout_secs":30, "keepalive_idle_timeout_secs":60}),
         ] {
             assert!(config(value).is_ok());
         }
         for value in [
             json!({"request_header_timeout_secs":0}),
+            json!({"local_body_timeout_secs":0}),
             json!({"response_header_timeout_secs":-1}),
             json!({"keepalive_idle_timeout_secs":1.5}),
             json!({"typo":1}),
@@ -422,6 +425,7 @@ mod tests {
         let config: super::super::HttpTcpActionConfig =
             serde_json::from_value(json!({"default_http_action":"close"})).unwrap();
         assert!(config.http_timeouts.request_header_timeout_secs.is_none());
+        assert!(config.http_timeouts.local_body_timeout_secs.is_none());
     }
 
     #[test]

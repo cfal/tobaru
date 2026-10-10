@@ -389,6 +389,34 @@ pub async fn prepare_tcp_server(
                 let http_protocols = HttpProtocols::resolve(http_protocols, server_tls.as_mut())?;
                 let http2 = *http2;
                 http2.validate()?;
+                let disabled: Vec<_> = [
+                    (
+                        "request_header_timeout_secs",
+                        http_timeouts.request_header_timeout_secs,
+                    ),
+                    (
+                        "response_header_timeout_secs",
+                        http_timeouts.response_header_timeout_secs,
+                    ),
+                    (
+                        "keepalive_idle_timeout_secs",
+                        http_timeouts.keepalive_idle_timeout_secs,
+                    ),
+                    (
+                        "local_body_timeout_secs",
+                        http_timeouts.local_body_timeout_secs,
+                    ),
+                ]
+                .into_iter()
+                .filter_map(|(name, timeout)| timeout.is_none().then_some(name))
+                .collect();
+                if !disabled.is_empty() {
+                    warn!(
+                        "HTTP target on {} has disabled http_timeouts: {}",
+                        server_address,
+                        disabled.join(", ")
+                    );
+                }
                 let mut path_configs = Trie::new();
                 for (path, path_config_vec) in http_paths {
                     let path_data_vec = path_config_vec
@@ -446,6 +474,12 @@ pub async fn prepare_tcp_server(
                 let tls_mode = if tls_config.is_passthrough() {
                     TlsMode::Passthrough
                 } else {
+                    if tls_config.handshake_timeout_secs.is_none() {
+                        warn!(
+                            "TLS target on {} has no handshake_timeout_secs",
+                            server_address
+                        );
+                    }
                     // Terminate mode: load certs and build rustls configs
                     let cert = tls_config.cert.as_ref().unwrap();
                     let key = tls_config.key.as_ref().unwrap();

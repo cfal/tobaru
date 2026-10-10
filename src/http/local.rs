@@ -11,6 +11,7 @@ use super::header_map::HeaderMap;
 use super::header_tuple::HeaderTuple;
 use super::{string_util, Outcome, Request, Session};
 use crate::tcp::TargetHttpActionData;
+use crate::tokio_util::with_timeout;
 use crate::util::{allocate_vec, write_all};
 
 impl Session<'_> {
@@ -34,7 +35,12 @@ impl Session<'_> {
                 request.verb, request.path
             );
         } else {
-            drain_request(&mut self.stream, request.data).await?;
+            with_timeout(
+                self.timeouts.local_body_timeout_secs,
+                "HTTP local request body",
+                drain_request(&mut self.stream, request.data),
+            )
+            .await?;
             let mut response = format!("HTTP/1.1 {}", status_code);
             if let Some(message) = status_message {
                 response.push(' ');
@@ -99,7 +105,14 @@ impl Session<'_> {
             write_all(&mut self.stream, b"HTTP/1.1 417 Expectation Failed\r\nConnection: close\r\nContent-Length: 0\r\n\r\n").await?;
             return Ok(Outcome::Close);
         }
-        self.reader = Some(drain_request(&mut self.stream, request.data).await?);
+        self.reader = Some(
+            with_timeout(
+                self.timeouts.local_body_timeout_secs,
+                "HTTP local request body",
+                drain_request(&mut self.stream, request.data),
+            )
+            .await?,
+        );
         let canonical_path = match resolve_file(path, &file_path).await {
             Ok(path) => path,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
