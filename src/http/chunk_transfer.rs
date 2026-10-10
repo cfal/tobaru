@@ -12,6 +12,7 @@ use crate::util::write_all;
 // TODO: is that enough?
 const CHUNK_SIZE_LINE_MAX_LEN: usize = 10 + 64;
 const TRAILER_HEADER_LEN: usize = 4096;
+const TRAILER_MAX_BYTES: usize = 65536;
 
 fn validate_extensions(mut bytes: &[u8]) -> std::io::Result<()> {
     let invalid =
@@ -62,6 +63,8 @@ pub struct ChunkTransfer {
     state: ChunkTransferState,
     read_size_buf: Vec<u8>,
     trailer_header_buf: [u8; TRAILER_HEADER_LEN],
+    trailer_fields: usize,
+    trailer_bytes: usize,
     #[cfg(test)]
     trailer_headers: HashMap<String, String>,
 }
@@ -87,6 +90,8 @@ impl ChunkTransfer {
             state: ChunkTransferState::ReadSize { cached_len: 0 },
             read_size_buf: Vec::with_capacity(CHUNK_SIZE_LINE_MAX_LEN),
             trailer_header_buf: [0u8; TRAILER_HEADER_LEN],
+            trailer_fields: 0,
+            trailer_bytes: 0,
             #[cfg(test)]
             trailer_headers: HashMap::new(),
         }
@@ -292,6 +297,16 @@ impl ChunkTransfer {
                             start_offset += used_len;
 
                             if i > 0 {
+                                self.trailer_fields += 1;
+                                self.trailer_bytes += trailer_line_len;
+                                if self.trailer_fields > super::message::MAX_FIELDS
+                                    || self.trailer_bytes > TRAILER_MAX_BYTES
+                                {
+                                    return Err(std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
+                                        "HTTP trailers exceed field or byte limit",
+                                    ));
+                                }
                                 // Process the trailer header line (content before CRLF)
                                 let trailer_header_str =
                                     match std::str::from_utf8(&self.trailer_header_buf[0..i]) {
@@ -398,6 +413,45 @@ mod tests {
     use std::time::Duration;
     use tokio::io::{AsyncWriteExt, BufWriter};
     use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn trailer_field_and_byte_limits_apply_before_forwarding_the_excess_field() {
+        for accepted in [
+            "x: y\r\n".repeat(super::super::message::MAX_FIELDS),
+            format!("x:{}\r\n", "y".repeat(TRAILER_HEADER_LEN - 4)).repeat(16),
+        ] {
+            for excess in [false, true] {
+                let prefix = format!("0\r\n{accepted}");
+                let input = format!("{prefix}{}\r\n", if excess { "extra: no\r\n" } else { "" });
+                for chunk_size in [1, 17, 4096, input.len()] {
+                    for forward in [false, true] {
+                        let mut transfer = ChunkTransfer::new();
+                        let mut written = Vec::new();
+                        let mut output = forward.then_some(&mut written);
+                        let mut result = Ok(0);
+                        for chunk in input.as_bytes().chunks(chunk_size) {
+                            result = transfer.run_prefix(chunk, &mut output).await;
+                            if result.is_err() {
+                                break;
+                            }
+                        }
+                        assert_eq!(result.is_err(), excess);
+                        assert_eq!(transfer.is_done(), !excess);
+                        if forward {
+                            assert_eq!(
+                                written,
+                                if excess {
+                                    prefix.as_bytes()
+                                } else {
+                                    input.as_bytes()
+                                }
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[tokio::test]
     async fn prefix_transfer_retains_next_message_and_validates_terminators() {
