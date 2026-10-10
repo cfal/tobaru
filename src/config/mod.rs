@@ -356,11 +356,21 @@ pub enum TargetConfigs {
         targets: Box<OneOrSome<TcpTargetConfig>>,
     },
     Udp {
-        #[serde(default)]
+        #[serde(default = "default_udp_max_associations")]
         udp_max_associations: Option<std::num::NonZeroUsize>,
+        #[serde(default = "default_udp_queue_capacity")]
+        udp_queue_capacity: std::num::NonZeroU16,
         #[serde(alias = "target")]
         targets: OneOrSome<UdpTargetConfig>,
     },
+}
+
+fn default_udp_max_associations() -> Option<std::num::NonZeroUsize> {
+    std::num::NonZeroUsize::new(128)
+}
+
+fn default_udp_queue_capacity() -> std::num::NonZeroU16 {
+    std::num::NonZeroU16::new(8).unwrap()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1539,7 +1549,8 @@ pub async fn load_url(config_url: &str) -> std::io::Result<ServerConfig> {
                 address,
                 use_iptables: false,
                 target_configs: TargetConfigs::Udp {
-                    udp_max_associations: None,
+                    udp_max_associations: default_udp_max_associations(),
+                    udp_queue_capacity: default_udp_queue_capacity(),
                     targets: OneOrSome::One(udp_target_config),
                 },
             })
@@ -1643,6 +1654,23 @@ mod tests {
             panic!("expected TCP targets");
         };
         assert_eq!(targets.into_vec().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn udp_urls_use_the_same_finite_resource_defaults() {
+        let server = load_url("udp://127.0.0.1:9000?target=127.0.0.1:9001")
+            .await
+            .unwrap();
+        let TargetConfigs::Udp {
+            udp_max_associations,
+            udp_queue_capacity,
+            ..
+        } = server.target_configs
+        else {
+            panic!("UDP expected");
+        };
+        assert_eq!(udp_max_associations.unwrap().get(), 128);
+        assert_eq!(udp_queue_capacity.get(), 8);
     }
 
     fn deser_path_config(yaml: &str) -> HttpPathConfig {
