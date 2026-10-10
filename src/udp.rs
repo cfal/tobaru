@@ -1,7 +1,7 @@
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU16, NonZeroUsize};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -30,12 +30,14 @@ struct UdpTargetData {
     addresses: Vec<NetLocation>,
     next_address_index: AtomicUsize,
     association_timeout_secs: u32,
+    queue_capacity: NonZeroU16,
 }
 
 pub fn prepare_udp_server(
     server_address: SocketAddr,
     use_iptables: bool,
     max_associations: Option<NonZeroUsize>,
+    queue_capacity: NonZeroU16,
     target_configs: Vec<UdpTargetConfig>,
     mut stop: oneshot::Receiver<()>,
 ) -> std::io::Result<impl std::future::Future<Output = std::io::Result<()>> + Send> {
@@ -71,6 +73,7 @@ pub fn prepare_udp_server(
             addresses: addresses.into_vec(),
             next_address_index: AtomicUsize::new(0),
             association_timeout_secs,
+            queue_capacity,
         });
 
         for IpMask(addr, masklen) in allowlist.into_iter().map(IpMaskSelection::unwrap_literal) {
@@ -211,6 +214,7 @@ fn forward_packet(
                 server_socket.clone(),
                 target_address.clone(),
                 target_data.association_timeout_secs,
+                target_data.queue_capacity,
                 tasks,
             ))
         }
@@ -256,12 +260,13 @@ impl Association {
         server_socket: Arc<UdpSocket>,
         target_address: NetLocation,
         timeout_secs: u32,
+        queue_capacity: NonZeroU16,
         tasks: &mut JoinSet<()>,
     ) -> Self {
         let last_active = Arc::new(Mutex::new(Instant::now()));
         let cloned_last_active = last_active.clone();
 
-        let (tx, rx) = channel::<Box<[u8]>>(1024);
+        let (tx, rx) = channel::<Box<[u8]>>(usize::from(queue_capacity.get()));
         let join_handle = tasks.spawn(async move {
             if let Err(e) = run_forward_tasks(
                 client_address,
@@ -355,6 +360,66 @@ async fn run_forward_tasks(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn configured_packet_budget_bounds_bursts_before_tasks_can_drain() {
+        let server = Arc::new(UdpSocket::bind("0.0.0.0:0").await.unwrap());
+        let target = UdpTargetData {
+            addresses: vec![NetLocation::try_from("127.0.0.1:9").unwrap()],
+            next_address_index: AtomicUsize::new(0),
+            association_timeout_secs: 200,
+            queue_capacity: NonZeroU16::new(8).unwrap(),
+        };
+        let mut associations = HashMap::new();
+        let mut tasks = JoinSet::new();
+        let cap = NonZeroUsize::new(128);
+        for port in 1..=129 {
+            let client = SocketAddr::from(([127, 0, 0, 1], port));
+            forward_packet(
+                &mut associations,
+                cap,
+                client,
+                &server,
+                &target,
+                b"first",
+                &mut tasks,
+            )
+            .unwrap();
+        }
+        assert_eq!(associations.len(), 128);
+        assert_eq!(tasks.len(), 128);
+        let client = SocketAddr::from(([127, 0, 0, 1], 1));
+        let packet = vec![0; MAX_UDP_PACKET_SIZE];
+        for _ in 1..8 {
+            forward_packet(
+                &mut associations,
+                cap,
+                client,
+                &server,
+                &target,
+                &packet,
+                &mut tasks,
+            )
+            .unwrap();
+        }
+        assert!(forward_packet(
+            &mut associations,
+            cap,
+            client,
+            &server,
+            &target,
+            &packet,
+            &mut tasks
+        )
+        .is_err());
+        assert_eq!(associations[&client].tx.capacity(), 0);
+        assert_eq!(associations[&client].tx.max_capacity(), 8);
+        // Capacity is reserved before copying, including while DNS/setup has not run.
+        assert_eq!(128 * 8 * MAX_UDP_PACKET_SIZE, 64 * 1024 * 1024);
+        drop(associations);
+        tasks.shutdown().await;
+        assert!(tasks.is_empty());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn cleanup_uses_monotonic_idle_time_and_removes_closed_queues() {
         let mut tasks = JoinSet::new();
@@ -441,6 +506,7 @@ mod tests {
             .unwrap()],
             next_address_index: AtomicUsize::new(0),
             association_timeout_secs: 5,
+            queue_capacity: NonZeroU16::new(8).unwrap(),
         };
         let mut associations = HashMap::new();
         let mut tasks = JoinSet::new();
