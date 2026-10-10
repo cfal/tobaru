@@ -195,7 +195,11 @@ impl<'a> Session<'a> {
                 return Err(io::Error::other("Invalid upstream protocol upgrade"));
             }
             write_head(&mut self.stream, &response).await?;
-            info!("[http] {} {} [forward-ws]", request.verb, request.path);
+            info!(
+                "[http] {} {} [forward-ws]",
+                request.verb,
+                string_util::log_path(&request.path)
+            );
             return Ok(Outcome::Tunnel(target.stream, response.into_reader()));
         }
 
@@ -231,7 +235,11 @@ impl<'a> Session<'a> {
                 reader = &mut drain => reader?,
             }
         };
-        info!("[http] {} {} [forward]", request.verb, request.path);
+        info!(
+            "[http] {} {} [forward]",
+            request.verb,
+            string_util::log_path(&request.path)
+        );
         if close {
             if upload_complete {
                 let _ = target.stream.try_shutdown().await;
