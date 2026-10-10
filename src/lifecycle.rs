@@ -131,7 +131,10 @@ fn watch_configs(config_paths: &[String]) -> io::Result<(ConfigWatcher, Receiver
     Ok((watcher, rx))
 }
 
-async fn prepare(configs: Vec<ServerConfig>) -> io::Result<Vec<PreparedServer>> {
+async fn prepare(
+    configs: Vec<ServerConfig>,
+    admissions: &mut tcp::Admissions,
+) -> io::Result<Vec<PreparedServer>> {
     let mut tasks = Vec::new();
     let mut listeners = HashSet::new();
     for config in configs {
@@ -147,6 +150,7 @@ async fn prepare(configs: Vec<ServerConfig>) -> io::Result<Vec<PreparedServer>> 
         let (stop, stopped) = oneshot::channel();
         let task: ServerTask = match target_configs {
             TargetConfigs::Tcp {
+                tcp_max_connections,
                 tcp_nodelay,
                 tcp_keepalive,
                 targets,
@@ -157,6 +161,8 @@ async fn prepare(configs: Vec<ServerConfig>) -> io::Result<Vec<PreparedServer>> 
                     tcp_nodelay,
                     tcp_keepalive,
                     targets.into_vec(),
+                    tcp_max_connections,
+                    admissions.for_listener(address),
                 )
                 .await?;
                 Box::pin(async move {
@@ -231,7 +237,8 @@ pub async fn run(
         return Ok(());
     }
     let mut firewall = firewall_addresses(&configs);
-    let tasks = prepare(configs).await?;
+    let mut admissions = tcp::Admissions::default();
+    let tasks = prepare(configs, &mut admissions).await?;
     if quick == Some(QuickAction::DryRun) {
         info!("Dry run complete");
         return Ok(());
@@ -258,7 +265,7 @@ pub async fn run(
                 return Err(io::Error::other("No server configs found"));
             }
             let firewall = firewall_addresses(&configs);
-            Ok::<_, io::Error>((prepare(configs).await?, firewall))
+            Ok::<_, io::Error>((prepare(configs, &mut admissions).await?, firewall))
         })
         .await?;
         let (tasks, new_firewall) = match replacement {
@@ -429,8 +436,57 @@ mod tests {
             serde_json::json!({"address":"127.0.0.1:1", "transport":"tcp", "target":{"allowlist":"127.0.0.1", "server_tls":{"mode":"passthrough"}, "protocol":"http", "default_http_action":"close"}}),
         ] {
             let config = serde_json::from_value(value).unwrap();
-            assert!(prepare(vec![config]).await.is_err());
+            assert!(prepare(vec![config], &mut tcp::Admissions::default())
+                .await
+                .is_err());
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tcp_reload_keeps_active_connections_in_the_admission_budget() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::{TcpListener, TcpStream};
+        async fn connect(address: SocketAddr) -> TcpStream {
+            loop {
+                match TcpStream::connect(address).await {
+                    Ok(stream) => return stream,
+                    Err(_) => sleep(Duration::from_millis(5)).await,
+                }
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let backend = TcpListener::bind("0.0.0.0:0").await.unwrap();
+            let reservation = TcpListener::bind("0.0.0.0:0").await.unwrap();
+            let bound = reservation.local_addr().unwrap();
+            let address = SocketAddr::from(([127, 0, 0, 1], bound.port()));
+            drop(reservation);
+            let config: ServerConfig = serde_json::from_value(serde_json::json!({
+                "address":bound.to_string(), "transport":"tcp", "tcp_max_connections":1,
+                "target":{"allowlist":"127.0.0.1/32", "location":format!("127.0.0.1:{}", backend.local_addr().unwrap().port())}
+            })).unwrap();
+            let mut admissions = tcp::Admissions::default();
+            let mut servers = JoinSet::new();
+            let stops = start_servers(prepare(vec![config.clone()], &mut admissions).await.unwrap(), &mut servers);
+            let first_client = connect(address).await;
+            let (first_backend, _) = backend.accept().await.unwrap();
+            stop_servers(stops, &mut servers).await.unwrap();
+            let stops = start_servers(prepare(vec![config], &mut admissions).await.unwrap(), &mut servers);
+            let mut rejected = connect(address).await;
+            assert!(matches!(rejected.read(&mut [0]).await, Ok(0) | Err(_)));
+            assert!(tokio::time::timeout(Duration::from_millis(30), backend.accept()).await.is_err());
+            drop(first_client);
+            drop(first_backend);
+            let mut clients = Vec::new();
+            let accepted = loop {
+                clients.push(connect(address).await);
+                if let Ok(accepted) = tokio::time::timeout(Duration::from_millis(10), backend.accept()).await {
+                    break accepted.unwrap();
+                }
+            };
+            drop(clients);
+            drop(accepted);
+            stop_servers(stops, &mut servers).await.unwrap();
+        }).await.expect("TCP admission/reload timed out");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -448,7 +504,7 @@ mod tests {
             })).unwrap();
             let mut servers = JoinSet::new();
             for round in 0..3 {
-                let stops = start_servers(prepare(vec![config.clone()]).await.unwrap(), &mut servers);
+                let stops = start_servers(prepare(vec![config.clone()], &mut tcp::Admissions::default()).await.unwrap(), &mut servers);
                 let mut clients = Vec::new();
                 let mut bytes = [0; 16];
                 for index in 0..24 {

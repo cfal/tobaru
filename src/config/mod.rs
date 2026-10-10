@@ -350,6 +350,8 @@ where
 #[serde(tag = "transport", rename_all = "lowercase")]
 pub enum TargetConfigs {
     Tcp {
+        #[serde(default = "default_tcp_max_connections")]
+        tcp_max_connections: Option<std::num::NonZeroUsize>,
         #[serde(default = "default_true")]
         tcp_nodelay: bool,
         #[serde(default)]
@@ -369,6 +371,10 @@ pub enum TargetConfigs {
 
 fn default_udp_max_associations() -> Option<std::num::NonZeroUsize> {
     std::num::NonZeroUsize::new(128)
+}
+
+fn default_tcp_max_connections() -> Option<std::num::NonZeroUsize> {
+    std::num::NonZeroUsize::new(256)
 }
 
 fn default_udp_queue_capacity() -> std::num::NonZeroU16 {
@@ -1511,6 +1517,7 @@ pub async fn load_url(config_url: &str) -> std::io::Result<ServerConfig> {
                 address,
                 use_iptables: false,
                 target_configs: TargetConfigs::Tcp {
+                    tcp_max_connections: default_tcp_max_connections(),
                     tcp_nodelay: true,
                     tcp_keepalive: TcpKeepaliveOption::default(),
                     targets: Box::new(OneOrSome::One(tcp_target_config)),
