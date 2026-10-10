@@ -33,7 +33,7 @@ pub(super) fn find_matching_headers<'a, 'h>(
         .split_once('?')
         .map_or(request_path, |(path, _)| path);
     let mut lookup_path;
-    let lookup = if request_path.ends_with('/') {
+    let mut lookup = if request_path.ends_with('/') {
         request_path
     } else {
         lookup_path = String::with_capacity(request_path.len() + 1);
@@ -41,19 +41,18 @@ pub(super) fn find_matching_headers<'a, 'h>(
         lookup_path.push('/');
         &lookup_path
     };
-    let mut lookup = lookup;
-    while let Some(t) = path_configs.get_ancestor(lookup) {
-        let key = t.key().unwrap();
-        if !path_prefix_matches(request_path, key) {
+    while let Some(candidate) = path_configs.get_ancestor(lookup) {
+        let route_path = candidate.key().unwrap();
+        if !path_prefix_matches(request_path, route_path) {
             // A byte-prefix sibling must not hide a valid parent route.
-            lookup = &key[..=key.rfind('/').unwrap()];
+            lookup = &route_path[..=route_path.rfind('/').unwrap()];
             continue;
         }
-        for path_config in t.value().unwrap().iter() {
+        for path_config in candidate.value().unwrap().iter() {
             if !has_required_headers(&header, &path_config.required_request_headers)? {
                 continue;
             }
-            return Ok((key, &path_config.http_action));
+            return Ok((route_path, &path_config.http_action));
         }
         break;
     }
@@ -80,7 +79,10 @@ fn has_required_headers<'h>(
 ) -> std::io::Result<bool> {
     let mut matches = true;
     for (key, rule) in required.iter() {
-        matches &= matches_http_value(rule, header(key)?)?;
+        // Keep checking after a mismatch so every predicate rejects duplicate fields.
+        if !matches_http_value(rule, header(key)?)? {
+            matches = false;
+        }
     }
     Ok(matches)
 }

@@ -18,7 +18,7 @@ fn framing(headers: &impl HeaderMap, is_response: bool) -> std::io::Result<Frami
     for value in headers.header_values("transfer-encoding") {
         codings.extend(parse_transfer_codings(value)?);
     }
-    if !codings.is_empty() {
+    if let Some(last_coding) = codings.last() {
         if length.is_some() {
             return Err(std::io::Error::other("Ambiguous HTTP body framing"));
         }
@@ -26,7 +26,7 @@ fn framing(headers: &impl HeaderMap, is_response: bool) -> std::io::Result<Frami
             .iter()
             .filter(|coding| coding.eq_ignore_ascii_case("chunked"))
             .count();
-        if chunked_count == 1 && codings.last().unwrap().eq_ignore_ascii_case("chunked") {
+        if chunked_count == 1 && last_coding.eq_ignore_ascii_case("chunked") {
             return Ok(Framing::Chunked);
         }
         if chunked_count != 0 || !is_response {
@@ -62,6 +62,32 @@ fn take_transfer_token<'a>(value: &mut &'a str) -> std::io::Result<&'a str> {
     Ok(token)
 }
 
+fn consume_transfer_parameter(value: &mut &str) -> std::io::Result<()> {
+    take_transfer_token(value)?;
+    *value = value
+        .strip_prefix('=')
+        .ok_or_else(invalid_transfer_coding)?
+        .trim_start_matches([' ', '\t']);
+    if !value.starts_with('"') {
+        take_transfer_token(value)?;
+        return Ok(());
+    }
+
+    // Commas and escaped quotes inside parameters are not list delimiters.
+    let bytes = value.as_bytes();
+    let mut end = 1;
+    loop {
+        match bytes.get(end) {
+            Some(b'"') => break,
+            Some(b'\\') if end + 1 < bytes.len() => end += 2,
+            Some(b'\\') | None => return Err(invalid_transfer_coding()),
+            Some(_) => end += 1,
+        }
+    }
+    *value = value[end + 1..].trim_start_matches([' ', '\t']);
+    Ok(())
+}
+
 fn parse_transfer_codings(mut value: &str) -> std::io::Result<Vec<&str>> {
     if !is_field_value(value.as_bytes()) {
         return Err(invalid_transfer_coding());
@@ -74,27 +100,7 @@ fn parse_transfer_codings(mut value: &str) -> std::io::Result<Vec<&str>> {
                 return Err(invalid_transfer_coding());
             }
             value = rest;
-            take_transfer_token(&mut value)?;
-            value = value
-                .strip_prefix('=')
-                .ok_or_else(invalid_transfer_coding)?
-                .trim_start_matches([' ', '\t']);
-            if value.starts_with('"') {
-                // Commas and escaped quotes inside parameters are not list delimiters.
-                let bytes = value.as_bytes();
-                let mut end = 1;
-                loop {
-                    match bytes.get(end) {
-                        Some(b'"') => break,
-                        Some(b'\\') if end + 1 < bytes.len() => end += 2,
-                        Some(b'\\') | None => return Err(invalid_transfer_coding()),
-                        Some(_) => end += 1,
-                    }
-                }
-                value = value[end + 1..].trim_start_matches([' ', '\t']);
-            } else {
-                take_transfer_token(&mut value)?;
-            }
+            consume_transfer_parameter(&mut value)?;
         }
         codings.push(coding);
         if value.is_empty() {
