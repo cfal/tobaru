@@ -300,11 +300,16 @@ async fn read_response<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     client: &mut W,
     mut reader: LineReader,
 ) -> io::Result<ParsedHttpData> {
+    let mut informational = 0;
     loop {
-        let response = ParsedHttpData::parse(target, reader).await?;
+        let response = ParsedHttpData::parse_response(target, reader).await?;
         let status = response.response_status()?;
         if status >= 200 || status == 101 {
             return Ok(response);
+        }
+        informational += 1;
+        if informational > super::message::MAX_INFORMATIONAL_RESPONSES {
+            return Err(io::Error::other("Too many informational responses"));
         }
         response_framing(response.headers(), "GET", status)?;
         write_head(client, &response).await?;
@@ -317,6 +322,21 @@ async fn read_response<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 mod tests {
     use super::*;
     use crate::http::header_map::Headers;
+
+    #[tokio::test]
+    async fn informational_responses_are_bounded_before_forwarding_excess_heads() {
+        let interim = "HTTP/1.1 103 Early Hints\r\n\r\n";
+        for count in [16, 17] {
+            let wire = format!(
+                "{}HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n",
+                interim.repeat(count)
+            );
+            let mut output = Vec::new();
+            let result = read_response(&mut wire.as_bytes(), &mut output, LineReader::new()).await;
+            assert_eq!(result.is_ok(), count == 16);
+            assert_eq!(output, interim.repeat(16).as_bytes());
+        }
+    }
 
     #[test]
     fn upgrade_names_ignore_case_but_versions_do_not() {
