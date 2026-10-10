@@ -86,6 +86,30 @@ impl TryFrom<&str> for IpMask {
     }
 }
 
+impl std::fmt::Display for IpMask {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}/{}", self.0, self.1)
+    }
+}
+
+impl<'de> Deserialize<'de> for IpMask {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::de::Deserializer<'de>,
+    {
+        let mask_str = String::deserialize(deserializer)?;
+
+        let mask = mask_str.as_str().try_into().map_err(|_| {
+            serde::de::Error::invalid_value(
+                serde::de::Unexpected::Other("invalid ip mask"),
+                &"invalid ip mask",
+            )
+        })?;
+
+        Ok(mask)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,30 +174,5 @@ mod tests {
             target.allowlist,
             OneOrSome::One(IpMaskSelection::Group(_))
         ));
-    }
-}
-
-impl std::fmt::Display for IpMask {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        // Use `self.number` to refer to each positional data point.
-        write!(f, "{}/{}", self.0, self.1)
-    }
-}
-
-impl<'de> Deserialize<'de> for IpMask {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::de::Deserializer<'de>,
-    {
-        let mask_str = String::deserialize(deserializer)?;
-
-        let mask = mask_str.as_str().try_into().map_err(|_| {
-            serde::de::Error::invalid_value(
-                serde::de::Unexpected::Other("invalid ip mask"),
-                &"invalid ip mask",
-            )
-        })?;
-
-        Ok(mask)
     }
 }

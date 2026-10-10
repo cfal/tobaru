@@ -559,7 +559,7 @@ impl Http2Config {
 #[derive(Debug, Clone)]
 pub enum TcpAction {
     Raw(RawTcpActionConfig),
-    Http(HttpTcpActionConfig),
+    Http(Box<HttpTcpActionConfig>),
 }
 
 impl<'de> Deserialize<'de> for TcpAction {
@@ -597,7 +597,7 @@ impl<'de> Deserialize<'de> for TcpAction {
             "http" => {
                 let config = HttpTcpActionConfig::deserialize(serde_json::Value::Object(map))
                     .map_err(serde::de::Error::custom)?;
-                Ok(TcpAction::Http(config))
+                Ok(TcpAction::Http(Box::new(config)))
             }
             _ => Err(serde::de::Error::unknown_variant(
                 protocol,

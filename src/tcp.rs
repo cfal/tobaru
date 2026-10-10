@@ -379,13 +379,14 @@ pub async fn prepare_tcp_server(
                     .collect::<std::io::Result<_>>()?,
                 next_address_index: AtomicUsize::new(0),
             },
-            TcpAction::Http(HttpTcpActionConfig {
-                http_protocols,
-                http2,
-                http_timeouts,
-                http_paths,
-                default_http_action,
-            }) => {
+            TcpAction::Http(config) => {
+                let HttpTcpActionConfig {
+                    http_protocols,
+                    http2,
+                    http_timeouts,
+                    http_paths,
+                    default_http_action,
+                } = *config;
                 let http_protocols = HttpProtocols::resolve(http_protocols, server_tls.as_mut())?;
                 let http2 = *http2;
                 http2.validate()?;
