@@ -50,12 +50,19 @@ impl TryFrom<&str> for IpMask {
                     let masklen = if masklen_str.is_empty() {
                         128
                     } else {
-                        96 + masklen_str.parse::<u32>().map_err(|e| {
+                        let prefix = masklen_str.parse::<u32>().map_err(|e| {
                             std::io::Error::new(
                                 std::io::ErrorKind::InvalidInput,
                                 format!("could not parse ipv4 mask length: {}", e),
                             )
-                        })?
+                        })?;
+                        if prefix > 32 {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                format!("invalid ipv4 mask length (max 32): {prefix}"),
+                            ));
+                        }
+                        96 + prefix
                     };
                     (i.to_ipv6_mapped(), masklen)
                 }
@@ -76,6 +83,73 @@ impl TryFrom<&str> for IpMask {
         }
 
         Ok(Self(addr, masklen))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ip_network_table_deps_treebitmap::IpLookupTable;
+
+    #[test]
+    fn ipv4_prefixes_are_validated_before_mapping() {
+        for prefix in ["33", "128", "4294967200", "4294967295", "4294967296"] {
+            let input = format!("127.0.0.1/{prefix}");
+            assert!(IpMask::try_from(input.as_str()).is_err(), "{input}");
+            assert!(serde_json::from_value::<IpMask>(serde_json::json!(input)).is_err());
+        }
+        for (input, expected) in [
+            ("127.0.0.1", 128),
+            ("127.0.0.1/", 128),
+            ("127.0.0.1/32", 128),
+            ("127.0.0.1/0", 96),
+            ("127.0.0.1/24", 120),
+            ("::1", 128),
+            ("::1/0", 0),
+            ("::1/128", 128),
+        ] {
+            assert_eq!(IpMask::try_from(input).unwrap().1, expected, "{input}");
+        }
+        assert!(IpMask::try_from("::1/129").is_err());
+    }
+
+    #[test]
+    fn mapped_ipv4_prefixes_do_not_admit_unrelated_addresses() {
+        for (input, peer, expected) in [
+            ("127.0.0.1/32", "127.0.0.1", true),
+            ("127.0.0.1/32", "203.0.113.42", false),
+            ("127.0.0.1/0", "203.0.113.42", true),
+            ("127.0.0.1/0", "::1", false),
+        ] {
+            let IpMask(address, prefix) = IpMask::try_from(input).unwrap();
+            let mut table = IpLookupTable::new();
+            table.insert(address, prefix, ());
+            let peer = peer
+                .parse::<Ipv6Addr>()
+                .unwrap_or_else(|_| peer.parse::<Ipv4Addr>().unwrap().to_ipv6_mapped());
+            assert_eq!(table.longest_match(peer).is_some(), expected);
+        }
+    }
+
+    #[test]
+    fn invalid_prefixes_cannot_be_resolved_as_literal_allowlists_or_groups() {
+        use crate::config::{IpMaskGroupConfig, IpMaskSelection, OneOrSome, TcpTargetConfig};
+        let invalid = "127.0.0.1/4294967200";
+        let mut target: TcpTargetConfig = serde_json::from_value(serde_json::json!({
+            "allowlist": invalid, "location": "127.0.0.1:80"
+        }))
+        .unwrap();
+        let groups = std::collections::HashMap::new();
+        assert!(IpMaskSelection::replace_groups(&mut target.allowlist, &groups).is_err());
+        let mut group: IpMaskGroupConfig = serde_json::from_value(serde_json::json!({
+            "group": "clients", "ip_mask": invalid
+        }))
+        .unwrap();
+        assert!(IpMaskSelection::replace_groups(&mut group.ip_masks, &groups).is_err());
+        assert!(matches!(
+            target.allowlist,
+            OneOrSome::One(IpMaskSelection::Group(_))
+        ));
     }
 }
 
