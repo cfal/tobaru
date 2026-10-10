@@ -28,6 +28,9 @@ use crate::rustls_util::{
 };
 use crate::tokio_util::resolve_host;
 
+mod admission;
+pub(crate) use admission::{Admission, Admissions};
+
 #[cfg(test)]
 mod protocol_tests;
 #[cfg(test)]
@@ -334,6 +337,8 @@ pub async fn prepare_tcp_server(
     tcp_nodelay: bool,
     tcp_keepalive: TcpKeepaliveOption,
     target_configs: Vec<TcpTargetConfig>,
+    max_connections: Option<std::num::NonZeroUsize>,
+    admission: Arc<Admission>,
 ) -> std::io::Result<impl std::future::Future<Output = std::io::Result<()>> + Send> {
     let (generation, retired) = tokio::sync::watch::channel(());
     let mut non_tls_lookup_table: IpLookupTable<Ipv6Addr, Arc<TargetData>> = IpLookupTable::new();
@@ -632,6 +637,11 @@ pub async fn prepare_tcp_server(
                 continue;
             }
 
+            let Some(permit) = admission.try_acquire(max_connections) else {
+                debug!("TCP connection limit reached on {}", server_address);
+                continue;
+            };
+
             if tcp_nodelay {
                 if let Err(e) = stream.set_nodelay(true) {
                     error!("Failed to set tcp_nodelay on server stream: {}", e);
@@ -653,6 +663,7 @@ pub async fn prepare_tcp_server(
                 let cloned_sni_trie = sni_trie.clone();
                 let cloned_no_sni = no_sni_targets.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     if let Err(e) = process_tls_stream(
                         stream,
                         &addr,
@@ -670,6 +681,7 @@ pub async fn prepare_tcp_server(
                 });
             } else {
                 tokio::spawn(async move {
+                    let _permit = permit;
                     if let Err(e) =
                         run_stream_action(Box::new(stream), &addr, non_tls_data.unwrap(), None)
                             .await

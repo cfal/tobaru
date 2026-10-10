@@ -441,6 +441,35 @@ mod tests {
         assert!(config.handshake_timeout_secs.is_none());
     }
     #[test]
+    fn tcp_connection_admission_defaults_and_opt_out_are_validated() {
+        use super::super::TargetConfigs;
+        let base = json!({"transport":"tcp", "target":{"allowlist":"127.0.0.1", "location":"127.0.0.1:80"}});
+        for (value, expected) in [
+            (None, Some(256)),
+            (Some(json!(null)), None),
+            (Some(json!(12)), Some(12)),
+        ] {
+            let mut config = base.clone();
+            if let Some(value) = value {
+                config["tcp_max_connections"] = value;
+            }
+            let TargetConfigs::Tcp {
+                tcp_max_connections,
+                ..
+            } = serde_json::from_value(config).unwrap()
+            else {
+                panic!("TCP expected")
+            };
+            assert_eq!(tcp_max_connections.map(|limit| limit.get()), expected);
+        }
+        for value in [json!(0), json!(-1), json!(1.5)] {
+            let mut config = base.clone();
+            config["tcp_max_connections"] = value;
+            assert!(serde_json::from_value::<TargetConfigs>(config).is_err());
+        }
+    }
+
+    #[test]
     fn udp_limits_are_finite_by_default_and_require_positive_values() {
         use super::super::TargetConfigs;
         let base = json!({"transport":"udp", "target":{"allowlist":"127.0.0.1", "location":"127.0.0.1:53"}});
