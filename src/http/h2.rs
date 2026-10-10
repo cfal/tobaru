@@ -250,7 +250,10 @@ async fn serve_stream(
             |name| {
                 routing::single_required_header(
                     name,
-                    request.headers().get_all(name).iter()
+                    request
+                        .headers()
+                        .get_all(name)
+                        .iter()
                         .map(|value| value.to_str().map_err(io_error)),
                 )
             },

@@ -16,7 +16,9 @@ pub(super) fn find_matching_action<'a>(
     find_matching_headers(path_configs, default_action, request_path, |key| {
         single_required_header(
             key,
-            request_data.headers().fields()
+            request_data
+                .headers()
+                .fields()
                 .filter(|(name, _)| name.eq_ignore_ascii_case(key))
                 .map(|(_, value)| Ok(value)),
         )
@@ -122,12 +124,15 @@ mod tests {
         ]);
         let matches = |headers: &Headers| {
             has_required_headers(
-                |key| single_required_header(
-                    key,
-                    headers.fields()
-                        .filter(|(name, _)| name.eq_ignore_ascii_case(key))
-                        .map(|(_, value)| Ok(value)),
-                ),
+                |key| {
+                    single_required_header(
+                        key,
+                        headers
+                            .fields()
+                            .filter(|(name, _)| name.eq_ignore_ascii_case(key))
+                            .map(|(_, value)| Ok(value)),
+                    )
+                },
                 &required,
             )
         };
