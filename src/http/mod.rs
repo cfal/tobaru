@@ -12,6 +12,7 @@ mod message;
 mod proxy;
 mod routing;
 mod string_util;
+pub(crate) mod syntax;
 
 #[cfg(test)]
 mod idle_tests;
@@ -89,7 +90,13 @@ impl<'a> Request<'a> {
                 data.first_line()
             ))
         })?;
-        if !request_path.starts_with('/') {
+        if !syntax::is_token(verb.as_bytes())
+            || !request_path.starts_with('/')
+            || request_path.contains('#')
+            || request_path
+                .bytes()
+                .any(|byte| byte <= b' ' || byte == 0x7f)
+        {
             return Err(std::io::Error::other(format!(
                 "Invalid http request path: {}",
                 data.first_line()

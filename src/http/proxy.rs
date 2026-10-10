@@ -27,7 +27,7 @@ impl Upgrade {
                 .header_values("upgrade")
                 .flat_map(|value| value.split(','))
                 .map(|value| {
-                    let value = value.trim();
+                    let value = value.trim_matches([' ', '\t']);
                     match value.split_once('/') {
                         Some((name, version)) => format!("{}/{version}", name.to_ascii_lowercase()),
                         None => value.to_ascii_lowercase(),

@@ -32,7 +32,7 @@ pub trait HeaderMap {
         self.header_values(name).any(|value| {
             value
                 .split(',')
-                .any(|part| part.trim().eq_ignore_ascii_case(token))
+                .any(|part| part.trim_matches([' ', '\t']).eq_ignore_ascii_case(token))
         })
     }
 
@@ -46,7 +46,7 @@ pub trait HeaderMap {
         values
             .into_iter()
             .flat_map(|value| value.split(','))
-            .map(|coding| coding.trim().to_ascii_lowercase())
+            .map(|coding| coding.trim_matches([' ', '\t']).to_ascii_lowercase())
             .collect()
     }
 
@@ -56,7 +56,7 @@ pub trait HeaderMap {
             .header_values("content-length")
             .flat_map(|value| value.split(','))
         {
-            let value = value.trim();
+            let value = value.trim_matches([' ', '\t']);
             if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
                 return Err(std::io::Error::other("Invalid content length"));
             }

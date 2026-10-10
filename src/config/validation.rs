@@ -38,21 +38,14 @@ impl HttpProtocols {
 }
 
 fn header_name(name: &str) -> Result<(), String> {
-    if name.is_empty()
-        || !name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
-    {
+    if !crate::http::syntax::is_token(name.as_bytes()) {
         return Err(format!("Invalid HTTP header name: {name:?}"));
     }
     Ok(())
 }
 
 fn header_value(value: &str) -> Result<(), String> {
-    if value
-        .bytes()
-        .any(|byte| byte < 0x20 && byte != b'\t' || byte == 0x7f)
-    {
+    if !crate::http::syntax::is_field_value(value.as_bytes()) {
         return Err("HTTP metadata must not contain control characters".into());
     }
     Ok(())

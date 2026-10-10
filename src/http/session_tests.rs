@@ -154,6 +154,64 @@ impl Drop for Files {
 }
 
 #[tokio::test]
+async fn malformed_request_metadata_never_reaches_a_backend() {
+    checked(async {
+        for wire in [
+            "GET / HTTP/1.1\r\nHost: a.test\r\nX: a\rTransfer-Encoding: chunked\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: a.test\r\n Transfer-Encoding: chunked\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: a.test\r\nTransfer-Encoding : chunked\r\n\r\n",
+            "GET /extra path HTTP/1.1\r\nHost: a.test\r\n\r\n",
+            "GET /x#fragment HTTP/1.1\r\nHost: a.test\r\n\r\n",
+            "G\tET / HTTP/1.1\r\nHost: a.test\r\n\r\n",
+            "GET /x\0 HTTP/1.1\r\nHost: a.test\r\n\r\n",
+        ] {
+            let (listener, address) = backend().await;
+            let (mut client, mut task) = session(forward(address), Trie::new(), None);
+            client.write_all(wire.as_bytes()).await.unwrap();
+            assert!(rest(&mut client).await.is_empty());
+            assert!((&mut task.0).await.unwrap().is_err(), "{wire:?}");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(5), listener.accept())
+                    .await
+                    .is_err()
+            );
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn malformed_response_metadata_never_reaches_the_client() {
+    checked(async {
+        for field in [
+            " X-Key: value",
+            "Content-Length : 0",
+            "X-Key: a\rInjected: value",
+        ] {
+            let (listener, address) = backend().await;
+            let upstream = Task(tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                head(&mut stream).await;
+                stream
+                    .write_all(format!("HTTP/1.1 200 OK\r\n{field}\r\n\r\n").as_bytes())
+                    .await
+                    .unwrap();
+                Ok(())
+            }));
+            let (mut client, mut task) = session(forward(address), Trie::new(), None);
+            client
+                .write_all(b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n")
+                .await
+                .unwrap();
+            assert!(rest(&mut client).await.is_empty());
+            assert!((&mut task.0).await.unwrap().is_err());
+            upstream.finish().await;
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn local_message_and_head_preserve_headers_and_ids() {
     checked(async {
         for method in ["GET", "HEAD"] {

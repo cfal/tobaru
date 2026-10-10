@@ -16,7 +16,7 @@ fn framing(headers: &impl HeaderMap, is_response: bool) -> std::io::Result<Frami
     let codings: Vec<_> = headers
         .header_values("transfer-encoding")
         .flat_map(|value| value.split(','))
-        .map(str::trim)
+        .map(|value| value.trim_matches([' ', '\t']))
         .collect();
     if !codings.is_empty() {
         if length.is_some() || codings.iter().any(|coding| coding.is_empty()) {
@@ -187,6 +187,10 @@ mod tests {
             (vec![("content-length", "+3")], None),
             (vec![("content-length", "-1")], None),
             (vec![("content-length", "")], None),
+            (vec![("content-length", "\u{a0}3")], None),
+            (vec![("content-length", "3\u{a0}")], None),
+            (vec![("transfer-encoding", "\u{a0}chunked")], None),
+            (vec![("transfer-encoding", "chunked\u{a0}")], None),
             (
                 vec![("content-length", "999999999999999999999999999999999999")],
                 None,
