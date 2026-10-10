@@ -1007,19 +1007,18 @@ impl ServerTlsConfig {
     }
 
     pub fn validate_with_action(&self, action: &TcpAction) -> Result<(), String> {
-        if self.is_passthrough() {
-            if matches!(action, TcpAction::Http(_)) {
-                return Err("HTTP actions require TLS terminate mode, not passthrough".into());
-            }
-            if let TcpAction::Raw(RawTcpActionConfig { locations }) = action {
-                for location in locations.iter() {
-                    let (_, client_tls) = location.clone().into_components();
-                    if client_tls.is_enabled() {
-                        return Err(
-                            "client_tls cannot be enabled in TLS passthrough mode (would cause TLS-in-TLS). Use terminate mode or disable client_tls.".to_string()
-                        );
-                    }
-                }
+        if !self.is_passthrough() {
+            return Ok(());
+        }
+        let TcpAction::Raw(RawTcpActionConfig { locations }) = action else {
+            return Err("HTTP actions require TLS terminate mode, not passthrough".into());
+        };
+        for location in locations.iter() {
+            let (_, client_tls) = location.clone().into_components();
+            if client_tls.is_enabled() {
+                return Err(
+                    "client_tls cannot be enabled in TLS passthrough mode (would cause TLS-in-TLS). Use terminate mode or disable client_tls.".to_string()
+                );
             }
         }
         Ok(())

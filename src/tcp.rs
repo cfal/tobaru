@@ -690,17 +690,11 @@ fn resolve_tls_candidates<'a>(
     sni_trie: &'a DomainTrie<Vec<Arc<TlsTargetData>>>,
     no_sni_targets: &'a [Arc<TlsTargetData>],
 ) -> Option<&'a [Arc<TlsTargetData>]> {
-    let candidates = match &parsed.server_name {
-        Some(hostname) => sni_trie.lookup(hostname)?,
-        None => {
-            if no_sni_targets.is_empty() {
-                return None;
-            }
-            no_sni_targets
-        }
-    };
-
-    Some(candidates)
+    match &parsed.server_name {
+        Some(hostname) => sni_trie.lookup(hostname).map(Vec::as_slice),
+        None if no_sni_targets.is_empty() => None,
+        None => Some(no_sni_targets),
+    }
 }
 
 /// Returns true if the candidate matches the client's ALPN offer.
