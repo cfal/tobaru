@@ -2,13 +2,13 @@ use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::SystemTime;
 
 use futures::join;
 use ip_network_table_deps_treebitmap::IpLookupTable;
 use log::{debug, error, warn};
+use parking_lot::Mutex;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::oneshot;
@@ -32,11 +32,6 @@ struct UdpTargetData {
     association_timeout_secs: u32,
 }
 
-#[inline]
-fn get_timestamp_secs() -> u32 {
-    SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs() as u32
-}
-
 pub fn prepare_udp_server(
     server_address: SocketAddr,
     use_iptables: bool,
@@ -44,6 +39,12 @@ pub fn prepare_udp_server(
     target_configs: Vec<UdpTargetConfig>,
     mut stop: oneshot::Receiver<()>,
 ) -> std::io::Result<impl std::future::Future<Output = std::io::Result<()>> + Send> {
+    if max_associations.is_none() {
+        warn!(
+            "UDP listener on {} has no udp_max_associations limit",
+            server_address
+        );
+    }
     let mut lookup_table = IpLookupTable::new();
 
     let mut min_association_timeout_secs: u32 = 0;
@@ -140,7 +141,7 @@ pub fn prepare_udp_server(
                 Some((_, _, d)) => d,
                 None => {
                     // Not allowed.
-                    warn!("Unknown address, ignoring: {}", addr.ip());
+                    debug!("Unknown address, ignoring: {}", addr.ip());
                     continue;
                 }
             };
@@ -157,7 +158,7 @@ pub fn prepare_udp_server(
 
             // Sends can fail if the channel is full.
             if let Err(e) = send_result {
-                error!("Failed to send: {}", e);
+                debug!("Failed to enqueue UDP packet: {}", e);
             }
         };
         // Association tasks retain the listening socket, including expired tasks
@@ -214,7 +215,7 @@ fn forward_packet(
             ))
         }
     };
-    association.try_send(packet.to_vec().into_boxed_slice())
+    association.try_send(packet)
 }
 
 #[cfg(test)]
@@ -227,10 +228,13 @@ impl<T> Drop for TaskDropGuard<T> {
 }
 
 fn cleanup_associations(associations: &mut HashMap<SocketAddr, Association>) {
-    let current_timestamp = get_timestamp_secs();
+    let now = Instant::now();
     associations.retain(|address, association| {
-        let last_active = association.last_active.load(Ordering::SeqCst);
-        if current_timestamp - last_active < association.timeout_secs {
+        let last_active = *association.last_active.lock();
+        if !association.tx.is_closed()
+            && now.saturating_duration_since(last_active)
+                < Duration::from_secs(association.timeout_secs as u64)
+        {
             true
         } else {
             debug!("Removing association: {:?}", address);
@@ -240,7 +244,7 @@ fn cleanup_associations(associations: &mut HashMap<SocketAddr, Association>) {
 }
 
 struct Association {
-    last_active: Arc<AtomicU32>,
+    last_active: Arc<Mutex<Instant>>,
     tx: Sender<Box<[u8]>>,
     join_handle: AbortHandle,
     timeout_secs: u32,
@@ -254,7 +258,7 @@ impl Association {
         timeout_secs: u32,
         tasks: &mut JoinSet<()>,
     ) -> Self {
-        let last_active = Arc::new(AtomicU32::new(get_timestamp_secs()));
+        let last_active = Arc::new(Mutex::new(Instant::now()));
         let cloned_last_active = last_active.clone();
 
         let (tx, rx) = channel::<Box<[u8]>>(1024);
@@ -280,8 +284,10 @@ impl Association {
         }
     }
 
-    fn try_send(&self, data: Box<[u8]>) -> std::io::Result<()> {
-        self.tx.try_send(data).map_err(std::io::Error::other)
+    fn try_send(&self, data: &[u8]) -> std::io::Result<()> {
+        let permit = self.tx.try_reserve().map_err(std::io::Error::other)?;
+        permit.send(data.to_vec().into_boxed_slice());
+        Ok(())
     }
 }
 
@@ -294,7 +300,7 @@ impl Drop for Association {
 async fn run_forward_to_target_task(
     mut rx: Receiver<Box<[u8]>>,
     forward_socket: Arc<UdpSocket>,
-    last_active: Arc<AtomicU32>,
+    last_active: Arc<Mutex<Instant>>,
 ) {
     while let Some(data) = rx.recv().await {
         // This previously did a try_send, but it seemed to skip a lot of messages
@@ -303,7 +309,7 @@ async fn run_forward_to_target_task(
             error!("Failed to forward data: {}", e);
         }
 
-        last_active.store(get_timestamp_secs(), Ordering::Relaxed);
+        *last_active.lock() = Instant::now();
     }
 }
 
@@ -311,14 +317,14 @@ async fn run_forward_from_target_task(
     forward_socket: Arc<UdpSocket>,
     server_socket: Arc<UdpSocket>,
     client_address: SocketAddr,
-    last_active: Arc<AtomicU32>,
+    last_active: Arc<Mutex<Instant>>,
 ) {
     let mut buf = [0u8; MAX_UDP_PACKET_SIZE];
     while let Ok(len) = forward_socket.recv(&mut buf).await {
         if let Err(e) = server_socket.send_to(&buf[0..len], client_address).await {
             error!("Failed to relay response: {}", e);
         }
-        last_active.store(get_timestamp_secs(), Ordering::Relaxed);
+        *last_active.lock() = Instant::now();
     }
 }
 
@@ -326,7 +332,7 @@ async fn run_forward_tasks(
     client_address: SocketAddr,
     server_socket: Arc<UdpSocket>,
     target_address: NetLocation,
-    last_active: Arc<AtomicU32>,
+    last_active: Arc<Mutex<Instant>>,
     rx: Receiver<Box<[u8]>>,
 ) -> std::io::Result<()> {
     let forward_addr = resolve_host((target_address.address.as_str(), target_address.port)).await?;
@@ -348,6 +354,54 @@ async fn run_forward_tasks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn cleanup_uses_monotonic_idle_time_and_removes_closed_queues() {
+        let mut tasks = JoinSet::new();
+        let (tx, mut rx) = channel(1);
+        let association = Association {
+            last_active: Arc::new(Mutex::new(Instant::now())),
+            tx,
+            join_handle: tasks.spawn(std::future::pending::<()>()),
+            timeout_secs: 5,
+        };
+        association.try_send(b"first").unwrap();
+        assert!(association.try_send(b"full").is_err());
+        assert_eq!(&*rx.recv().await.unwrap(), b"first");
+        let address = "127.0.0.1:1".parse().unwrap();
+        let mut associations = HashMap::from([(address, association)]);
+        tokio::time::advance(Duration::from_secs(4)).await;
+        cleanup_associations(&mut associations);
+        assert_eq!(associations.len(), 1);
+        // A concurrent activity update may be newer than cleanup's snapshot.
+        *associations[&address].last_active.lock() = Instant::now() + Duration::from_secs(1);
+        cleanup_associations(&mut associations);
+        assert_eq!(associations.len(), 1);
+        tokio::time::advance(Duration::from_secs(6)).await;
+        cleanup_associations(&mut associations);
+        assert!(associations.is_empty());
+        tasks.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn periodic_cleanup_reclaims_failed_associations() {
+        let mut tasks = JoinSet::new();
+        let (tx, rx) = channel(1);
+        drop(rx);
+        let address = "127.0.0.1:1".parse().unwrap();
+        let mut associations = HashMap::from([(
+            address,
+            Association {
+                last_active: Arc::new(Mutex::new(Instant::now())),
+                tx,
+                join_handle: tasks.spawn(std::future::pending::<()>()),
+                timeout_secs: 200,
+            },
+        )]);
+        cleanup_associations(&mut associations);
+        assert!(associations.is_empty());
+        tasks.shutdown().await;
+    }
 
     #[tokio::test]
     async fn shutdown_preserves_ready_receive_errors_but_not_successful_packets() {
@@ -432,9 +486,7 @@ mod tests {
         assert_eq!(peer, same_peer);
         assert_eq!(&bytes[..length], b"existing");
 
-        associations[&first]
-            .last_active
-            .store(get_timestamp_secs() - 10, Ordering::SeqCst);
+        *associations[&first].last_active.lock() = Instant::now() - Duration::from_secs(10);
         cleanup_associations(&mut associations);
         assert!(associations.is_empty());
         forward_packet(
@@ -490,7 +542,7 @@ mod tests {
                     client_address,
                     server,
                     NetLocation::try_from(upstream.to_string().as_str()).unwrap(),
-                    Arc::new(AtomicU32::new(get_timestamp_secs())),
+                    Arc::new(Mutex::new(Instant::now())),
                     rx,
                 )));
                 tx.send(b"request".to_vec().into_boxed_slice())

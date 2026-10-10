@@ -628,7 +628,7 @@ pub async fn prepare_tcp_server(
             let has_tls_data = tls_lookup_table.longest_match(ip).is_some();
 
             if non_tls_data.is_none() && !has_tls_data {
-                warn!("Unknown address, not allowing: {}", addr.ip());
+                debug!("Unknown address, not allowing: {}", addr.ip());
                 continue;
             }
 
@@ -1264,9 +1264,9 @@ pub async fn setup_http_target_stream(
                 }
             }
             debug!(
-                "Connected to remote: {} using local addr {}",
+                "Connected to remote: {} using local addr {:?}",
                 addr,
-                tcp_stream.local_addr().unwrap()
+                tcp_stream.local_addr()
             );
 
             maybe_wrap_tls(tcp_stream, target_location, Some(address.as_str())).await
@@ -1276,7 +1276,7 @@ pub async fn setup_http_target_stream(
             debug!(
                 "Connected to unix domain socket: {} using local addr {:?}",
                 path_buf.as_path().display(),
-                unix_stream.local_addr().unwrap()
+                unix_stream.local_addr()
             );
 
             maybe_wrap_tls(unix_stream, target_location, None).await
