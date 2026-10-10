@@ -271,7 +271,10 @@ async fn h2_local_validation_applies_to_default_and_explicit_protocols() {
     ] {
         let mut value = json!({
             "allowlist":"127.0.0.1/32",
-            "default_http_action":{"type":"serve-message", "status_code":101}
+            "default_http_action":{
+                "type":"serve-message", "status_code":200,
+                "response_headers":{"proxy-connection":"keep-alive"}
+            }
         });
         if let Some(protocols) = protocols {
             value["http_protocols"] = protocols;

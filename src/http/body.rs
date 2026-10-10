@@ -1,4 +1,5 @@
 use super::header_map::HeaderMap;
+use super::syntax::{is_field_value, is_token_byte};
 use super::{chunk_transfer, http_parser, line_reader, string_util};
 use crate::util::write_all;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -13,20 +14,19 @@ pub(super) enum Framing {
 
 fn framing(headers: &impl HeaderMap, is_response: bool) -> std::io::Result<Framing> {
     let length = headers.content_length()?;
-    let codings: Vec<_> = headers
-        .header_values("transfer-encoding")
-        .flat_map(|value| value.split(','))
-        .map(str::trim)
-        .collect();
-    if !codings.is_empty() {
-        if length.is_some() || codings.iter().any(|coding| coding.is_empty()) {
+    let mut codings = Vec::new();
+    for value in headers.header_values("transfer-encoding") {
+        codings.extend(parse_transfer_codings(value)?);
+    }
+    if let Some(last_coding) = codings.last() {
+        if length.is_some() {
             return Err(std::io::Error::other("Ambiguous HTTP body framing"));
         }
         let chunked_count = codings
             .iter()
             .filter(|coding| coding.eq_ignore_ascii_case("chunked"))
             .count();
-        if chunked_count == 1 && codings.last().unwrap().eq_ignore_ascii_case("chunked") {
+        if chunked_count == 1 && last_coding.eq_ignore_ascii_case("chunked") {
             return Ok(Framing::Chunked);
         }
         if chunked_count != 0 || !is_response {
@@ -44,6 +44,74 @@ fn framing(headers: &impl HeaderMap, is_response: bool) -> std::io::Result<Frami
     })
 }
 
+fn invalid_transfer_coding() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid transfer coding")
+}
+
+fn take_transfer_token<'a>(value: &mut &'a str) -> std::io::Result<&'a str> {
+    *value = value.trim_start_matches([' ', '\t']);
+    let end = value
+        .bytes()
+        .position(|byte| !is_token_byte(byte))
+        .unwrap_or(value.len());
+    if end == 0 {
+        return Err(invalid_transfer_coding());
+    }
+    let (token, rest) = value.split_at(end);
+    *value = rest.trim_start_matches([' ', '\t']);
+    Ok(token)
+}
+
+fn consume_transfer_parameter(value: &mut &str) -> std::io::Result<()> {
+    take_transfer_token(value)?;
+    *value = value
+        .strip_prefix('=')
+        .ok_or_else(invalid_transfer_coding)?
+        .trim_start_matches([' ', '\t']);
+    if !value.starts_with('"') {
+        take_transfer_token(value)?;
+        return Ok(());
+    }
+
+    // Commas and escaped quotes inside parameters are not list delimiters.
+    let bytes = value.as_bytes();
+    let mut end = 1;
+    loop {
+        match bytes.get(end) {
+            Some(b'"') => break,
+            Some(b'\\') if end + 1 < bytes.len() => end += 2,
+            Some(b'\\') | None => return Err(invalid_transfer_coding()),
+            Some(_) => end += 1,
+        }
+    }
+    *value = value[end + 1..].trim_start_matches([' ', '\t']);
+    Ok(())
+}
+
+fn parse_transfer_codings(mut value: &str) -> std::io::Result<Vec<&str>> {
+    if !is_field_value(value.as_bytes()) {
+        return Err(invalid_transfer_coding());
+    }
+    let mut codings = Vec::new();
+    loop {
+        let coding = take_transfer_token(&mut value)?;
+        while let Some(rest) = value.strip_prefix(';') {
+            if coding.eq_ignore_ascii_case("chunked") {
+                return Err(invalid_transfer_coding());
+            }
+            value = rest;
+            consume_transfer_parameter(&mut value)?;
+        }
+        codings.push(coding);
+        if value.is_empty() {
+            return Ok(codings);
+        }
+        value = value
+            .strip_prefix(',')
+            .ok_or_else(invalid_transfer_coding)?;
+    }
+}
+
 pub(super) fn request_framing(headers: &impl HeaderMap) -> std::io::Result<Framing> {
     framing(headers, false)
 }
@@ -53,10 +121,11 @@ pub(super) fn response_framing(
     method: &str,
     status: u16,
 ) -> std::io::Result<Framing> {
+    let framing = framing(headers, true)?;
     if method == "HEAD" || status < 200 || status == 204 || status == 304 {
         return Ok(Framing::Empty);
     }
-    framing(headers, true)
+    Ok(framing)
 }
 
 pub(super) async fn write_head<W: AsyncWrite + Unpin>(
@@ -171,6 +240,73 @@ mod tests {
     }
 
     #[test]
+    fn transfer_coding_names_and_parameters_are_validated() {
+        for invalid in [
+            "\u{a0}chunked",
+            "chunked\u{a0}",
+            "bad coding",
+            "gzip; key",
+            "gzip; key=",
+            "gzip; =value",
+            "gzip; key=\"unterminated",
+            "gzip; key=\"ok\"junk",
+            "chunked; key=value",
+        ] {
+            let mixed = format!("{invalid}, chunked");
+            for fields in [
+                vec![("transfer-encoding", mixed.as_str())],
+                vec![
+                    ("transfer-encoding", invalid),
+                    ("transfer-encoding", "chunked"),
+                ],
+                vec![
+                    ("transfer-encoding", "chunked"),
+                    ("transfer-encoding", invalid),
+                ],
+            ] {
+                let headers = headers(&fields);
+                assert!(request_framing(&headers).is_err(), "{fields:?}");
+                for (method, status) in [("GET", 200), ("HEAD", 200), ("GET", 304)] {
+                    assert!(
+                        response_framing(&headers, method, status).is_err(),
+                        "{fields:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn quoted_transfer_parameters_do_not_change_coding_boundaries() {
+        for coding in [
+            "x-dictionary; key=\"A, chunked, B\"",
+            "x-dictionary; key=\"a;\\\"b, chunked, c\"; other=token",
+            "x-dictionary ; key = \"\"",
+            "x-dictionary; key=\"\u{a0}\"",
+        ] {
+            let combined = format!("{coding}, Chunked");
+            for fields in [
+                vec![("transfer-encoding", combined.as_str())],
+                vec![
+                    ("transfer-encoding", coding),
+                    ("transfer-encoding", "Chunked"),
+                ],
+            ] {
+                let headers = headers(&fields);
+                assert_eq!(request_framing(&headers).unwrap(), Framing::Chunked);
+                assert_eq!(
+                    response_framing(&headers, "GET", 200).unwrap(),
+                    Framing::Chunked
+                );
+            }
+            assert_eq!(
+                response_framing(&headers(&[("transfer-encoding", coding)]), "GET", 200).unwrap(),
+                Framing::UntilEof
+            );
+        }
+    }
+
+    #[test]
     fn request_framing_accepts_only_unambiguous_boundaries() {
         for (fields, expected) in [
             (vec![], Some(Framing::Empty)),
@@ -187,6 +323,10 @@ mod tests {
             (vec![("content-length", "+3")], None),
             (vec![("content-length", "-1")], None),
             (vec![("content-length", "")], None),
+            (vec![("content-length", "\u{a0}3")], None),
+            (vec![("content-length", "3\u{a0}")], None),
+            (vec![("transfer-encoding", "\u{a0}chunked")], None),
+            (vec![("transfer-encoding", "chunked\u{a0}")], None),
             (
                 vec![("content-length", "999999999999999999999999999999999999")],
                 None,

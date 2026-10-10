@@ -27,7 +27,7 @@ impl Upgrade {
                 .header_values("upgrade")
                 .flat_map(|value| value.split(','))
                 .map(|value| {
-                    let value = value.trim();
+                    let value = value.trim_matches([' ', '\t']);
                     match value.split_once('/') {
                         Some((name, version)) => format!("{}/{version}", name.to_ascii_lowercase()),
                         None => value.to_ascii_lowercase(),
@@ -306,6 +306,7 @@ async fn read_response<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         if status >= 200 || status == 101 {
             return Ok(response);
         }
+        response_framing(response.headers(), "GET", status)?;
         write_head(client, &response).await?;
         client.flush().await?;
         reader = response.into_reader();

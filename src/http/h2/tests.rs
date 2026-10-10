@@ -806,19 +806,156 @@ async fn literal_close_terminates_the_frontend_connection() {
 async fn local_bodyless_statuses_and_config_validation() {
     checked(async {
         for status in [204, 205, 304] {
-            let (mut client, _driver, _server) = frontend(action(json!({"type":"serve-message", "status_code":status, "content":"not on wire"}))).await;
+            let (mut client, _driver, _server) = frontend(action(
+                json!({"type":"serve-message", "status_code":status, "content":"not on wire"}),
+            ))
+            .await;
             for method in ["GET", "HEAD"] {
-                let (response, _) = client.send_request(Request::builder().method(method).uri("http://example.test/").body(()).unwrap(), true).unwrap();
+                let (response, _) = client
+                    .send_request(
+                        Request::builder()
+                            .method(method)
+                            .uri("http://example.test/")
+                            .body(())
+                            .unwrap(),
+                        true,
+                    )
+                    .unwrap();
                 let response = response.await.unwrap();
                 assert_eq!(response.status().as_u16(), status);
                 assert!(collect(response.into_body()).await.0.is_empty());
             }
         }
-        for fields in [json!({"connection":"close"}), json!({"content-length":"100"})] {
-            let http = runtime(action(json!({"type":"serve-message", "status_code":200, "content":"short", "response_headers":fields})), Http2Config::default(), None);
+        for fields in [
+            json!({"connection":"close"}),
+            json!({"content-length":"100"}),
+        ] {
+            assert!(serde_json::from_value::<HttpPathAction>(json!({
+                "type":"serve-message", "status_code":200,
+                "content":"short", "response_headers":fields
+            }))
+            .is_err());
+            let mut action =
+                action(json!({"type":"serve-message", "status_code":200, "content":"short"}));
+            let TargetHttpActionData::ServeMessage {
+                response_headers, ..
+            } = &mut action
+            else {
+                unreachable!()
+            };
+            *response_headers = serde_json::from_value(fields).unwrap();
+            let http = runtime(action, Http2Config::default(), None);
             assert!(validate_config(&http).is_err());
         }
-    }).await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn routing_uses_path_segments_and_ignores_queries() {
+    checked(async {
+        let message = |content| {
+            action(json!({
+                "type":"serve-message", "status_code":200, "content":content
+            }))
+        };
+        let mut http = runtime(message("default"), Http2Config::default(), None);
+        for (path, content) in [("/", "root"), ("/api", "api"), ("/api/deep", "deep")] {
+            http.path_configs.insert(
+                path.into(),
+                vec![crate::tcp::TargetHttpPathData {
+                    required_request_headers: Default::default(),
+                    http_action: message(content),
+                }],
+            );
+        }
+        let (mut client, _driver, _server) = configured_frontend(http).await;
+        for (path, expected) in [
+            ("/api?next=/apiary", "api"),
+            ("/apiary", "root"),
+            ("/api/deeper", "api"),
+            ("/api/deep?x=1", "deep"),
+            ("/api/deep/file", "deep"),
+        ] {
+            let request = Request::builder()
+                .uri(format!("https://example.test{path}"))
+                .body(())
+                .unwrap();
+            let (response, _) = client.send_request(request, true).unwrap();
+            assert_eq!(
+                collect(response.await.unwrap().into_body()).await.0,
+                expected.as_bytes()
+            );
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn duplicate_route_headers_fail_before_upstream_io_and_keep_siblings_alive() {
+    checked(async {
+        let (listener, address) = backend().await;
+        let mut http = runtime(
+            action(json!({"type":"serve-message", "status_code":200, "content":"default"})),
+            Http2Config::default(),
+            None,
+        );
+        http.path_configs.insert(
+            "/api".into(),
+            vec![crate::tcp::TargetHttpPathData {
+                required_request_headers: std::collections::HashMap::from([
+                    (
+                        "x-key".into(),
+                        crate::config::HttpValueMatch::Single("secret".into()),
+                    ),
+                    ("x-other".into(), crate::config::HttpValueMatch::Any),
+                ]),
+                http_action: action(json!({"type":"forward", "location":address.to_string()})),
+            }],
+        );
+        let (mut client, _driver, _server) = configured_frontend(http).await;
+        for include_other in [false, true] {
+            for values in [
+                ["wrong", "secret"],
+                ["secret", "wrong"],
+                ["secret", "secret"],
+            ] {
+                let mut request = Request::builder()
+                    .uri("https://example.test/api")
+                    .header("x-key", values[0])
+                    .header("x-key", values[1]);
+                if include_other {
+                    request = request.header("x-other", "present");
+                }
+                let (response, _) = client
+                    .send_request(request.body(()).unwrap(), true)
+                    .unwrap();
+                let response = response.await.unwrap();
+                assert_eq!(response.status(), 502);
+                assert!(collect(response.into_body()).await.0.is_empty());
+            }
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), listener.accept())
+                .await
+                .is_err()
+        );
+        let (response, _) = client
+            .send_request(
+                Request::builder()
+                    .uri("https://example.test/api")
+                    .header("x-key", "secret")
+                    .body(())
+                    .unwrap(),
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            collect(response.await.unwrap().into_body()).await.0,
+            b"default"
+        );
+    })
+    .await;
 }
 
 #[tokio::test]

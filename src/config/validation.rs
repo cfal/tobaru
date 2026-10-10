@@ -38,21 +38,14 @@ impl HttpProtocols {
 }
 
 fn header_name(name: &str) -> Result<(), String> {
-    if name.is_empty()
-        || !name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
-    {
+    if !crate::http::syntax::is_token(name.as_bytes()) {
         return Err(format!("Invalid HTTP header name: {name:?}"));
     }
     Ok(())
 }
 
 fn header_value(value: &str) -> Result<(), String> {
-    if value
-        .bytes()
-        .any(|byte| byte < 0x20 && byte != b'\t' || byte == 0x7f)
-    {
+    if !crate::http::syntax::is_field_value(value.as_bytes()) {
         return Err("HTTP metadata must not contain control characters".into());
     }
     Ok(())
@@ -62,6 +55,33 @@ fn headers(fields: &std::collections::HashMap<String, String>) -> Result<(), Str
     for (name, value) in fields {
         header_name(name)?;
         header_value(value)?;
+    }
+    Ok(())
+}
+
+fn non_framing_header(name: &str) -> Result<(), String> {
+    header_name(name)?;
+    if [
+        "content-length",
+        "transfer-encoding",
+        "connection",
+        "trailer",
+        "upgrade",
+    ]
+    .iter()
+    .any(|reserved| name.eq_ignore_ascii_case(reserved))
+    {
+        return Err(format!("HTTP header is managed by the server: {name}"));
+    }
+    Ok(())
+}
+
+fn local_response_headers(
+    fields: &std::collections::HashMap<String, String>,
+) -> Result<(), String> {
+    headers(fields)?;
+    for name in fields.keys() {
+        non_framing_header(name)?;
     }
     Ok(())
 }
@@ -82,17 +102,20 @@ impl HttpPathAction {
         let id_names = match self {
             Self::CloseConnection => return Ok(()),
             Self::ServeMessage(config) => {
-                if !(100..600).contains(&config.status_code) {
-                    return Err("HTTP status code must be between 100 and 599".into());
+                if !(200..600).contains(&config.status_code) {
+                    return Err(
+                        "serve-message requires a final HTTP status code between 200 and 599"
+                            .into(),
+                    );
                 }
                 if let Some(message) = &config.status_message {
                     header_value(message)?;
                 }
-                headers(&config.response_headers)?;
+                local_response_headers(&config.response_headers)?;
                 [None, config.response_id_header_name.as_deref()]
             }
             Self::ServeDirectory(config) => {
-                headers(&config.response_headers)?;
+                local_response_headers(&config.response_headers)?;
                 [None, config.response_id_header_name.as_deref()]
             }
             Self::Forward(config) => {
@@ -114,7 +137,7 @@ impl HttpPathAction {
             }
         };
         for name in id_names.into_iter().flatten() {
-            header_name(name)?;
+            non_framing_header(name)?;
         }
         Ok(())
     }
@@ -248,6 +271,80 @@ mod tests {
     }
 
     #[test]
+    fn local_responses_and_ids_cannot_override_wire_framing() {
+        for name in [
+            "Content-Length",
+            "TRANSFER-Encoding",
+            "Connection",
+            "Trailer",
+            "Upgrade",
+        ] {
+            for mut action in [
+                json!({"type":"serve-message", "status_code":200}),
+                json!({"type":"serve-directory", "path":"."}),
+            ] {
+                action["response_headers"] = json!({name:"value"});
+                assert!(serde_json::from_value::<HttpPathAction>(action).is_err());
+            }
+            for mut action in [
+                json!({"type":"serve-message", "status_code":200}),
+                json!({"type":"serve-directory", "path":"."}),
+                json!({"type":"forward", "location":"localhost:80"}),
+            ] {
+                action["response_id_header_name"] = json!(name);
+                assert!(serde_json::from_value::<HttpPathAction>(action).is_err());
+            }
+            assert!(serde_json::from_value::<HttpPathAction>(json!({
+                "type":"forward", "location":"localhost:80", "request_id_header_name":name
+            }))
+            .is_err());
+        }
+        for status in [100, 101, 103, 199] {
+            assert!(serde_json::from_value::<HttpPathAction>(json!({
+                "type":"serve-message", "status_code":status
+            }))
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn passthrough_rejects_http_actions_before_accepting_connections() {
+        let tls: super::super::ServerTlsConfig =
+            serde_json::from_value(json!({"mode":"passthrough"})).unwrap();
+        for value in [
+            json!({"protocol":"http", "default_http_action":"close"}),
+            json!({"protocol":"http", "default_http_action":{"type":"forward", "location":"localhost:80"}}),
+        ] {
+            let action = serde_json::from_value(value).unwrap();
+            assert!(tls.validate_with_action(&action).is_err());
+        }
+        let action = serde_json::from_value(json!({"location":"localhost:443"})).unwrap();
+        assert!(tls.validate_with_action(&action).is_ok());
+    }
+
+    #[test]
+    fn http_route_keys_are_paths_not_request_targets() {
+        for path in ["", "api", "/api?x=1", "/api#x", "/a b", "/a\r\n"] {
+            let config = json!({"default_http_action":"close", "http_paths":{
+                path:{"http_action":"close"}
+            }});
+            assert!(
+                serde_json::from_value::<super::super::HttpTcpActionConfig>(config).is_err(),
+                "{path:?}"
+            );
+        }
+        for path in ["/", "/api", "/api/", "/a%20b"] {
+            let config = json!({"default_http_action":"close", "http_paths":{
+                path:{"http_action":"close"}
+            }});
+            assert!(
+                serde_json::from_value::<super::super::HttpTcpActionConfig>(config).is_ok(),
+                "{path:?}"
+            );
+        }
+    }
+
+    #[test]
     fn configured_http_metadata_cannot_inject_wire_lines() {
         for value in [
             json!({"type":"serve-message", "status_code":200, "status_message":"OK\r\nx-injected: yes"}),
@@ -303,12 +400,15 @@ mod tests {
         for value in [
             json!({}),
             json!({"request_header_timeout_secs":null}),
+            json!({"local_body_timeout_secs":null}),
+            json!({"local_body_timeout_secs":60}),
             json!({"request_header_timeout_secs":15, "response_header_timeout_secs":30, "keepalive_idle_timeout_secs":60}),
         ] {
             assert!(config(value).is_ok());
         }
         for value in [
             json!({"request_header_timeout_secs":0}),
+            json!({"local_body_timeout_secs":0}),
             json!({"response_header_timeout_secs":-1}),
             json!({"keepalive_idle_timeout_secs":1.5}),
             json!({"typo":1}),
@@ -318,6 +418,7 @@ mod tests {
         let config: super::super::HttpTcpActionConfig =
             serde_json::from_value(json!({"default_http_action":"close"})).unwrap();
         assert!(config.http_timeouts.request_header_timeout_secs.is_none());
+        assert!(config.http_timeouts.local_body_timeout_secs.is_none());
     }
 
     #[test]

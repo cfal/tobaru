@@ -248,13 +248,14 @@ async fn serve_stream(
             &http.default_http_action,
             &path,
             |name| {
-                request
-                    .headers()
-                    .get_all(name)
-                    .iter()
-                    .next_back()
-                    .map(|value| value.to_str().map_err(io_error))
-                    .transpose()
+                routing::single_required_header(
+                    name,
+                    request
+                        .headers()
+                        .get_all(name)
+                        .iter()
+                        .map(|value| value.to_str().map_err(io_error)),
+                )
             },
         )?;
         let request_id = format!("{:x}#{}", rand::random::<u64>(), stream_id.as_u32());

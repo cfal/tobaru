@@ -11,6 +11,7 @@ use super::header_map::HeaderMap;
 use super::header_tuple::HeaderTuple;
 use super::{string_util, Outcome, Request, Session};
 use crate::tcp::TargetHttpActionData;
+use crate::tokio_util::with_timeout;
 use crate::util::{allocate_vec, write_all};
 
 impl Session<'_> {
@@ -34,7 +35,12 @@ impl Session<'_> {
                 request.verb, request.path
             );
         } else {
-            drain_request(&mut self.stream, request.data).await?;
+            with_timeout(
+                self.timeouts.local_body_timeout_secs,
+                "HTTP local request body",
+                drain_request(&mut self.stream, request.data),
+            )
+            .await?;
             let mut response = format!("HTTP/1.1 {}", status_code);
             if let Some(message) = status_message {
                 response.push(' ');
@@ -45,9 +51,15 @@ impl Session<'_> {
             if let Some(name) = response_id_header_name {
                 (name, &request.id).append_header_to_string(&mut response);
             }
-            response.push_str("transfer-encoding: chunked\r\nconnection: close\r\n\r\n");
+            let body_allowed = !matches!(status_code, 204 | 205 | 304);
+            if body_allowed {
+                response.push_str("transfer-encoding: chunked\r\n");
+            } else if *status_code == 205 {
+                response.push_str("content-length: 0\r\n");
+            }
+            response.push_str("connection: close\r\n\r\n");
             write_all(&mut self.stream, response.as_bytes()).await?;
-            if request.verb != "HEAD" {
+            if request.verb != "HEAD" && body_allowed {
                 if !content.is_empty() {
                     write_chunk(&mut self.stream, content.as_bytes()).await?;
                 }
@@ -93,7 +105,14 @@ impl Session<'_> {
             write_all(&mut self.stream, b"HTTP/1.1 417 Expectation Failed\r\nConnection: close\r\nContent-Length: 0\r\n\r\n").await?;
             return Ok(Outcome::Close);
         }
-        self.reader = Some(drain_request(&mut self.stream, request.data).await?);
+        self.reader = Some(
+            with_timeout(
+                self.timeouts.local_body_timeout_secs,
+                "HTTP local request body",
+                drain_request(&mut self.stream, request.data),
+            )
+            .await?,
+        );
         let canonical_path = match resolve_file(path, &file_path).await {
             Ok(path) => path,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {

@@ -21,6 +21,84 @@ fn session<'a>(
 }
 
 #[tokio::test(start_paused = true)]
+async fn local_body_deadline_includes_chunk_trailers_and_does_not_reset() {
+    for action in [
+        serde_json::json!({"type":"serve-message", "status_code":200}),
+        serde_json::json!({"type":"serve-directory", "path":"."}),
+    ] {
+        for body in [
+            "Content-Length: 100\r\n\r\nx",
+            "Transfer-Encoding: chunked\r\n\r\n0\r\nX-Trailer: ",
+        ] {
+            let (mut client, stream) = tokio::io::duplex(4096);
+            let addr = "127.0.0.1:1".parse().unwrap();
+            let mut session = session(
+                stream,
+                &addr,
+                HttpTimeouts {
+                    local_body_timeout_secs: std::num::NonZeroU64::new(1),
+                    ..Default::default()
+                },
+            );
+            let action = TargetHttpActionData::try_from(
+                serde_json::from_value::<crate::config::HttpPathAction>(action.clone()).unwrap(),
+            )
+            .unwrap();
+            client
+                .write_all(format!("GET / HTTP/1.1\r\nHost: a.test\r\n{body}").as_bytes())
+                .await
+                .unwrap();
+            let data = session.read_request(false).await.unwrap();
+            let paths = Trie::new();
+            let request = Request::new(data, "test#1".into(), &paths, &action).unwrap();
+            let (result, ()) = tokio::join!(session.dispatch(request), async {
+                sleep(Duration::from_millis(600)).await;
+                client.write_all(b"x").await.unwrap();
+                sleep(Duration::from_millis(600)).await;
+            });
+            let error = result.err().unwrap();
+            assert_eq!(error.kind(), ErrorKind::TimedOut);
+            assert_eq!(error.to_string(), "HTTP local request body timed out");
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn local_body_deadline_allows_completion_and_can_be_disabled() {
+    for seconds in [None, std::num::NonZeroU64::new(3)] {
+        let (mut client, stream) = tokio::io::duplex(4096);
+        let addr = "127.0.0.1:1".parse().unwrap();
+        let mut session = session(
+            stream,
+            &addr,
+            HttpTimeouts {
+                local_body_timeout_secs: seconds,
+                ..Default::default()
+            },
+        );
+        let action = TargetHttpActionData::try_from(
+            serde_json::from_value::<crate::config::HttpPathAction>(
+                serde_json::json!({"type":"serve-message", "status_code":200}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        client
+            .write_all(b"GET / HTTP/1.1\r\nContent-Length: 1\r\n\r\n")
+            .await
+            .unwrap();
+        let data = session.read_request(false).await.unwrap();
+        let paths = Trie::new();
+        let request = Request::new(data, "test#1".into(), &paths, &action).unwrap();
+        let (result, ()) = tokio::join!(session.dispatch(request), async {
+            sleep(Duration::from_secs(2)).await;
+            client.write_all(b"x").await.unwrap();
+        });
+        assert!(matches!(result.unwrap(), Outcome::Close));
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn request_header_deadline_does_not_reset_on_partial_progress() {
     let (mut client, stream) = tokio::io::duplex(4096);
     let addr = "127.0.0.1:1".parse().unwrap();

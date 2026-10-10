@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use memchr::{memchr, memmem};
 use tokio::io::AsyncWrite;
 
+use super::syntax::{is_field_value, is_token_byte, parse_field};
 use crate::util::write_all;
 
 // 8 byte length + \r\n = 10 bytes. max chunk size is 0xffffffff which is over 4gb.
@@ -11,6 +12,51 @@ use crate::util::write_all;
 // TODO: is that enough?
 const CHUNK_SIZE_LINE_MAX_LEN: usize = 10 + 64;
 const TRAILER_HEADER_LEN: usize = 4096;
+
+fn validate_extensions(mut bytes: &[u8]) -> std::io::Result<()> {
+    let invalid =
+        || std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid chunk extension");
+    while !bytes.is_empty() {
+        bytes = bytes.strip_prefix(b";").ok_or_else(invalid)?;
+        bytes = bytes.trim_ascii_start();
+        let name_end = bytes
+            .iter()
+            .position(|&b| !is_token_byte(b))
+            .unwrap_or(bytes.len());
+        if name_end == 0 {
+            return Err(invalid());
+        }
+        bytes = bytes[name_end..].trim_ascii_start();
+        if let Some(value) = bytes.strip_prefix(b"=") {
+            bytes = value.trim_ascii_start();
+            if let Some(quoted) = bytes.strip_prefix(b"\"") {
+                bytes = quoted;
+                loop {
+                    match bytes.first() {
+                        Some(b'"') => {
+                            bytes = &bytes[1..];
+                            break;
+                        }
+                        Some(b'\\') if bytes.len() >= 2 => bytes = &bytes[2..],
+                        Some(b'\\') | None => return Err(invalid()),
+                        Some(_) => bytes = &bytes[1..],
+                    }
+                }
+            } else {
+                let value_end = bytes
+                    .iter()
+                    .position(|&b| !is_token_byte(b))
+                    .unwrap_or(bytes.len());
+                if value_end == 0 {
+                    return Err(invalid());
+                }
+                bytes = &bytes[value_end..];
+            }
+            bytes = bytes.trim_ascii_start();
+        }
+    }
+    Ok(())
+}
 
 pub struct ChunkTransfer {
     state: ChunkTransferState,
@@ -78,6 +124,13 @@ impl ChunkTransfer {
                             // The complete chunk size line content (excluding CRLF)
                             let line_slice = &self.read_size_buf[0..crlf_index];
 
+                            if !is_field_value(line_slice) {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "Control character in chunk size line",
+                                ));
+                            }
+
                             if line_slice.is_empty() {
                                 return Err(std::io::Error::new(
                                     std::io::ErrorKind::InvalidData, // Use InvalidData for parse errors
@@ -110,12 +163,18 @@ impl ChunkTransfer {
                                 }
                             };
 
-                            // RFC 7230 Section 4.1.1: Parsers MAY ignore leading/trailing whitespace
-                            let trimmed_hex_str = hex_str.trim();
-                            if trimmed_hex_str.is_empty() {
+                            let trimmed_hex_str = if hex_end_index < line_slice.len() {
+                                validate_extensions(&line_slice[hex_end_index..])?;
+                                hex_str.trim_end_matches([' ', '\t'])
+                            } else {
+                                hex_str
+                            };
+                            if trimmed_hex_str.is_empty()
+                                || !trimmed_hex_str.bytes().all(|byte| byte.is_ascii_hexdigit())
+                            {
                                 return Err(std::io::Error::new(
                                     std::io::ErrorKind::InvalidData,
-                                    "chunk size hex part is empty after trim",
+                                    format!("invalid hex size ('{trimmed_hex_str}')"),
                                 ));
                             }
 
@@ -228,14 +287,6 @@ impl ChunkTransfer {
                         Some(i) => {
                             let trailer_line_len = i + 2; // Includes CRLF
 
-                            if let Some(ref mut forward_stream) = maybe_forward_stream {
-                                write_all(
-                                    forward_stream,
-                                    &self.trailer_header_buf[0..trailer_line_len],
-                                )
-                                .await?;
-                            }
-
                             // Bytes consumed from the current `unused` slice
                             let used_len = trailer_line_len - cached_len;
                             start_offset += used_len;
@@ -255,27 +306,37 @@ impl ChunkTransfer {
                                             ));
                                         }
                                     };
-                                // Basic parsing, could be more robust (e.g., handling LWS)
-                                let tokens: Vec<&str> = trailer_header_str.splitn(2, ':').collect();
-                                if tokens.len() != 2 {
+                                let (name, _value) =
+                                    parse_field(trailer_header_str).map_err(|error| {
+                                        std::io::Error::new(
+                                            std::io::ErrorKind::InvalidData,
+                                            format!("invalid trailer header format: {error}"),
+                                        )
+                                    })?;
+                                if ["content-length", "transfer-encoding", "host", "connection"]
+                                    .iter()
+                                    .any(|forbidden| name.eq_ignore_ascii_case(forbidden))
+                                {
                                     return Err(std::io::Error::new(
-                                        std::io::ErrorKind::InvalidData, // Use InvalidData
-                                        format!(
-                                            "invalid trailer header format: {}",
-                                            trailer_header_str
-                                        ),
+                                        std::io::ErrorKind::InvalidData,
+                                        "Framing or routing field in HTTP trailers",
                                     ));
                                 }
                                 #[cfg(test)]
-                                self.trailer_headers.insert(
-                                    tokens[0].trim().to_lowercase(),
-                                    tokens[1].trim().to_string(),
-                                );
+                                self.trailer_headers
+                                    .insert(name.to_ascii_lowercase(), _value.to_owned());
 
                                 self.state = ChunkTransferState::ReadTrailer { cached_len: 0 };
                             } else {
                                 // i == 0 means an empty line "\r\n" was found, signaling the end
                                 self.state = ChunkTransferState::Done;
+                            }
+                            if let Some(ref mut forward_stream) = maybe_forward_stream {
+                                write_all(
+                                    forward_stream,
+                                    &self.trailer_header_buf[..trailer_line_len],
+                                )
+                                .await?;
                             }
                         }
                         None => {
@@ -643,6 +704,61 @@ mod tests {
         assert!(transfer.is_done());
         assert!(written_data.is_none()); // No writer was provided
         assert!(transfer.trailer_headers().is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_chunk_metadata_is_never_forwarded_even_when_fragmented() {
+        for line in [
+            "+1",
+            " 1",
+            "1 ",
+            "1\t",
+            "1\n",
+            "1;foo=\r0",
+            "1;foo=\u{7f}",
+            "1;",
+            "1;=value",
+            "1;foo=",
+            "1;foo=\"unterminated",
+            "1;foo=\"ok\"junk",
+        ] {
+            let wire = format!("{line}\r\nx\r\n0\r\n\r\n");
+            for split in 0..=wire.len() {
+                let (result, _, written) = run_transfer_fragmented(
+                    &[&wire.as_bytes()[..split], &wire.as_bytes()[split..]],
+                    true,
+                )
+                .await;
+                assert!(result.is_err(), "{line:?} at {split}");
+                assert!(written.unwrap().is_empty(), "{line:?} at {split}");
+            }
+        }
+        for line in [
+            " X-Key: value",
+            "X-Key : value",
+            "X-Key: a\nb",
+            "X-Key: a\rb",
+            "Content-Length: 0",
+            "Transfer-Encoding: chunked",
+            "Host: other",
+            "Connection: keep-alive",
+        ] {
+            let wire = format!("0\r\n{line}\r\n\r\n");
+            for split in 0..=wire.len() {
+                let (result, _, written) = run_transfer_fragmented(
+                    &[&wire.as_bytes()[..split], &wire.as_bytes()[split..]],
+                    true,
+                )
+                .await;
+                assert!(result.is_err(), "{line:?} at {split}");
+                assert_eq!(written.unwrap(), b"0\r\n", "{line:?} at {split}");
+            }
+        }
+        let wire = b"1 ; foo=\"a;\\\"b\"; flag\r\nx\r\n0\r\nX-End: ok\r\n\r\n";
+        let (result, transfer, written) = run_transfer_fragmented(&[wire], true).await;
+        result.unwrap();
+        assert!(transfer.is_done());
+        assert_eq!(written.unwrap(), wire);
     }
 
     #[tokio::test]

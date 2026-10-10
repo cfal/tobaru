@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use super::string_util::update_base_path;
+use super::string_util::{path_prefix_matches, update_base_path};
 use crate::config::HttpHeaderPatch;
 
 #[derive(Default)]
@@ -9,15 +9,6 @@ pub struct Headers(Vec<(String, String)>);
 impl Headers {
     pub fn append(&mut self, name: String, value: String) {
         self.0.push((name.to_ascii_lowercase(), value));
-    }
-
-    pub fn get(&self, name: &str) -> Option<&String> {
-        // Routing previously used the last occurrence of a repeated field.
-        self.0
-            .iter()
-            .rev()
-            .find(|(key, _)| key.eq_ignore_ascii_case(name))
-            .map(|(_, value)| value)
     }
 
     pub fn insert(&mut self, name: String, value: String) {
@@ -41,7 +32,7 @@ pub trait HeaderMap {
         self.header_values(name).any(|value| {
             value
                 .split(',')
-                .any(|part| part.trim().eq_ignore_ascii_case(token))
+                .any(|part| part.trim_matches([' ', '\t']).eq_ignore_ascii_case(token))
         })
     }
 
@@ -55,7 +46,7 @@ pub trait HeaderMap {
         values
             .into_iter()
             .flat_map(|value| value.split(','))
-            .map(|coding| coding.trim().to_ascii_lowercase())
+            .map(|coding| coding.trim_matches([' ', '\t']).to_ascii_lowercase())
             .collect()
     }
 
@@ -65,7 +56,7 @@ pub trait HeaderMap {
             .header_values("content-length")
             .flat_map(|value| value.split(','))
         {
-            let value = value.trim();
+            let value = value.trim_matches([' ', '\t']);
             if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
                 return Err(std::io::Error::other("Invalid content length"));
             }
@@ -111,7 +102,9 @@ pub trait HeaderMap {
     fn update_path_headers(&mut self, base_path: &str, target_base_path: &Option<String>) {
         if let Some(prefix) = target_base_path {
             let location = self.header_values("location").last().map(str::to_owned);
-            if let Some(location) = location.filter(|location| location.starts_with(prefix)) {
+            if let Some(location) =
+                location.filter(|location| path_prefix_matches(location, prefix))
+            {
                 self.set_header(
                     "location".into(),
                     update_base_path(&location, prefix, base_path),
@@ -171,6 +164,41 @@ impl HeaderMap for HashMap<String, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn root_redirect_rewriting_preserves_empty_path_references() {
+        use super::HeaderMap;
+        for (location, expected) in [
+            ("?step=2", "?step=2"),
+            ("#section", "#section"),
+            ("", ""),
+            ("/next?step=2", "/public/next?step=2"),
+            ("/?step=2", "/public/?step=2"),
+        ] {
+            let mut headers =
+                std::collections::HashMap::from([("location".into(), location.into())]);
+            headers.update_path_headers("/public/", &Some("/".into()));
+            assert_eq!(headers["location"], expected);
+        }
+    }
+
+    #[test]
+    fn redirect_rewriting_respects_path_boundaries() {
+        use super::HeaderMap;
+        for (location, expected) in [
+            ("/internal/next", "/public/next"),
+            ("/internal?x=1", "/public?x=1"),
+            ("/internal-other", "/internal-other"),
+            (
+                "https://example.com/internal",
+                "https://example.com/internal",
+            ),
+        ] {
+            let mut headers =
+                std::collections::HashMap::from([("location".into(), location.into())]);
+            headers.update_path_headers("/public", &Some("/internal".into()));
+            assert_eq!(headers["location"], expected);
+        }
+    }
     use super::*;
     use crate::config::HttpPathAction;
     use crate::tcp::TargetHttpActionData;

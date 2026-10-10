@@ -29,18 +29,21 @@ impl ParsedHttpData {
             }
 
             if first_line.is_none() {
+                if !super::syntax::is_field_value(line.as_bytes()) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Invalid HTTP start line",
+                    ));
+                }
                 first_line = Some(line.to_string());
             } else {
-                let tokens: Vec<&str> = line.splitn(2, ':').collect();
-                if tokens.len() != 2 {
-                    return Err(std::io::Error::other(format!(
-                        "invalid http request line: {}",
-                        line
-                    )));
-                }
-                let header_key = tokens[0].trim().to_lowercase();
-                let header_value = tokens[1].trim().to_string();
-                headers.append(header_key, header_value);
+                let (name, value) = super::syntax::parse_field(line).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("invalid http request line: {}", line),
+                    )
+                })?;
+                headers.append(name.to_owned(), value.to_owned());
             }
 
             line_count += 1;
@@ -101,6 +104,48 @@ mod tests {
     use crate::http::header_map::HeaderMap;
     use crate::http::test_io::{ReadStep, ScriptedIo};
     use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn malformed_fields_are_rejected_for_requests_and_responses_at_every_split() {
+        for start in ["GET / HTTP/1.1", "HTTP/1.1 200 OK"] {
+            for field in [
+                " X-Key: value",
+                "\tX-Key: value",
+                "X-Key : value",
+                ": value",
+                "Bad Name: value",
+                "X-Key\0: value",
+                "X-Key: a\rb",
+                "X-Key: a\nb",
+                "X-Key: \u{b}value",
+                "X-Key: value\u{7f}",
+            ] {
+                let wire = format!("{start}\r\n{field}\r\n\r\n");
+                for split in 0..=wire.len() {
+                    let mut stream = ScriptedIo::split(wire.as_bytes(), split);
+                    assert!(
+                        ParsedHttpData::parse(&mut stream, LineReader::new())
+                            .await
+                            .is_err(),
+                        "{field:?} at {split}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn header_values_trim_only_http_optional_whitespace() {
+        let wire = "GET / HTTP/1.1\r\nX-Test:\t \u{a0}value\u{a0}\t \r\n\r\n";
+        let mut stream = ScriptedIo::split(wire.as_bytes(), 10);
+        let data = ParsedHttpData::parse(&mut stream, LineReader::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            data.headers().header_values("x-test").collect::<Vec<_>>(),
+            ["\u{a0}value\u{a0}"]
+        );
+    }
 
     #[tokio::test]
     async fn every_head_split_preserves_repeated_fields_and_read_ahead() {

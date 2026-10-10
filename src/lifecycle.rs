@@ -424,6 +424,7 @@ mod tests {
             serde_json::json!({"address":"127.0.0.1:1", "transport":"tcp", "target":{"allowlist":["127.0.0.1", "127.0.0.1"], "location":"127.0.0.1:2"}}),
             serde_json::json!({"address":"127.0.0.1:1", "transport":"udp", "target":{"allowlist":["127.0.0.1", "127.0.0.1"], "location":"127.0.0.1:2"}}),
             serde_json::json!({"address":"127.0.0.1:1", "transport":"tcp", "target":{"allowlist":"127.0.0.1", "server_tls":{"cert":"/does/not/exist", "key":"/does/not/exist"}, "location":"127.0.0.1:2"}}),
+            serde_json::json!({"address":"127.0.0.1:1", "transport":"tcp", "target":{"allowlist":"127.0.0.1", "server_tls":{"mode":"passthrough"}, "protocol":"http", "default_http_action":"close"}}),
         ] {
             let config = serde_json::from_value(value).unwrap();
             assert!(prepare(vec![config]).await.is_err());

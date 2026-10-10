@@ -154,6 +154,101 @@ impl Drop for Files {
 }
 
 #[tokio::test]
+async fn malformed_request_metadata_never_reaches_a_backend() {
+    checked(async {
+        for wire in [
+            "GET / HTTP/1.1\r\nHost: a.test\r\nX: a\rTransfer-Encoding: chunked\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: a.test\r\n Transfer-Encoding: chunked\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: a.test\r\nTransfer-Encoding : chunked\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: a.test\r\nTransfer-Encoding: chunked\u{a0}, chunked\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: a.test\r\nTransfer-Encoding: \u{a0}chunked, chunked\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: a.test\r\nTransfer-Encoding: chunked\u{a0}\r\nTransfer-Encoding: chunked\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: a.test\r\nTransfer-Encoding: \u{a0}chunked\r\nTransfer-Encoding: chunked\r\n\r\n",
+            "GET /extra path HTTP/1.1\r\nHost: a.test\r\n\r\n",
+            "GET /x#fragment HTTP/1.1\r\nHost: a.test\r\n\r\n",
+            "G\tET / HTTP/1.1\r\nHost: a.test\r\n\r\n",
+            "GET /x\0 HTTP/1.1\r\nHost: a.test\r\n\r\n",
+        ] {
+            let (listener, address) = backend().await;
+            let (mut client, mut task) = session(forward(address), Trie::new(), None);
+            client.write_all(wire.as_bytes()).await.unwrap();
+            assert!(rest(&mut client).await.is_empty());
+            assert!((&mut task.0).await.unwrap().is_err(), "{wire:?}");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(5), listener.accept())
+                    .await
+                    .is_err()
+            );
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn malformed_response_metadata_never_reaches_the_client() {
+    checked(async {
+        for field in [
+            " X-Key: value",
+            "Content-Length : 0",
+            "X-Key: a\rInjected: value",
+            "Transfer-Encoding: chunked\u{a0}, chunked",
+            "Transfer-Encoding: \u{a0}chunked, chunked",
+            "Transfer-Encoding: chunked\u{a0}\r\nTransfer-Encoding: chunked",
+            "Transfer-Encoding: \u{a0}chunked\r\nTransfer-Encoding: chunked",
+        ] {
+            for (method, status) in [("GET", 200), ("HEAD", 200), ("GET", 103), ("GET", 304)] {
+                let (listener, address) = backend().await;
+                let upstream = Task(tokio::spawn(async move {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    head(&mut stream).await;
+                    stream
+                        .write_all(format!("HTTP/1.1 {status} Test\r\n{field}\r\n\r\n").as_bytes())
+                        .await
+                        .unwrap();
+                    Ok(())
+                }));
+                let (mut client, mut task) = session(forward(address), Trie::new(), None);
+                client
+                    .write_all(format!("{method} / HTTP/1.1\r\nHost: a.test\r\n\r\n").as_bytes())
+                    .await
+                    .unwrap();
+                assert!(rest(&mut client).await.is_empty());
+                assert!((&mut task.0).await.unwrap().is_err());
+                upstream.finish().await;
+            }
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn quoted_transfer_parameters_survive_request_and_response_forwarding() {
+    checked(async {
+        let coding = "x-dictionary; key=\"A, chunked, B\"; other=\"a;\\\"b\", chunked";
+        let (listener, address) = backend().await;
+        let upstream = Task(tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            assert_eq!(values(&head(&mut stream).await, "transfer-encoding"), [coding]);
+            let mut body = [0; 5];
+            stream.read_exact(&mut body).await.unwrap();
+            assert_eq!(&body, b"0\r\n\r\n");
+            stream.write_all(format!(
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: {coding}\r\nConnection: close\r\n\r\n0\r\n\r\n"
+            ).as_bytes()).await.unwrap();
+            Ok(())
+        }));
+        let (mut client, task) = session(forward(address), Trie::new(), None);
+        client.write_all(format!(
+            "POST / HTTP/1.1\r\nHost: a.test\r\nTransfer-Encoding: {coding}\r\n\r\n0\r\n\r\n"
+        ).as_bytes()).await.unwrap();
+        assert_eq!(values(&head(&mut client).await, "transfer-encoding"), [coding]);
+        assert_eq!(rest(&mut client).await, b"0\r\n\r\n");
+        task.finish().await;
+        upstream.finish().await;
+    }).await;
+}
+
+#[tokio::test]
 async fn local_message_and_head_preserve_headers_and_ids() {
     checked(async {
         for method in ["GET", "HEAD"] {
@@ -188,12 +283,43 @@ async fn local_message_and_head_preserve_headers_and_ids() {
 }
 
 #[tokio::test]
-async fn initial_bytes_and_raw_routing_semantics_are_preserved() {
+async fn local_bodyless_statuses_never_send_chunk_framing_or_content() {
+    checked(async {
+        for status in [204, 205, 304] {
+            for method in ["GET", "HEAD"] {
+                let default = action(json!({
+                    "type":"serve-message", "status_code":status, "content":"must not be sent"
+                }));
+                let (mut client, task) = session(default, Trie::new(), None);
+                client
+                    .write_all(format!("{method} / HTTP/1.1\r\nHost: a.test\r\n\r\n").as_bytes())
+                    .await
+                    .unwrap();
+                let response = head(&mut client).await;
+                assert!(values(&response, "transfer-encoding").is_empty());
+                assert_eq!(
+                    values(&response, "content-length"),
+                    if status == 205 { vec!["0"] } else { vec![] }
+                );
+                assert!(rest(&mut client).await.is_empty());
+                task.finish().await;
+            }
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn initial_bytes_and_segment_routing_are_preserved() {
     checked(async {
         for (target, expected) in [
-            ("/prefix-extra", "prefix"),
+            ("/prefix-extra", "default"),
+            ("/prefix", "prefix"),
+            ("/prefix?x=1", "prefix"),
+            ("/prefix/x", "prefix"),
             ("/segment", "segment"),
-            ("/segment?x=1", "default"),
+            ("/segment?x=1", "segment"),
+            ("/parent/childishly/x", "parent"),
             ("/parent/child/x", "default"),
         ] {
             let mut paths = Trie::new();
@@ -205,6 +331,7 @@ async fn initial_bytes_and_raw_routing_semantics_are_preserved() {
                 .required_request_headers
                 .insert("x-key".into(), HttpValueMatch::Single("secret".into()));
             paths.insert("/parent/child/".into(), vec![child]);
+            paths.insert("/parent/childish".into(), vec![route(message("sibling"))]);
             let raw = format!("GET {target} HTTP/1.1\r\nHost: a.test\r\n\r\n");
             let (mut client, task) = session(
                 message("default"),
@@ -218,6 +345,35 @@ async fn initial_bytes_and_raw_routing_semantics_are_preserved() {
                 format!("{:X}\r\n{expected}\r\n0\r\n\r\n", expected.len()).as_bytes()
             );
             task.finish().await;
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn duplicate_routing_headers_cannot_fall_through_to_the_default_action() {
+    checked(async {
+        for fields in [
+            "X-Key: wrong\r\nX-Key: secret\r\n",
+            "X-Key: secret\r\nx-key: wrong\r\n",
+            "X-Key: secret\r\nx-key: secret\r\n",
+        ] {
+            let mut paths = Trie::new();
+            let mut matched = route(message("matched"));
+            matched
+                .required_request_headers
+                .insert("x-key".into(), HttpValueMatch::Single("secret".into()));
+            paths.insert("/".into(), vec![matched]);
+            let (mut client, mut task) = session(message("default"), paths, None);
+            client
+                .write_all(format!("GET / HTTP/1.1\r\nHost: a.test\r\n{fields}\r\n").as_bytes())
+                .await
+                .unwrap();
+            assert!(rest(&mut client).await.is_empty());
+            let error = (&mut task.0).await.unwrap().unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("Multiple fields for required request header"));
         }
     })
     .await;
