@@ -1005,10 +1005,11 @@ impl ServerTlsConfig {
         Ok(())
     }
 
-    /// Validate that client_tls is not enabled in passthrough mode
-    /// This must be called after action_data is available
     pub fn validate_with_action(&self, action: &TcpAction) -> Result<(), String> {
         if self.is_passthrough() {
+            if matches!(action, TcpAction::Http(_)) {
+                return Err("HTTP actions require TLS terminate mode, not passthrough".into());
+            }
             if let TcpAction::Raw(RawTcpActionConfig { locations }) = action {
                 for location in locations.iter() {
                     let (_, client_tls) = location.clone().into_components();

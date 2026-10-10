@@ -188,6 +188,33 @@ async fn local_message_and_head_preserve_headers_and_ids() {
 }
 
 #[tokio::test]
+async fn local_bodyless_statuses_never_send_chunk_framing_or_content() {
+    checked(async {
+        for status in [204, 205, 304] {
+            for method in ["GET", "HEAD"] {
+                let default = action(json!({
+                    "type":"serve-message", "status_code":status, "content":"must not be sent"
+                }));
+                let (mut client, task) = session(default, Trie::new(), None);
+                client
+                    .write_all(format!("{method} / HTTP/1.1\r\nHost: a.test\r\n\r\n").as_bytes())
+                    .await
+                    .unwrap();
+                let response = head(&mut client).await;
+                assert!(values(&response, "transfer-encoding").is_empty());
+                assert_eq!(
+                    values(&response, "content-length"),
+                    if status == 205 { vec!["0"] } else { vec![] }
+                );
+                assert!(rest(&mut client).await.is_empty());
+                task.finish().await;
+            }
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn initial_bytes_and_segment_routing_are_preserved() {
     checked(async {
         for (target, expected) in [

@@ -66,6 +66,33 @@ fn headers(fields: &std::collections::HashMap<String, String>) -> Result<(), Str
     Ok(())
 }
 
+fn non_framing_header(name: &str) -> Result<(), String> {
+    header_name(name)?;
+    if [
+        "content-length",
+        "transfer-encoding",
+        "connection",
+        "trailer",
+        "upgrade",
+    ]
+    .iter()
+    .any(|reserved| name.eq_ignore_ascii_case(reserved))
+    {
+        return Err(format!("HTTP header is managed by the server: {name}"));
+    }
+    Ok(())
+}
+
+fn local_response_headers(
+    fields: &std::collections::HashMap<String, String>,
+) -> Result<(), String> {
+    headers(fields)?;
+    for name in fields.keys() {
+        non_framing_header(name)?;
+    }
+    Ok(())
+}
+
 impl HttpHeaderPatch {
     fn validate(&self) -> Result<(), String> {
         headers(&self.default_headers)?;
@@ -82,17 +109,20 @@ impl HttpPathAction {
         let id_names = match self {
             Self::CloseConnection => return Ok(()),
             Self::ServeMessage(config) => {
-                if !(100..600).contains(&config.status_code) {
-                    return Err("HTTP status code must be between 100 and 599".into());
+                if !(200..600).contains(&config.status_code) {
+                    return Err(
+                        "serve-message requires a final HTTP status code between 200 and 599"
+                            .into(),
+                    );
                 }
                 if let Some(message) = &config.status_message {
                     header_value(message)?;
                 }
-                headers(&config.response_headers)?;
+                local_response_headers(&config.response_headers)?;
                 [None, config.response_id_header_name.as_deref()]
             }
             Self::ServeDirectory(config) => {
-                headers(&config.response_headers)?;
+                local_response_headers(&config.response_headers)?;
                 [None, config.response_id_header_name.as_deref()]
             }
             Self::Forward(config) => {
@@ -114,7 +144,7 @@ impl HttpPathAction {
             }
         };
         for name in id_names.into_iter().flatten() {
-            header_name(name)?;
+            non_framing_header(name)?;
         }
         Ok(())
     }
@@ -245,6 +275,58 @@ mod tests {
             let mut tls = serde_json::from_value(json!({"alpn_protocols":alpn})).unwrap();
             assert!(HttpProtocols::resolve(protocols, Some(&mut tls)).is_err());
         }
+    }
+
+    #[test]
+    fn local_responses_and_ids_cannot_override_wire_framing() {
+        for name in [
+            "Content-Length",
+            "TRANSFER-Encoding",
+            "Connection",
+            "Trailer",
+            "Upgrade",
+        ] {
+            for mut action in [
+                json!({"type":"serve-message", "status_code":200}),
+                json!({"type":"serve-directory", "path":"."}),
+            ] {
+                action["response_headers"] = json!({name:"value"});
+                assert!(serde_json::from_value::<HttpPathAction>(action).is_err());
+            }
+            for mut action in [
+                json!({"type":"serve-message", "status_code":200}),
+                json!({"type":"serve-directory", "path":"."}),
+                json!({"type":"forward", "location":"localhost:80"}),
+            ] {
+                action["response_id_header_name"] = json!(name);
+                assert!(serde_json::from_value::<HttpPathAction>(action).is_err());
+            }
+            assert!(serde_json::from_value::<HttpPathAction>(json!({
+                "type":"forward", "location":"localhost:80", "request_id_header_name":name
+            }))
+            .is_err());
+        }
+        for status in [100, 101, 103, 199] {
+            assert!(serde_json::from_value::<HttpPathAction>(json!({
+                "type":"serve-message", "status_code":status
+            }))
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn passthrough_rejects_http_actions_before_accepting_connections() {
+        let tls: super::super::ServerTlsConfig =
+            serde_json::from_value(json!({"mode":"passthrough"})).unwrap();
+        for value in [
+            json!({"protocol":"http", "default_http_action":"close"}),
+            json!({"protocol":"http", "default_http_action":{"type":"forward", "location":"localhost:80"}}),
+        ] {
+            let action = serde_json::from_value(value).unwrap();
+            assert!(tls.validate_with_action(&action).is_err());
+        }
+        let action = serde_json::from_value(json!({"location":"localhost:443"})).unwrap();
+        assert!(tls.validate_with_action(&action).is_ok());
     }
 
     #[test]

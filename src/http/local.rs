@@ -45,9 +45,15 @@ impl Session<'_> {
             if let Some(name) = response_id_header_name {
                 (name, &request.id).append_header_to_string(&mut response);
             }
-            response.push_str("transfer-encoding: chunked\r\nconnection: close\r\n\r\n");
+            let body_allowed = !matches!(status_code, 204 | 205 | 304);
+            if body_allowed {
+                response.push_str("transfer-encoding: chunked\r\n");
+            } else if *status_code == 205 {
+                response.push_str("content-length: 0\r\n");
+            }
+            response.push_str("connection: close\r\n\r\n");
             write_all(&mut self.stream, response.as_bytes()).await?;
-            if request.verb != "HEAD" {
+            if request.verb != "HEAD" && body_allowed {
                 if !content.is_empty() {
                     write_chunk(&mut self.stream, content.as_bytes()).await?;
                 }
