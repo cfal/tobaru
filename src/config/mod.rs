@@ -1419,6 +1419,13 @@ pub async fn load_url(config_url: &str) -> std::io::Result<ServerConfig> {
         )
     })?;
 
+    // query_pairs decodes once, but replaces invalid UTF-8; reject it before parsing.
+    if let Some(query) = url.query() {
+        percent_decode_str(query)
+            .decode_utf8()
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    }
+
     let host_str = url.host_str().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -1448,11 +1455,6 @@ pub async fn load_url(config_url: &str) -> std::io::Result<ServerConfig> {
             let mut locations = vec![];
 
             for (query_key, query_value) in url.query_pairs().into_owned() {
-                let query_value = percent_decode_str(&query_value)
-                    .decode_utf8()
-                    .unwrap()
-                    .into_owned();
-
                 match query_key.as_str() {
                     "target" | "target-address" => {
                         locations.push(TcpTargetLocation::Config(TcpTargetLocationConfig {
@@ -1507,11 +1509,6 @@ pub async fn load_url(config_url: &str) -> std::io::Result<ServerConfig> {
             let mut addresses = vec![];
 
             for (query_key, query_value) in url.query_pairs().into_owned() {
-                let query_value = percent_decode_str(&query_value)
-                    .decode_utf8()
-                    .unwrap()
-                    .into_owned();
-
                 match query_key.as_str() {
                     "target" | "target-address" => {
                         addresses.push(query_value.as_str().try_into()?);
@@ -1557,6 +1554,49 @@ pub async fn load_url(config_url: &str) -> std::io::Result<ServerConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn url_queries_are_decoded_once_and_reject_invalid_utf8() {
+        for scheme in ["tcp", "udp"] {
+            for query in ["target=%FF", "target=%C3%28", "%FF=localhost:80"] {
+                let error = load_url(&format!("{scheme}://127.0.0.1:9000?{query}"))
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            }
+            assert!(
+                load_url(&format!("{scheme}://127.0.0.1:9000?target=127.0.0.1%3A80"))
+                    .await
+                    .is_ok()
+            );
+        }
+        for (encoded, expected) in [
+            ("%2Frun%2Fbackend.sock", "/run/backend.sock"),
+            ("%2Frun%2F%25FF.sock", "/run/%FF.sock"),
+            ("%2Frun%2Fa%252Fb.sock", "/run/a%2Fb.sock"),
+            ("%2Frun%2Fa+b%2Bc.sock", "/run/a b+c.sock"),
+        ] {
+            let server = load_url(&format!("tcp://127.0.0.1:9000?target-path={encoded}"))
+                .await
+                .unwrap();
+            let TargetConfigs::Tcp { targets, .. } = server.target_configs else {
+                panic!("TCP expected")
+            };
+            let TcpAction::Raw(action) = &targets.iter().next().unwrap().action else {
+                panic!("raw expected")
+            };
+            let (location, _) = action
+                .locations
+                .iter()
+                .next()
+                .unwrap()
+                .clone()
+                .into_components();
+            assert!(
+                matches!(location, Location::Path(path) if path == std::path::Path::new(expected))
+            );
+        }
+    }
 
     #[test]
     fn tcp_target_forms_deserialize_from_json_and_yaml() {
