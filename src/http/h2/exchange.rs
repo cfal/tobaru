@@ -178,7 +178,7 @@ pub(super) async fn forward(
         unreachable!()
     };
     let final_received = Arc::new(AtomicBool::new(false));
-    let expect = message::expect_continue(request.headers())?;
+    message::expect_continue(request.headers())?;
     let deadline = || {
         HeaderDeadline::new(
             context
@@ -186,7 +186,6 @@ pub(super) async fn forward(
                 .response_header_timeout_secs
                 .map(|n| n.get()),
             has_body,
-            expect,
         )
     };
     let seconds = config.body_progress_timeout_secs.get();
@@ -196,7 +195,7 @@ pub(super) async fn forward(
             .open(plan.action, request, !has_body, context)
             .await?;
         let mut send = H2Send::new(open.send, !has_body);
-        let deadline = deadline();
+        let deadline = deadline()?;
         let activity = message::Activity::new(seconds);
         let upload = async {
             if has_body {
@@ -249,7 +248,7 @@ pub(super) async fn forward(
         )
         .await?;
         let mut send = bridge::H1Send::new(write, has_body);
-        let deadline = deadline();
+        let deadline = deadline()?;
         let activity = message::Activity::new(seconds);
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
         let upload = async {
@@ -290,7 +289,6 @@ pub(super) async fn forward(
                         bridge::framing(response.headers(), true)?;
                         message::strip_hop_headers(response.headers_mut(), false)?;
                         message::validate_response(&mut response, limit)?;
-                        deadline.informational(response.status());
                         output.head(response, false).await?;
                         activity.touch();
                     }
@@ -392,7 +390,6 @@ async fn response_h2(
                             return Err(invalid("Invalid informational response sequence"));
                         }
                         message::validate_response(&mut head, limit)?;
-                        deadline.informational(head.status());
                         output.head(head, false).await?;
                         activity.touch();
                     }

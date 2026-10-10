@@ -1,12 +1,10 @@
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tokio::sync::watch;
 use tokio::time::Instant;
 
 pub(super) struct HeaderDeadline {
-    deadline: watch::Sender<Option<Instant>>,
-    explicit: bool,
+    deadline: Option<Instant>,
     uploaded: AtomicBool,
 }
 
@@ -14,48 +12,37 @@ impl HeaderDeadline {
     pub fn upload_complete(&self) -> bool {
         self.uploaded.load(Ordering::Acquire)
     }
-    pub fn new(explicit: Option<u64>, has_body: bool, expect: bool) -> Self {
-        let initial = (explicit.is_some() || !has_body || expect)
-            .then(|| Instant::now() + Duration::from_secs(explicit.unwrap_or(30)));
-        Self {
-            deadline: watch::channel(initial).0,
-            explicit: explicit.is_some(),
+    pub fn new(seconds: Option<u64>, has_body: bool) -> io::Result<Self> {
+        let deadline = seconds
+            .map(|seconds| {
+                Instant::now()
+                    .checked_add(Duration::from_secs(seconds))
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "Timeout is too large")
+                    })
+            })
+            .transpose()?;
+        Ok(Self {
+            deadline,
             uploaded: AtomicBool::new(!has_body),
-        }
+        })
     }
 
     pub fn uploaded(&self) {
         self.uploaded.store(true, Ordering::Release);
-        if !self.explicit {
-            self.deadline
-                .send_replace(Some(Instant::now() + Duration::from_secs(30)));
-        }
-    }
-
-    pub fn informational(&self, status: http::StatusCode) {
-        if status == http::StatusCode::CONTINUE
-            && !self.explicit
-            && !self.uploaded.load(Ordering::Acquire)
-        {
-            self.deadline.send_replace(None);
-        }
     }
 
     pub async fn wait<T>(
         &self,
         operation: impl std::future::Future<Output = io::Result<T>>,
     ) -> io::Result<T> {
-        let mut deadline = self.deadline.subscribe();
-        tokio::pin!(operation);
-        loop {
-            let instant = *deadline.borrow_and_update();
-            tokio::select! {
-                result = &mut operation => return result,
-                _ = deadline.changed() => {},
-                _ = async { match instant { Some(instant) => tokio::time::sleep_until(instant).await, None => std::future::pending::<()>().await } } => {
-                    return Err(io::Error::new(io::ErrorKind::TimedOut, "HTTP response header deadline"));
-                }
-            }
+        match self.deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, operation)
+                .await
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::TimedOut, "HTTP response header deadline")
+                })?,
+            None => operation.await,
         }
     }
 }
@@ -65,42 +52,42 @@ mod tests {
     use super::*;
 
     #[tokio::test(start_paused = true)]
-    async fn default_deadline_starts_after_upload_but_explicit_is_absolute() {
-        let default = HeaderDeadline::new(None, true, false);
-        let explicit = HeaderDeadline::new(Some(30), true, false);
-        tokio::time::advance(Duration::from_secs(31)).await;
-        assert!(tokio::time::timeout(
-            Duration::from_secs(1),
-            default.wait(std::future::pending::<io::Result<()>>())
-        )
-        .await
-        .is_err());
-        assert_eq!(
-            explicit
-                .wait(std::future::pending::<io::Result<()>>())
-                .await
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::TimedOut
-        );
-        default.uploaded();
-        assert!(default.wait(async { Ok(()) }).await.is_ok());
-        tokio::time::advance(Duration::from_secs(31)).await;
-        assert!(default
-            .wait(std::future::pending::<io::Result<()>>())
-            .await
-            .is_err());
+    async fn omitted_deadline_stays_disabled_before_and_after_upload() {
+        for has_body in [false, true] {
+            let deadline = HeaderDeadline::new(None, has_body).unwrap();
+            for _ in 0..2 {
+                deadline
+                    .wait(async {
+                        tokio::time::sleep(Duration::from_secs(3600)).await;
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+                deadline.uploaded();
+            }
+        }
     }
 
     #[tokio::test(start_paused = true)]
-    async fn hints_do_not_extend_expect_deadline() {
-        let deadline = HeaderDeadline::new(None, true, true);
-        tokio::time::advance(Duration::from_secs(20)).await;
-        deadline.informational(http::StatusCode::EARLY_HINTS);
-        tokio::time::advance(Duration::from_secs(11)).await;
-        assert!(deadline
-            .wait(std::future::pending::<io::Result<()>>())
-            .await
-            .is_err());
+    async fn explicit_deadline_is_absolute_and_upload_does_not_extend_it() {
+        for complete in [false, true] {
+            let deadline = HeaderDeadline::new(Some(30), true).unwrap();
+            tokio::time::advance(Duration::from_secs(20)).await;
+            if complete {
+                deadline.uploaded();
+            }
+            let start = Instant::now();
+            let error = deadline
+                .wait(std::future::pending::<io::Result<()>>())
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            assert_eq!(start.elapsed(), Duration::from_secs(10));
+        }
+    }
+
+    #[tokio::test]
+    async fn excessive_deadlines_are_rejected_without_panicking() {
+        assert!(HeaderDeadline::new(Some(u64::MAX), false).is_err());
     }
 }
