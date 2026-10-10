@@ -179,6 +179,11 @@ try {
   assert.equal(echoed.continues, 1);
   assert.equal(connections, 1, 'Sequential requests must reuse their backend');
 
+  const sensitive = await request(port, 'GET', '/logged-path?token=not-for-access-logs');
+  assert.equal(sensitive.response.statusCode, 200);
+  await waitForLog('GET /logged-path [forward]');
+  assert(!logs.includes('not-for-access-logs'));
+
   const socket = new net.Socket({ signal });
   sockets.add(socket);
   socket.on('close', () => sockets.delete(socket));

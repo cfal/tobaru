@@ -87,7 +87,7 @@ impl ParsedHttpData {
                 let (name, value) = super::syntax::parse_field(line).map_err(|_| {
                     std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
-                        format!("invalid http request line: {}", line),
+                        "Invalid HTTP header field",
                     )
                 })?;
                 headers.append(name.to_owned(), value.to_owned());
@@ -150,6 +150,60 @@ mod tests {
     use super::*;
     use crate::http::header_map::HeaderMap;
     use crate::http::test_io::{ReadStep, ScriptedIo};
+
+    #[tokio::test]
+    async fn byte_mutations_parse_identically_across_fragment_boundaries() {
+        async fn parse(
+            wire: &[u8],
+            split: usize,
+            response: bool,
+        ) -> Result<String, (std::io::ErrorKind, String)> {
+            let mut io = crate::http::test_io::ScriptedIo::split(wire, split);
+            let result = if response {
+                super::ParsedHttpData::parse_response(&mut io, super::LineReader::new()).await
+            } else {
+                super::ParsedHttpData::parse(&mut io, super::LineReader::new()).await
+            };
+            result
+                .map(|data| crate::http::string_util::create_message(&data))
+                .map_err(|error| (error.kind(), error.to_string()))
+        }
+        for (seed, response) in [
+            (
+                b"GET /?x=y HTTP/1.1\r\nHost: a\r\nX-A: b\r\n\r\n".as_slice(),
+                false,
+            ),
+            (
+                b"HTTP/1.1 200 OK\r\nSet-Cookie: a\r\nX-A: b\r\n\r\n".as_slice(),
+                true,
+            ),
+        ] {
+            for index in 0..seed.len() {
+                for byte in 0..=u8::MAX {
+                    let mut wire = seed.to_vec();
+                    wire[index] = byte;
+                    let contiguous = parse(&wire, wire.len(), response).await;
+                    assert_eq!(
+                        parse(&wire, index + 1, response).await,
+                        contiguous,
+                        "response={response}, byte={byte}, index={index}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_fields_do_not_echo_sensitive_values() {
+        let error = super::ParsedHttpData::parse(
+            &mut &b"GET /?token=secret HTTP/1.1\r\n Authorization: secret\r\n\r\n"[..],
+            super::LineReader::new(),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(error.to_string(), "Invalid HTTP header field");
+    }
     use tokio::io::AsyncReadExt;
 
     #[tokio::test]
@@ -261,7 +315,7 @@ mod tests {
             ("\r\n".to_owned(), "empty http request"),
             (
                 "GET / HTTP/1.1\r\nmissing-colon\r\n\r\n".into(),
-                "invalid http request line: missing-colon",
+                "Invalid HTTP header field",
             ),
             (
                 format!("{}\r\n\r\n", "x".repeat(4096)),
