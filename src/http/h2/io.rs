@@ -22,7 +22,7 @@ pub(super) struct TimedIo<T> {
     header_open: bool,
     encoded: usize,
     limit: usize,
-    timeout: Duration,
+    timeout: Option<Duration>,
     deadline: Option<Pin<Box<Sleep>>>,
     deadline_state: watch::Sender<Option<tokio::time::Instant>>,
     sections: Option<Sections>,
@@ -53,10 +53,11 @@ impl<T> TimedIo<T> {
         inner: T,
         initial: Vec<u8>,
         server: bool,
-        timeout: Duration,
+        timeout: impl Into<Option<Duration>>,
         limit: usize,
         max_streams: usize,
     ) -> Self {
+        let timeout = timeout.into();
         let state = Self {
             inner,
             initial: initial.into(),
@@ -69,7 +70,7 @@ impl<T> TimedIo<T> {
             limit,
             timeout,
             deadline: if server {
-                Some(Box::pin(tokio::time::sleep(timeout)))
+                timeout.map(|duration| Box::pin(tokio::time::sleep(duration)))
             } else {
                 None
             },
@@ -117,7 +118,9 @@ impl<T> TimedIo<T> {
     fn observe(&mut self, mut bytes: &[u8]) -> io::Result<()> {
         while !bytes.is_empty() {
             if self.deadline.is_none() {
-                self.deadline = Some(Box::pin(tokio::time::sleep(self.timeout)));
+                self.deadline = self
+                    .timeout
+                    .map(|duration| Box::pin(tokio::time::sleep(duration)));
             }
             if self.preface != 0 {
                 let n = self.preface.min(bytes.len());
@@ -250,6 +253,27 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for TimedIo<T> {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    #[tokio::test(start_paused = true)]
+    async fn disabled_frontend_timer_keeps_encoded_header_limits() {
+        let (mut peer, stream) = tokio::io::duplex(256);
+        let mut io = TimedIo::new(stream, vec![], true, None, 1, 64);
+        peer.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+            .await
+            .unwrap();
+        io.read_exact(&mut [0; 24]).await.unwrap();
+        peer.write_all(&[0, 0]).await.unwrap();
+        io.read_exact(&mut [0; 2]).await.unwrap();
+        tokio::time::advance(Duration::from_secs(100)).await;
+        assert!(io.deadline.is_none());
+        peer.write_all(&[2, 1, 4, 0, 0, 0, 1, b'a', b'b'])
+            .await
+            .unwrap();
+        assert_eq!(
+            io.read(&mut [0; 9]).await.unwrap_err().to_string(),
+            "Encoded HTTP/2 field section too large"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn watchdog_expires_without_another_transport_read() {
         let (mut peer, stream) = tokio::io::duplex(256);
