@@ -27,6 +27,10 @@ impl H2Body {
 
 #[async_trait]
 impl ReceiveBody for H2Body {
+    fn watch_upload(&mut self, upload: &mut crate::http::upload::Upload) {
+        upload.watch_h2(self.stream.flow_control().clone());
+    }
+
     async fn next(&mut self) -> io::Result<Option<BodyFrame>> {
         if self.finished {
             return Ok(None);

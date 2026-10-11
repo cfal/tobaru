@@ -179,8 +179,8 @@ pub(super) async fn forward(
     else {
         unreachable!()
     };
-    let upload_state = Upload::new(message::expect_continue(request.headers())?);
-    body.watch_upload(upload_state.clone());
+    let mut upload_state = Upload::new(message::expect_continue(request.headers())?);
+    body.watch_upload(&mut upload_state);
     let upload_policy = message::BodyPolicy {
         activity: &activity,
         upstream_seconds: context.timeouts.upstream_body_progress_timeout_secs,
