@@ -214,6 +214,8 @@ pub(super) async fn forward(
         let upload = async {
             if has_body {
                 tokio::select! {
+                    // Forward a ready EOF or trailers before early-final cancellation.
+                    biased;
                     result = message::copy_body(body, &mut send, expected, &upload_policy, limit) => result?,
                     _ = upload_state.stopped() => return Ok(false),
                 }
