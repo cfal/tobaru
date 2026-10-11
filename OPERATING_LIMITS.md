@@ -95,8 +95,10 @@ No new mandatory upstream setup, raw inactivity, or whole-connection deadline is
 ## HTTP Metadata and Logging
 
 Legacy H1 request limits remain unchanged: less than 4 KiB per line, at most 38 fields plus
-the start line. H1 responses permit at most 128 fields, 16 KiB per line, and 64 KiB for the
-complete head including CRLFs. At most 16 informational responses precede a final response.
+the start line. The legacy H1-to-H1 response parser permits at most 128 fields, 16 KiB per
+line, and 64 KiB for the complete head including CRLFs. H1/H2 translation uses separate
+configurable field-list accounting rather than these legacy response-head limits.
+At most 16 informational responses precede a final response.
 
 Legacy H1 chunked trailers permit at most 128 fields and 64 KiB of field lines including
 their CRLFs, excluding the final empty line. Over-limit fields are rejected before being
