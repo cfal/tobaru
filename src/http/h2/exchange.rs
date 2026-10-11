@@ -179,7 +179,6 @@ pub(super) async fn forward(
     else {
         unreachable!()
     };
-    let final_received = Arc::new(AtomicBool::new(false));
     let upload_state = Upload::new(message::expect_continue(request.headers())?);
     body.watch_upload(upload_state.clone());
     let upload_policy = message::BodyPolicy {
@@ -231,9 +230,8 @@ pub(super) async fn forward(
             &response_policy,
             &upload_state,
             config,
-            &final_received,
         );
-        let result = concurrent(upload, response, &final_received).await;
+        let result = concurrent(upload, response).await;
         drop(open._client);
         result
     } else {
@@ -274,6 +272,7 @@ pub(super) async fn forward(
             has_body,
         );
         let deadline = deadline()?;
+        let final_received = AtomicBool::new(false);
         let upload = async {
             if !has_body {
                 return Ok(true);
@@ -282,7 +281,10 @@ pub(super) async fn forward(
                 result = message::copy_body(body, &mut send, expected, &upload_policy, limit) => {
                     if let Err(error) = result {
                         // An early response may need upload EOF before its body can finish.
-                        let _ = progress(seconds, send.io.shutdown()).await;
+                        progress(seconds, send.io.shutdown()).await?;
+                        if error.kind() != io::ErrorKind::TimedOut && final_received.load(Ordering::Acquire) {
+                            return Ok(false);
+                        }
                         return Err(error);
                     }
                     deadline.uploaded();
@@ -358,25 +360,22 @@ pub(super) async fn forward(
             }
             Ok(())
         };
-        concurrent(upload, response, &final_received).await
+        concurrent(upload, response).await
     }
 }
 
 async fn concurrent(
     upload: impl Future<Output = io::Result<bool>>,
     response: impl Future<Output = io::Result<()>>,
-    final_received: &AtomicBool,
 ) -> io::Result<bool> {
     tokio::pin!(upload, response);
     tokio::select! {
         biased;
         result = &mut response => { result?; Ok(false) },
         result = &mut upload => {
-            match result {
-                Ok(complete) => { response.await?; Ok(complete) }
-                Err(_) if final_received.load(Ordering::Acquire) => { response.await?; Ok(false) }
-                Err(error) => Err(error),
-            }
+            let complete = result?;
+            response.await?;
+            Ok(complete)
         }
     }
 }
@@ -396,7 +395,6 @@ async fn response_h2(
     policy: &message::BodyPolicy<'_>,
     upload_state: &Upload,
     config: Http2Config,
-    final_received: &AtomicBool,
 ) -> io::Result<()> {
     let limit = config.max_header_list_size.get() as usize;
     let response = deadline
@@ -437,7 +435,6 @@ async fn response_h2(
             }
         })
         .await?;
-    final_received.store(true, Ordering::Release);
     if !deadline.upload_complete() {
         output.early_final();
         upload_state.stop_if_pending();

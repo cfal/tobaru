@@ -248,6 +248,148 @@ async fn explicit_h2_upstream_body_budget_releases_admission_and_preserves_sibli
 }
 
 #[tokio::test]
+async fn active_upload_timeout_after_final_headers_releases_admission() {
+    for frontend_h2 in [false, true] {
+        let (addr, _, _backend) = h2_backend(|mut request, mut response| async move {
+            if request.uri().path() == "/slow" {
+                let first = request.body_mut().data().await.unwrap().unwrap();
+                request
+                    .body_mut()
+                    .flow_control()
+                    .release_capacity(first.len())
+                    .unwrap();
+                let mut send = response.send_response(Response::new(()), false).unwrap();
+                while let Some(data) = request.body_mut().data().await {
+                    let Ok(data) = data else {
+                        return;
+                    };
+                    request
+                        .body_mut()
+                        .flow_control()
+                        .release_capacity(data.len())
+                        .unwrap();
+                }
+                let _ = send.send_data(Bytes::from_static(b"EOF received"), true);
+            } else {
+                let mut send = response.send_response(Response::new(()), false).unwrap();
+                send.send_data(Bytes::from_static(b"OK"), true).unwrap();
+            }
+        })
+        .await;
+        let config = Http2Config {
+            max_backend_connections: 1.try_into().unwrap(),
+            body_progress_timeout_secs: 1.try_into().unwrap(),
+            ..Default::default()
+        };
+        let make_http = || {
+            runtime(
+                action(
+                    json!({"type":"forward", "location":addr.to_string(), "upstream_protocol":"http2"}),
+                ),
+                config,
+                None,
+            )
+        };
+        let http = make_http();
+        let admission = http.h2_admission.backends.clone();
+        assert!(http
+            .http_timeouts
+            .upstream_body_progress_timeout_secs
+            .is_none());
+        if frontend_h2 {
+            let (mut client, _driver, _server) = configured_frontend(http).await;
+            let (response, mut upload) = client
+                .send_request(
+                    Request::builder()
+                        .method("POST")
+                        .uri("http://example.test/slow")
+                        .header("content-length", "2")
+                        .body(())
+                        .unwrap(),
+                    false,
+                )
+                .unwrap();
+            upload.send_data(Bytes::from_static(b"x"), false).unwrap();
+            let mut response = response.await.unwrap();
+            assert_eq!(response.status(), 200);
+            elapse(2).await;
+            assert!(response.body_mut().data().await.unwrap().is_err());
+            assert_eq!(admission.available_permits(), 1);
+            let (response, _) = client
+                .send_request(
+                    Request::builder()
+                        .uri("http://example.test/next")
+                        .body(())
+                        .unwrap(),
+                    true,
+                )
+                .unwrap();
+            assert_eq!(collect(response.await.unwrap().into_body()).await.0, b"OK");
+        } else {
+            let (mut client, mut session) = h1_frontend(http);
+            client
+                .write_all(
+                    b"POST /slow HTTP/1.1\r\nHost: example.test\r\nContent-Length: 2\r\n\r\nx",
+                )
+                .await
+                .unwrap();
+            assert!(head(&mut client).await.starts_with(b"HTTP/1.1 200"));
+            elapse(2).await;
+            assert!(matches!(client.read(&mut [0]).await, Ok(0) | Err(_)));
+            assert_eq!(
+                (&mut session.0).await.unwrap().unwrap_err().kind(),
+                std::io::ErrorKind::TimedOut
+            );
+            assert_eq!(admission.available_permits(), 1);
+            let mut next = make_http();
+            next.h2_admission.backends = admission;
+            let (mut client, _session) = h1_frontend(next);
+            client
+                .write_all(b"GET /next HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            assert!(head(&mut client).await.starts_with(b"HTTP/1.1 200"));
+            assert_eq!(chunked(&mut client).await.0, b"OK");
+        }
+    }
+}
+
+#[tokio::test]
+async fn malformed_upload_after_h2_final_headers_does_not_hold_admission() {
+    let (addr, _, _backend) = h2_backend(|mut request, mut response| async move {
+        let first = request.body_mut().data().await.unwrap().unwrap();
+        request
+            .body_mut()
+            .flow_control()
+            .release_capacity(first.len())
+            .unwrap();
+        let _send = response.send_response(Response::new(()), false).unwrap();
+        let _ = request.body_mut().data().await;
+    })
+    .await;
+    let http = runtime(
+        action(json!({"type":"forward", "location":addr.to_string(), "upstream_protocol":"http2"})),
+        Http2Config {
+            max_backend_connections: 1.try_into().unwrap(),
+            ..Default::default()
+        },
+        None,
+    );
+    let admission = http.h2_admission.backends.clone();
+    let (mut client, mut session) = h1_frontend(http);
+    client.write_all(b"POST / HTTP/1.1\r\nHost: example.test\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n").await.unwrap();
+    assert!(head(&mut client).await.starts_with(b"HTTP/1.1 200"));
+    client.write_all(b"invalid-size\r\n").await.unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(2), &mut session.0)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(admission.available_permits(), 1);
+}
+
+#[tokio::test]
 async fn explicit_header_budget_expires_during_expect_and_interim_responses() {
     for status in [100, 103] {
         let (addr, _, _backend) = h2_backend(move |request, mut response| async move {
