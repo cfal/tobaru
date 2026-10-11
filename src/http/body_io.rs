@@ -33,18 +33,21 @@ fn poll_operation<T>(
     poll: impl FnOnce(&mut Context<'_>) -> Poll<io::Result<T>>,
 ) -> Poll<io::Result<T>> {
     if let Some(seconds) = seconds {
-        if timer.is_none() {
-            let Some(deadline) =
-                tokio::time::Instant::now().checked_add(Duration::from_secs(seconds.get()))
-            else {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "Timeout is too large",
-                )));
-            };
-            *timer = Some(Box::pin(tokio::time::sleep_until(deadline)));
-        }
-        if timer.as_mut().unwrap().as_mut().poll(cx).is_ready() {
+        let sleep = match timer {
+            Some(sleep) => sleep,
+            None => {
+                let Some(deadline) =
+                    tokio::time::Instant::now().checked_add(Duration::from_secs(seconds.get()))
+                else {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Timeout is too large",
+                    )));
+                };
+                timer.insert(Box::pin(tokio::time::sleep_until(deadline)))
+            }
+        };
+        if sleep.as_mut().poll(cx).is_ready() {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!("Upstream body {operation} made no progress for {seconds}s"),
