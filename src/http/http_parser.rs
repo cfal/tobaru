@@ -10,9 +10,9 @@ pub struct ParsedHttpData {
 }
 
 struct HeadLimits {
-    line_bytes: usize,
-    lines: usize,
-    bytes: usize,
+    max_line_bytes: usize,
+    max_lines: usize,
+    max_head_bytes: usize,
 }
 
 impl ParsedHttpData {
@@ -24,9 +24,9 @@ impl ParsedHttpData {
             stream,
             line_reader,
             HeadLimits {
-                line_bytes: 4095,
-                lines: 39,
-                bytes: 39 * 4097 + 2,
+                max_line_bytes: 4095,
+                max_lines: 39,
+                max_head_bytes: 39 * 4097 + 2,
             },
         )
         .await
@@ -40,9 +40,9 @@ impl ParsedHttpData {
             stream,
             line_reader,
             HeadLimits {
-                line_bytes: 16384,
-                lines: super::message::MAX_FIELDS + 1,
-                bytes: 65536,
+                max_line_bytes: 16384,
+                max_lines: super::message::MAX_FIELDS + 1,
+                max_head_bytes: 65536,
             },
         )
         .await
@@ -64,14 +64,14 @@ impl ParsedHttpData {
         loop {
             let line = line_reader.read_line(stream).await?;
             byte_count += line.len() + 2;
-            if byte_count > limits.bytes {
+            if byte_count > limits.max_head_bytes {
                 return Err(std::io::Error::other("HTTP head exceeds byte limit"));
             }
             if line.is_empty() {
                 break;
             }
 
-            if line.len() > limits.line_bytes {
+            if line.len() > limits.max_line_bytes {
                 return Err(std::io::Error::other("HTTP head line is too long"));
             }
 
@@ -94,7 +94,7 @@ impl ParsedHttpData {
             }
 
             line_count += 1;
-            if line_count > limits.lines {
+            if line_count > limits.max_lines {
                 return Err(std::io::Error::other("HTTP head has too many lines"));
             }
         }
@@ -150,6 +150,7 @@ mod tests {
     use super::*;
     use crate::http::header_map::HeaderMap;
     use crate::http::test_io::{ReadStep, ScriptedIo};
+    use tokio::io::AsyncReadExt;
 
     #[tokio::test]
     async fn byte_mutations_parse_identically_across_fragment_boundaries() {
@@ -204,7 +205,6 @@ mod tests {
         .unwrap();
         assert_eq!(error.to_string(), "Invalid HTTP header field");
     }
-    use tokio::io::AsyncReadExt;
 
     #[tokio::test]
     async fn responses_have_separate_bounded_limits_without_relaxing_requests() {

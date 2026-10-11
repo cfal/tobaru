@@ -21,13 +21,13 @@ pub(super) struct Upload {
 
 impl Upload {
     pub fn new(expect: bool) -> Self {
+        let phase = if expect {
+            Phase::ExpectPending
+        } else {
+            Phase::Active
+        };
         Self {
-            phase: watch::channel(if expect {
-                Phase::ExpectPending
-            } else {
-                Phase::Active
-            })
-            .0,
+            phase: watch::channel(phase).0,
             h2_receive: None,
         }
     }
@@ -38,12 +38,11 @@ impl Upload {
 
     pub fn started(&self) {
         self.phase.send_if_modified(|phase| {
-            if *phase == Phase::ExpectPending {
-                *phase = Phase::Active;
-                true
-            } else {
-                false
+            if *phase != Phase::ExpectPending {
+                return false;
             }
+            *phase = Phase::Active;
+            true
         });
     }
 
@@ -53,21 +52,20 @@ impl Upload {
 
     pub fn stop_if_pending(&self) {
         self.phase.send_if_modified(|phase| {
-            if *phase == Phase::ExpectPending {
-                // H2 DATA can arrive during backend setup, before the upload's first poll.
-                *phase = if self
-                    .h2_receive
-                    .as_ref()
-                    .is_some_and(|receive| receive.used_capacity() > 0)
-                {
-                    Phase::Active
-                } else {
-                    Phase::Stopped
-                };
-                true
-            } else {
-                false
+            if *phase != Phase::ExpectPending {
+                return false;
             }
+            // H2 DATA can arrive during backend setup, before the upload's first poll.
+            let has_buffered_data = self
+                .h2_receive
+                .as_ref()
+                .is_some_and(|receive| receive.used_capacity() > 0);
+            *phase = if has_buffered_data {
+                Phase::Active
+            } else {
+                Phase::Stopped
+            };
+            true
         });
     }
 
