@@ -594,6 +594,96 @@ async fn buffered_expect_upload_survives_an_immediate_duplex_final_response() {
 }
 
 #[tokio::test]
+async fn ready_expect_upload_completion_wins_after_final_response() {
+    use crate::http::upload::Upload;
+
+    struct CompletedAfterFinal {
+        upload: Option<Upload>,
+        frame: Option<BodyFrame>,
+    }
+
+    #[async_trait::async_trait]
+    impl ReceiveBody for CompletedAfterFinal {
+        fn watch_upload(&mut self, upload: &mut Upload) {
+            self.upload = Some(upload.clone());
+        }
+
+        async fn next(&mut self) -> std::io::Result<Option<BodyFrame>> {
+            // Make zero-byte completion ready alongside the early-final cancellation.
+            self.upload.as_ref().unwrap().stopped().await;
+            Ok(self.frame.take())
+        }
+    }
+
+    checked(async {
+        let (addr, _, _backend) = h2_backend(|request, mut response| async move {
+            let trailers_only = request.uri().path() == "/trailers";
+            let mut send = response.send_response(Response::new(()), false).unwrap();
+            let (data, trailers) = collect(request.into_body()).await;
+            assert!(data.is_empty());
+            if trailers_only {
+                assert_eq!(trailers["x-end"], "complete");
+            } else {
+                assert!(trailers.is_empty());
+            }
+            send.send_data(Bytes::from_static(b"EOF received"), true)
+                .unwrap();
+        })
+        .await;
+        let action = action(json!({
+            "type": "forward", "location": addr.to_string(), "upstream_protocol": "http2"
+        }));
+        let mut context = Context::testing();
+        context.backends = Arc::new(Semaphore::new(1));
+        for path in ["/eof", "/empty-data", "/trailers"] {
+            for _ in 0..16 {
+                let frame = match path {
+                    "/empty-data" => Some(BodyFrame::Data(Bytes::new())),
+                    "/trailers" => {
+                        let mut trailers = HeaderMap::new();
+                        trailers.insert("x-end", HeaderValue::from_static("complete"));
+                        Some(BodyFrame::Trailers(trailers))
+                    }
+                    _ => None,
+                };
+                let mut body = CompletedAfterFinal {
+                    upload: None,
+                    frame,
+                };
+                let mut output =
+                    crate::http::bridge::H1Response::new(Vec::new(), http::Method::POST, false);
+                assert!(exchange::forward(
+                    &context,
+                    exchange::Plan {
+                        action: &action,
+                        base_path: "/",
+                        request_id: "test"
+                    },
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("http://example.test{path}"))
+                        .header("host", "example.test")
+                        .header("expect", "100-continue")
+                        .body(())
+                        .unwrap(),
+                    &mut body,
+                    &mut output,
+                    true,
+                )
+                .await
+                .unwrap());
+                assert!(String::from_utf8(output.body.io)
+                    .unwrap()
+                    .contains("EOF received"));
+                assert_eq!(context.backends.available_permits(), 1);
+            }
+        }
+        context.clients.shutdown().await;
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn h2_upstream_early_final_completes_before_upload_cancellation() {
     checked(async {
         for h2_ingress in [false, true] {
