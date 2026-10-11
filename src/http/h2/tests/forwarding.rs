@@ -435,6 +435,29 @@ async fn forwarded_bodyless_responses_preserve_all_four_paths() {
 }
 
 #[tokio::test]
+async fn buffered_expect_upload_survives_an_immediate_duplex_final_response() {
+    checked(async {
+        let (addr, _, _backend) = h2_backend(|mut request, mut response| async move {
+            let mut send = response.send_response(Response::new(()), false).unwrap();
+            while let Some(data) = request.body_mut().data().await {
+                let data = data.unwrap();
+                request.body_mut().flow_control().release_capacity(data.len()).unwrap();
+                send.send_data(data, false).unwrap();
+            }
+            send.send_data(Bytes::new(), true).unwrap();
+        }).await;
+        let (mut client, _session) = h1_frontend(forwarding(addr));
+        client.write_all(b"POST /duplex HTTP/1.1\r\nHost: example.test\r\nExpect: 100-continue\r\nContent-Length: 2\r\nConnection: close\r\n\r\nx").await.unwrap();
+        assert!(head(&mut client).await.starts_with(b"HTTP/1.1 200"));
+        let mut first = [0; 6];
+        client.read_exact(&mut first).await.unwrap();
+        assert_eq!(&first, b"1\r\nx\r\n");
+        client.write_all(b"y").await.unwrap();
+        assert_eq!(chunked(&mut client).await.0, b"y");
+    }).await;
+}
+
+#[tokio::test]
 async fn h2_upstream_early_final_completes_before_upload_cancellation() {
     checked(async {
         for h2_ingress in [false, true] {
