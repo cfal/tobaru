@@ -14,22 +14,30 @@ enum Phase {
 }
 
 #[derive(Clone)]
-pub(super) struct Upload(watch::Sender<Phase>);
+pub(super) struct Upload {
+    phase: watch::Sender<Phase>,
+    h2_receive: Option<h2::FlowControl>,
+}
 
 impl Upload {
     pub fn new(expect: bool) -> Self {
-        Self(
-            watch::channel(if expect {
+        Self {
+            phase: watch::channel(if expect {
                 Phase::ExpectPending
             } else {
                 Phase::Active
             })
             .0,
-        )
+            h2_receive: None,
+        }
+    }
+
+    pub fn watch_h2(&mut self, receive: h2::FlowControl) {
+        self.h2_receive = Some(receive);
     }
 
     pub fn started(&self) {
-        self.0.send_if_modified(|phase| {
+        self.phase.send_if_modified(|phase| {
             if *phase == Phase::ExpectPending {
                 *phase = Phase::Active;
                 true
@@ -40,13 +48,22 @@ impl Upload {
     }
 
     pub fn stop(&self) {
-        self.0.send_replace(Phase::Stopped);
+        self.phase.send_replace(Phase::Stopped);
     }
 
     pub fn stop_if_pending(&self) {
-        self.0.send_if_modified(|phase| {
+        self.phase.send_if_modified(|phase| {
             if *phase == Phase::ExpectPending {
-                *phase = Phase::Stopped;
+                // H2 DATA can arrive during backend setup, before the upload's first poll.
+                *phase = if self
+                    .h2_receive
+                    .as_ref()
+                    .is_some_and(|receive| receive.used_capacity() > 0)
+                {
+                    Phase::Active
+                } else {
+                    Phase::Stopped
+                };
                 true
             } else {
                 false
@@ -55,7 +72,7 @@ impl Upload {
     }
 
     pub async fn stopped(&self) {
-        let mut phase = self.0.subscribe();
+        let mut phase = self.phase.subscribe();
         loop {
             if *phase.borrow_and_update() == Phase::Stopped {
                 return;
@@ -71,7 +88,7 @@ impl Upload {
         activity: &Activity,
         operation: impl Future<Output = io::Result<Option<BodyFrame>>>,
     ) -> io::Result<Option<BodyFrame>> {
-        let mut phase = self.0.subscribe();
+        let mut phase = self.phase.subscribe();
         // H1 reads can consume framing before yielding. A phase change must not restart them.
         tokio::pin!(operation);
         loop {
@@ -143,7 +160,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn partial_h1_upload_activates_protection_without_restarting_the_read() {
         for buffered in [false, true] {
-            let upload = Upload::new(true);
+            let mut upload = Upload::new(true);
             let activity = Activity::new(10);
             let (mut peer, io) = tokio::io::duplex(256);
             let mut reader = LineReader::new();
@@ -151,7 +168,7 @@ mod tests {
                 reader = LineReader::new_with_data(b"1".to_vec());
             }
             let mut body = H1Body::new(io, reader, Framing::Chunked, 65536);
-            body.watch_upload(upload.clone());
+            body.watch_upload(&mut upload);
             let (result, ()) = tokio::join!(upload.read(&activity, body.next()), async {
                 if !buffered {
                     peer.write_all(b"1").await.unwrap();
@@ -174,7 +191,7 @@ mod tests {
 
     #[tokio::test]
     async fn buffered_upload_is_active_before_a_ready_final_response() {
-        let upload = Upload::new(true);
+        let mut upload = Upload::new(true);
         let (_peer, io) = tokio::io::duplex(256);
         let mut body = H1Body::new(
             io,
@@ -182,9 +199,9 @@ mod tests {
             Framing::Length(2),
             65536,
         );
-        body.watch_upload(upload.clone());
+        body.watch_upload(&mut upload);
         upload.stop_if_pending();
-        assert!(*upload.0.borrow() == Phase::Active);
+        assert!(*upload.phase.borrow() == Phase::Active);
         let activity = Activity::new(10);
         assert!(
             matches!(upload.read(&activity, body.next()).await.unwrap(), Some(BodyFrame::Data(bytes)) if bytes == b"x"[..])
@@ -199,7 +216,7 @@ mod tests {
                 upload.started();
             }
             upload.stop_if_pending();
-            assert_eq!(*upload.0.borrow() == Phase::Stopped, !started);
+            assert_eq!(*upload.phase.borrow() == Phase::Stopped, !started);
         }
     }
 }

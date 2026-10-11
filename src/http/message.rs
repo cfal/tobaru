@@ -34,7 +34,7 @@ pub(super) enum BodyFrame {
 
 #[async_trait]
 pub(super) trait ReceiveBody: Send {
-    fn watch_upload(&mut self, _upload: super::upload::Upload) {}
+    fn watch_upload(&mut self, _upload: &mut super::upload::Upload) {}
     async fn next(&mut self) -> io::Result<Option<BodyFrame>>;
     fn release(&mut self, _bytes: usize) -> io::Result<()> {
         Ok(())

@@ -128,11 +128,11 @@ impl<R> H1Body<R> {
 
 #[async_trait]
 impl<R: AsyncRead + Unpin + Send> ReceiveBody for H1Body<R> {
-    fn watch_upload(&mut self, upload: super::upload::Upload) {
+    fn watch_upload(&mut self, upload: &mut super::upload::Upload) {
         if !self.done && !self.reader.unparsed_data().is_empty() {
             upload.started();
         }
-        self.upload = Some(upload);
+        self.upload = Some(upload.clone());
     }
 
     async fn next(&mut self) -> io::Result<Option<BodyFrame>> {

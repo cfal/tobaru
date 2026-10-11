@@ -435,26 +435,162 @@ async fn forwarded_bodyless_responses_preserve_all_four_paths() {
 }
 
 #[tokio::test]
+async fn queued_h2_expect_upload_is_active_before_the_first_body_poll() {
+    use crate::http::upload::Upload;
+    use futures::FutureExt;
+
+    checked(async {
+        for queued_before_watch in [false, true] {
+            let (client, server) = tokio::io::duplex(8192);
+            let mut accept = Task(tokio::spawn(async move {
+                let mut connection = h2::server::handshake(server).await.unwrap();
+                let (request, response) = connection.accept().await.unwrap().unwrap();
+                let driver = Task(tokio::spawn(async move {
+                    while connection.accept().await.is_some() {}
+                }));
+                (request, response, driver)
+            }));
+            let (mut client, connection) = h2::client::handshake(client).await.unwrap();
+            let _client_driver = Task(tokio::spawn(async move {
+                let _ = connection.await;
+            }));
+            let (response, mut send) = client
+                .send_request(
+                    Request::builder()
+                        .method("POST")
+                        .uri("http://example.test/duplex")
+                        .header("expect", "100-continue")
+                        .header("content-length", "2")
+                        .body(())
+                        .unwrap(),
+                    false,
+                )
+                .unwrap();
+            let (request, mut respond, _server_driver) = (&mut accept.0).await.unwrap();
+            let mut body = body::H2Body::new(request.into_body());
+            let mut pending = Upload::new(true);
+            body.watch_upload(&mut pending);
+            pending.stop_if_pending();
+            assert!(pending.stopped().now_or_never().is_some());
+            let mut upload = Upload::new(true);
+            if !queued_before_watch {
+                body.watch_upload(&mut upload);
+            }
+            send.send_data(Bytes::from_static(b"x"), false).unwrap();
+            while body.stream.flow_control().used_capacity() != 1 {
+                tokio::task::yield_now().await;
+            }
+            if queued_before_watch {
+                body.watch_upload(&mut upload);
+            }
+
+            // Match response-first exchange polling, before the first body read.
+            let mut response_body = respond.send_response(Response::new(()), false).unwrap();
+            upload.stop_if_pending();
+            assert!(
+                upload.stopped().now_or_never().is_none(),
+                "queued before watch: {queued_before_watch}"
+            );
+            let response = response.await.unwrap();
+            assert_eq!(response.status(), 200);
+            assert!(
+                matches!(body.next().await.unwrap(), Some(BodyFrame::Data(bytes)) if bytes == b"x"[..])
+            );
+            body.release(1).unwrap();
+            send.send_data(Bytes::from_static(b"y"), true).unwrap();
+            assert!(
+                matches!(body.next().await.unwrap(), Some(BodyFrame::Data(bytes)) if bytes == b"y"[..])
+            );
+            body.release(1).unwrap();
+            assert!(body.next().await.unwrap().is_none());
+            response_body.send_data(Bytes::new(), true).unwrap();
+            assert!(collect(response.into_body()).await.0.is_empty());
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn buffered_expect_upload_survives_an_immediate_duplex_final_response() {
     checked(async {
-        let (addr, _, _backend) = h2_backend(|mut request, mut response| async move {
-            let mut send = response.send_response(Response::new(()), false).unwrap();
-            while let Some(data) = request.body_mut().data().await {
-                let data = data.unwrap();
-                request.body_mut().flow_control().release_capacity(data.len()).unwrap();
-                send.send_data(data, false).unwrap();
+        for h2_ingress in [false, true] {
+            let (addr, _, _backend) = h2_backend(|mut request, mut response| async move {
+                let mut send = response.send_response(Response::new(()), false).unwrap();
+                while let Some(data) = request.body_mut().data().await {
+                    let data = data.unwrap();
+                    request
+                        .body_mut()
+                        .flow_control()
+                        .release_capacity(data.len())
+                        .unwrap();
+                    send.send_data(data, false).unwrap();
+                }
+                send.send_data(Bytes::new(), true).unwrap();
+            })
+            .await;
+            let http = runtime(
+                action(json!({"type":"forward", "location":addr.to_string(), "upstream_protocol":"http2"})),
+                Http2Config {
+                    max_backend_connections: 1.try_into().unwrap(),
+                    ..Default::default()
+                },
+                None,
+            );
+            let admission = http.h2_admission.backends.clone();
+            if h2_ingress {
+                let (mut client, _driver, _server) = configured_frontend(http).await;
+                let (response, mut send) = client
+                    .send_request(
+                        Request::builder()
+                            .method("POST")
+                            .uri("http://example.test/duplex")
+                            .header("expect", "100-continue")
+                            .header("content-length", "2")
+                            .body(())
+                            .unwrap(),
+                        false,
+                    )
+                    .unwrap();
+                send.send_data(Bytes::from_static(b"x"), false).unwrap();
+                let mut response = response.await.unwrap();
+                assert_eq!(response.status(), 200);
+                let first = response.body_mut().data().await.unwrap().unwrap();
+                assert_eq!(first, b"x"[..]);
+                response
+                    .body_mut()
+                    .flow_control()
+                    .release_capacity(first.len())
+                    .unwrap();
+                send.send_data(Bytes::from_static(b"y"), true).unwrap();
+                assert_eq!(collect(response.into_body()).await.0, b"y");
+                while admission.available_permits() != 1 {
+                    tokio::task::yield_now().await;
+                }
+                let (response, _) = client
+                    .send_request(
+                        Request::builder()
+                            .uri("http://example.test/sibling")
+                            .body(())
+                            .unwrap(),
+                        true,
+                    )
+                    .unwrap();
+                let response = response.await.unwrap();
+                assert_eq!(response.status(), 200);
+                assert!(collect(response.into_body()).await.0.is_empty());
+            } else {
+                let (mut client, _session) = h1_frontend(http);
+                client.write_all(b"POST /duplex HTTP/1.1\r\nHost: example.test\r\nExpect: 100-continue\r\nContent-Length: 2\r\nConnection: close\r\n\r\nx").await.unwrap();
+                assert!(head(&mut client).await.starts_with(b"HTTP/1.1 200"));
+                let mut first = [0; 6];
+                client.read_exact(&mut first).await.unwrap();
+                assert_eq!(&first, b"1\r\nx\r\n");
+                client.write_all(b"y").await.unwrap();
+                assert_eq!(chunked(&mut client).await.0, b"y");
             }
-            send.send_data(Bytes::new(), true).unwrap();
-        }).await;
-        let (mut client, _session) = h1_frontend(forwarding(addr));
-        client.write_all(b"POST /duplex HTTP/1.1\r\nHost: example.test\r\nExpect: 100-continue\r\nContent-Length: 2\r\nConnection: close\r\n\r\nx").await.unwrap();
-        assert!(head(&mut client).await.starts_with(b"HTTP/1.1 200"));
-        let mut first = [0; 6];
-        client.read_exact(&mut first).await.unwrap();
-        assert_eq!(&first, b"1\r\nx\r\n");
-        client.write_all(b"y").await.unwrap();
-        assert_eq!(chunked(&mut client).await.0, b"y");
-    }).await;
+        }
+    })
+    .await;
 }
 
 #[tokio::test]
