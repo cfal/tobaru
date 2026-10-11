@@ -1465,7 +1465,7 @@ pub async fn load_url(config_url: &str) -> std::io::Result<ServerConfig> {
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     }
 
-    let host_str = url.host_str().ok_or_else(|| {
+    let host = url.host().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "No host specified in URL format",
@@ -1479,15 +1479,19 @@ pub async fn load_url(config_url: &str) -> std::io::Result<ServerConfig> {
         )
     })?;
 
-    let address = tokio::net::lookup_host((host_str, port))
-        .await?
-        .next()
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Unable to resolve bind address",
-            )
-        })?;
+    let address = match host {
+        url::Host::Ipv4(ip) => SocketAddr::new(ip.into(), port),
+        url::Host::Ipv6(ip) => SocketAddr::new(ip.into(), port),
+        url::Host::Domain(host) => tokio::net::lookup_host((host, port))
+            .await?
+            .next()
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Unable to resolve bind address",
+                )
+            })?,
+    };
 
     let config = match url.scheme() {
         "tcp" => {
@@ -1623,6 +1627,18 @@ mod tests {
                 selection.iter().next().unwrap(),
                 IpMaskSelection::Literal(_)
             ));
+        }
+    }
+
+    #[tokio::test]
+    async fn ipv6_shortcut_binds_do_not_go_through_dns() {
+        for scheme in ["tcp", "udp"] {
+            for ip in ["::1", "::", "::ffff:127.0.0.1", "2001:db8::1"] {
+                let config = load_url(&format!("{scheme}://[{ip}]:9000?target=127.0.0.1:80"))
+                    .await
+                    .unwrap();
+                assert_eq!(config.address, SocketAddr::new(ip.parse().unwrap(), 9000));
+            }
         }
     }
 
