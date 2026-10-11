@@ -173,6 +173,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn buffered_upload_is_active_before_a_ready_final_response() {
+        let upload = Upload::new(true);
+        let (_peer, io) = tokio::io::duplex(256);
+        let mut body = H1Body::new(
+            io,
+            LineReader::new_with_data(b"x".to_vec()),
+            Framing::Length(2),
+            65536,
+        );
+        body.watch_upload(upload.clone());
+        upload.stop_if_pending();
+        assert!(*upload.0.borrow() == Phase::Active);
+        let activity = Activity::new(10);
+        assert!(
+            matches!(upload.read(&activity, body.next()).await.unwrap(), Some(BodyFrame::Data(bytes)) if bytes == b"x"[..])
+        );
+    }
+
+    #[tokio::test]
     async fn a_final_response_stops_only_an_expect_pending_upload() {
         for started in [false, true] {
             let upload = Upload::new(true);
