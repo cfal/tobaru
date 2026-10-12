@@ -998,12 +998,14 @@ async fn stalled_early_responses_release_backend_admission() {
                 body_progress_timeout_secs: 1.try_into().unwrap(),
                 ..Default::default()
             };
-            let (mut client, _driver, _server) = configured_frontend(runtime(
+            let mut runtime = runtime(
                 action(json!({"type":"forward", "location":addr.to_string()})),
                 config,
                 None,
-            ))
-            .await;
+            );
+            runtime.http_timeouts.upstream_body_progress_timeout_secs =
+                std::num::NonZeroU64::new(1);
+            let (mut client, _driver, _server) = configured_frontend(runtime).await;
             let (response, _upload) = client
                 .send_request(
                     Request::builder()

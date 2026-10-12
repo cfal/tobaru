@@ -6,9 +6,9 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 pub(crate) async fn protocol(
     stream: &mut (impl AsyncRead + Unpin + ?Sized),
     initial: &mut Option<Vec<u8>>,
-    deadline: Duration,
+    deadline: impl Into<Option<Duration>>,
 ) -> io::Result<HttpProtocol> {
-    tokio::time::timeout(deadline, async {
+    let detect = async {
         let initial = initial.get_or_insert_with(Vec::new);
         loop {
             let prefix = &initial[..initial.len().min(4)];
@@ -29,9 +29,13 @@ pub(crate) async fn protocol(
             }
             initial.extend_from_slice(&bytes[..count]);
         }
-    })
-    .await
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "HTTP protocol detection timed out"))?
+    };
+    match deadline.into() {
+        Some(duration) => tokio::time::timeout(duration, detect).await.map_err(|_| {
+            io::Error::new(io::ErrorKind::TimedOut, "HTTP protocol detection timed out")
+        })?,
+        None => detect.await,
+    }
 }
 
 #[cfg(test)]
@@ -134,6 +138,17 @@ mod tests {
             task.await.unwrap().unwrap_err().kind(),
             io::ErrorKind::TimedOut
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn explicit_null_allows_delayed_detection() {
+        let (mut client, mut server) = tokio::io::duplex(64);
+        let mut initial = None;
+        let (result, ()) = tokio::join!(protocol(&mut server, &mut initial, None), async {
+            tokio::time::sleep(Duration::from_secs(100)).await;
+            client.write_all(b"G").await.unwrap();
+        });
+        assert_eq!(result.unwrap(), HttpProtocol::Http1);
     }
 
     #[tokio::test(start_paused = true)]

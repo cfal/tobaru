@@ -32,7 +32,8 @@ impl Session<'_> {
             write_all(&mut self.stream, b"HTTP/1.1 417 Expectation Failed\r\n\r\n").await?;
             info!(
                 "[http] {} {} [serve message: expectation failed]",
-                request.verb, request.path
+                request.verb,
+                string_util::log_path(&request.path)
             );
         } else {
             with_timeout(
@@ -68,7 +69,9 @@ impl Session<'_> {
         }
         info!(
             "[http] {} {} [serve message: {}]",
-            request.verb, request.path, status_code
+            request.verb,
+            string_util::log_path(&request.path),
+            status_code
         );
         Ok(Outcome::Close)
     }
@@ -125,14 +128,16 @@ impl Session<'_> {
                 .await?;
                 info!(
                     "[http] {} {} [serve file: not found]",
-                    request.verb, request.path
+                    request.verb,
+                    string_util::log_path(&request.path)
                 );
                 return Ok(outcome);
             }
             Err(error) => {
                 info!(
                     "[http] {} {} [serve file: invalid path]",
-                    request.verb, request.path
+                    request.verb,
+                    string_util::log_path(&request.path)
                 );
                 return Err(io::Error::other(format!(
                     "Could not canonicalize path: {}",
@@ -151,7 +156,8 @@ impl Session<'_> {
             .await?;
             info!(
                 "[http] {} {} [serve file: invalid, not a file]",
-                request.verb, request.path
+                request.verb,
+                string_util::log_path(&request.path)
             );
             return Ok(outcome);
         }
@@ -183,7 +189,7 @@ impl Session<'_> {
         info!(
             "[http] {} {} [serve file: {}]",
             request.verb,
-            request.path,
+            string_util::log_path(&request.path),
             mime_type.essence_str()
         );
         Ok(outcome)

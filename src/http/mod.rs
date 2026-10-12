@@ -1,4 +1,5 @@
 mod body;
+mod body_io;
 mod bridge;
 mod chunk_transfer;
 pub(crate) mod detect;
@@ -13,6 +14,7 @@ mod proxy;
 mod routing;
 mod string_util;
 pub(crate) mod syntax;
+mod upload;
 
 #[cfg(test)]
 mod idle_tests;
@@ -81,15 +83,13 @@ impl<'a> Request<'a> {
                 "Multiple Host fields are not allowed",
             ));
         }
-        let first_line = data.first_line().strip_suffix(" HTTP/1.1").ok_or_else(|| {
-            std::io::Error::other(format!("Not a http/1.1 request: {}", data.first_line()))
-        })?;
-        let (verb, request_path) = first_line.split_once(' ').ok_or_else(|| {
-            std::io::Error::other(format!(
-                "Invalid http request directive: {}",
-                data.first_line()
-            ))
-        })?;
+        let first_line = data
+            .first_line()
+            .strip_suffix(" HTTP/1.1")
+            .ok_or_else(|| std::io::Error::other("Not a http/1.1 request"))?;
+        let (verb, request_path) = first_line
+            .split_once(' ')
+            .ok_or_else(|| std::io::Error::other("Invalid http request directive"))?;
         if !syntax::is_token(verb.as_bytes())
             || !request_path.starts_with('/')
             || request_path.contains('#')
@@ -97,10 +97,7 @@ impl<'a> Request<'a> {
                 .bytes()
                 .any(|byte| byte <= b' ' || byte == 0x7f)
         {
-            return Err(std::io::Error::other(format!(
-                "Invalid http request path: {}",
-                data.first_line()
-            )));
+            return Err(std::io::Error::other("Invalid http request path"));
         }
 
         let verb = verb.to_ascii_uppercase();
@@ -145,7 +142,9 @@ impl<'a> Session<'a> {
                 }
             }
             with_timeout(
-                self.timeouts.request_header_timeout_secs,
+                self.timeouts
+                    .request_header_timeout_secs
+                    .resolve(std::num::NonZeroU64::new(10)),
                 "HTTP request headers",
                 http_parser::ParsedHttpData::parse(&mut self.stream, reader),
             )
@@ -173,7 +172,11 @@ impl<'a> Session<'a> {
     async fn dispatch(&mut self, request: Request<'a>) -> std::io::Result<Outcome> {
         match request.action {
             TargetHttpActionData::CloseConnection => {
-                info!("[http] {} {} [close]", request.verb, request.path);
+                info!(
+                    "[http] {} {} [close]",
+                    request.verb,
+                    string_util::log_path(&request.path)
+                );
                 Ok(Outcome::Close)
             }
             TargetHttpActionData::ServeMessage { .. } => self.serve_message(request).await,

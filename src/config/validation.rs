@@ -391,7 +391,7 @@ mod tests {
     }
 
     #[test]
-    fn http_timeouts_are_opt_in_and_positive() {
+    fn http_timeouts_have_finite_frontend_defaults_and_explicit_opt_outs() {
         let config = |timeouts| {
             serde_json::from_value::<super::super::HttpTcpActionConfig>(json!({
                 "default_http_action":"close", "http_timeouts": timeouts,
@@ -402,6 +402,8 @@ mod tests {
             json!({"request_header_timeout_secs":null}),
             json!({"local_body_timeout_secs":null}),
             json!({"local_body_timeout_secs":60}),
+            json!({"upstream_body_progress_timeout_secs":null}),
+            json!({"upstream_body_progress_timeout_secs":17}),
             json!({"request_header_timeout_secs":15, "response_header_timeout_secs":30, "keepalive_idle_timeout_secs":60}),
         ] {
             assert!(config(value).is_ok());
@@ -409,6 +411,7 @@ mod tests {
         for value in [
             json!({"request_header_timeout_secs":0}),
             json!({"local_body_timeout_secs":0}),
+            json!({"upstream_body_progress_timeout_secs":0}),
             json!({"response_header_timeout_secs":-1}),
             json!({"keepalive_idle_timeout_secs":1.5}),
             json!({"typo":1}),
@@ -417,8 +420,59 @@ mod tests {
         }
         let config: super::super::HttpTcpActionConfig =
             serde_json::from_value(json!({"default_http_action":"close"})).unwrap();
-        assert!(config.http_timeouts.request_header_timeout_secs.is_none());
-        assert!(config.http_timeouts.local_body_timeout_secs.is_none());
+        let defaults = config.http_timeouts;
+        assert_eq!(
+            defaults
+                .request_header_timeout_secs
+                .resolve(std::num::NonZeroU64::new(10))
+                .unwrap()
+                .get(),
+            10
+        );
+        assert_eq!(defaults.keepalive_idle_timeout_secs.unwrap().get(), 60);
+        assert_eq!(defaults.local_body_timeout_secs.unwrap().get(), 10);
+        assert!(defaults.response_header_timeout_secs.is_none());
+        assert!(defaults.upstream_body_progress_timeout_secs.is_none());
+        for value in [json!({}), json!({"response_header_timeout_secs":17})] {
+            let parsed: super::super::HttpTimeouts = serde_json::from_value(value).unwrap();
+            assert_eq!(
+                parsed
+                    .request_header_timeout_secs
+                    .resolve(std::num::NonZeroU64::new(23))
+                    .unwrap()
+                    .get(),
+                23
+            );
+            assert_eq!(
+                parsed.keepalive_idle_timeout_secs,
+                defaults.keepalive_idle_timeout_secs
+            );
+            assert_eq!(
+                parsed.local_body_timeout_secs,
+                defaults.local_body_timeout_secs
+            );
+        }
+        let disabled: super::super::HttpTimeouts = serde_json::from_value(json!({
+            "request_header_timeout_secs":null, "response_header_timeout_secs":null,
+            "keepalive_idle_timeout_secs":null, "local_body_timeout_secs":null
+        }))
+        .unwrap();
+        assert!(disabled
+            .request_header_timeout_secs
+            .resolve(std::num::NonZeroU64::new(23))
+            .is_none());
+        assert!(disabled.keepalive_idle_timeout_secs.is_none());
+        assert!(disabled.local_body_timeout_secs.is_none());
+        let overridden: super::super::HttpTimeouts =
+            serde_json::from_value(json!({"request_header_timeout_secs":7})).unwrap();
+        assert_eq!(
+            overridden
+                .request_header_timeout_secs
+                .resolve(std::num::NonZeroU64::new(23))
+                .unwrap()
+                .get(),
+            7
+        );
     }
 
     #[test]
@@ -438,20 +492,66 @@ mod tests {
         assert!(config.validate().is_ok());
         let config: ServerTlsConfig =
             serde_json::from_value(json!({"mode":"passthrough"})).unwrap();
-        assert!(config.handshake_timeout_secs.is_none());
+        assert!(config.handshake_timeout().is_none());
+        assert!(config.validate().is_ok());
+        for (setting, expected) in [
+            (None, Some(10)),
+            (Some(json!(null)), None),
+            (Some(json!(4)), Some(4)),
+        ] {
+            let mut value = json!({"cert":"cert.pem", "key":"key.pem"});
+            if let Some(setting) = setting {
+                value["handshake_timeout_secs"] = setting;
+            }
+            let config: ServerTlsConfig = serde_json::from_value(value).unwrap();
+            assert!(config.validate().is_ok());
+            assert_eq!(config.handshake_timeout().map(|n| n.get()), expected);
+        }
     }
     #[test]
-    fn udp_association_cap_is_optional_and_positive() {
+    fn tcp_connection_admission_defaults_and_opt_out_are_validated() {
+        use super::super::TargetConfigs;
+        let base = json!({"transport":"tcp", "target":{"allowlist":"127.0.0.1", "location":"127.0.0.1:80"}});
+        for (value, expected) in [
+            (None, Some(256)),
+            (Some(json!(null)), None),
+            (Some(json!(12)), Some(12)),
+        ] {
+            let mut config = base.clone();
+            if let Some(value) = value {
+                config["tcp_max_connections"] = value;
+            }
+            let TargetConfigs::Tcp {
+                tcp_max_connections,
+                ..
+            } = serde_json::from_value(config).unwrap()
+            else {
+                panic!("TCP expected")
+            };
+            assert_eq!(tcp_max_connections.map(|limit| limit.get()), expected);
+        }
+        for value in [json!(0), json!(-1), json!(1.5)] {
+            let mut config = base.clone();
+            config["tcp_max_connections"] = value;
+            assert!(serde_json::from_value::<TargetConfigs>(config).is_err());
+        }
+    }
+
+    #[test]
+    fn udp_limits_are_finite_by_default_and_require_positive_values() {
         use super::super::TargetConfigs;
         let base = json!({"transport":"udp", "target":{"allowlist":"127.0.0.1", "location":"127.0.0.1:53"}});
         let config: TargetConfigs = serde_json::from_value(base.clone()).unwrap();
-        assert!(matches!(
-            config,
-            TargetConfigs::Udp {
-                udp_max_associations: None,
-                ..
-            }
-        ));
+        let TargetConfigs::Udp {
+            udp_max_associations,
+            udp_queue_capacity,
+            ..
+        } = config
+        else {
+            panic!("UDP expected");
+        };
+        assert_eq!(udp_max_associations.unwrap().get(), 128);
+        assert_eq!(udp_queue_capacity.get(), 8);
         for value in [json!(null), json!(1), json!(4096)] {
             let mut config = base.clone();
             config["udp_max_associations"] = value;
@@ -460,6 +560,16 @@ mod tests {
         for value in [json!(0), json!(-1), json!(1.5)] {
             let mut config = base.clone();
             config["udp_max_associations"] = value;
+            assert!(serde_json::from_value::<TargetConfigs>(config).is_err());
+        }
+        for value in [json!(1), json!(8), json!(1024), json!(65535)] {
+            let mut config = base.clone();
+            config["udp_queue_capacity"] = value;
+            assert!(serde_json::from_value::<TargetConfigs>(config).is_ok());
+        }
+        for value in [json!(null), json!(0), json!(-1), json!(1.5), json!(65536)] {
+            let mut config = base.clone();
+            config["udp_queue_capacity"] = value;
             assert!(serde_json::from_value::<TargetConfigs>(config).is_err());
         }
     }

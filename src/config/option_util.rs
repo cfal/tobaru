@@ -1,6 +1,6 @@
 use serde::Deserialize;
 
-#[derive(Default, Debug, Clone, Deserialize)]
+#[derive(Default, Debug, Clone, Copy, Deserialize)]
 #[serde(untagged)]
 pub enum NoneOrOne<T> {
     #[serde(skip_deserializing)]
@@ -8,6 +8,16 @@ pub enum NoneOrOne<T> {
     Unspecified,
     None,
     One(T),
+}
+
+impl<T> NoneOrOne<T> {
+    pub fn resolve(self, fallback: Option<T>) -> Option<T> {
+        match self {
+            Self::Unspecified => fallback,
+            Self::None => None,
+            Self::One(value) => Some(value),
+        }
+    }
 }
 
 #[derive(Default, Debug, Clone, Deserialize)]

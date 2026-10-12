@@ -129,13 +129,12 @@ pub(crate) async fn handle(
     let header_seconds = http
         .http_timeouts
         .request_header_timeout_secs
-        .unwrap_or(config.header_timeout_secs)
-        .get();
+        .resolve(Some(config.header_timeout_secs));
     let io = io::TimedIo::new(
         stream,
         initial.unwrap_or_default(),
         true,
-        Duration::from_secs(header_seconds),
+        header_seconds.map(|seconds| Duration::from_secs(seconds.get())),
         config.max_header_list_size.get() as usize * 4,
         config.max_concurrent_streams.get() as usize,
     );
@@ -161,11 +160,16 @@ pub(crate) async fn handle(
     };
     let mut tasks = JoinSet::new();
     let (close_tx, mut close_rx) = tokio::sync::mpsc::channel(1);
-    let idle_seconds = http
-        .http_timeouts
-        .keepalive_idle_timeout_secs
-        .map_or(60, |n| n.get());
-    let mut idle = tokio::time::Instant::now() + Duration::from_secs(idle_seconds);
+    let idle_timeout = http.http_timeouts.keepalive_idle_timeout_secs;
+    let idle_wait = || {
+        crate::tokio_util::with_timeout(
+            idle_timeout,
+            "HTTP/2 keepalive idle",
+            std::future::pending::<std::io::Result<()>>(),
+        )
+    };
+    let idle = idle_wait();
+    tokio::pin!(idle);
     let mut draining = false;
     let mut deadline = tokio::time::Instant::now();
     let result = loop {
@@ -179,14 +183,14 @@ pub(crate) async fn handle(
             }
             Some(()) = close_rx.recv() => { connection.abrupt_shutdown(h2::Reason::NO_ERROR); break Ok(()); }
             _ = tokio::time::sleep_until(deadline), if draining => { connection.abrupt_shutdown(h2::Reason::CANCEL); break Ok(()); }
-            _ = tokio::time::sleep_until(idle), if tasks.is_empty() && !draining => {
+            _ = &mut idle, if tasks.is_empty() && !draining => {
                 draining = true;
                 deadline = tokio::time::Instant::now() + Duration::from_secs(config.drain_timeout_secs.get());
                 connection.graceful_shutdown();
             }
             Some(result) = tasks.join_next(), if !tasks.is_empty() => {
                 if let Err(error) = result { log::warn!("[h2] stream task failed: {error}"); }
-                idle = tokio::time::Instant::now() + Duration::from_secs(idle_seconds);
+                idle.set(idle_wait());
             }
             next = connection.accept() => match next {
                 Some(Ok((request, mut response))) => {

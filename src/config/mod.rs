@@ -5,6 +5,8 @@ mod location;
 mod option_util;
 mod sni_value;
 mod validation;
+#[cfg(test)]
+mod yaml_tests;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -298,7 +300,7 @@ impl IpMaskSelection {
                     let ip_masks = groups.get(group_name.as_str()).ok_or_else(|| {
                         std::io::Error::new(
                             std::io::ErrorKind::InvalidInput,
-                            format!("No such ip group: {}", group_name),
+                            format!("Unknown IP group or invalid IP/CIDR address: {group_name}"),
                         )
                     })?;
                     ret.extend(ip_masks.iter().cloned().map(IpMaskSelection::Literal));
@@ -348,6 +350,8 @@ where
 #[serde(tag = "transport", rename_all = "lowercase")]
 pub enum TargetConfigs {
     Tcp {
+        #[serde(default = "default_tcp_max_connections")]
+        tcp_max_connections: Option<std::num::NonZeroUsize>,
         #[serde(default = "default_true")]
         tcp_nodelay: bool,
         #[serde(default)]
@@ -356,11 +360,25 @@ pub enum TargetConfigs {
         targets: Box<OneOrSome<TcpTargetConfig>>,
     },
     Udp {
-        #[serde(default)]
+        #[serde(default = "default_udp_max_associations")]
         udp_max_associations: Option<std::num::NonZeroUsize>,
+        #[serde(default = "default_udp_queue_capacity")]
+        udp_queue_capacity: std::num::NonZeroU16,
         #[serde(alias = "target")]
         targets: OneOrSome<UdpTargetConfig>,
     },
+}
+
+fn default_udp_max_associations() -> Option<std::num::NonZeroUsize> {
+    std::num::NonZeroUsize::new(128)
+}
+
+fn default_tcp_max_connections() -> Option<std::num::NonZeroUsize> {
+    std::num::NonZeroUsize::new(256)
+}
+
+fn default_udp_queue_capacity() -> std::num::NonZeroU16 {
+    std::num::NonZeroU16::new(8).unwrap()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -416,13 +434,26 @@ where
     Ok(paths)
 }
 
-#[derive(Debug, Clone, Copy, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct HttpTimeouts {
-    pub request_header_timeout_secs: Option<std::num::NonZeroU64>,
+    pub request_header_timeout_secs: NoneOrOne<std::num::NonZeroU64>,
     pub response_header_timeout_secs: Option<std::num::NonZeroU64>,
+    pub upstream_body_progress_timeout_secs: Option<std::num::NonZeroU64>,
     pub keepalive_idle_timeout_secs: Option<std::num::NonZeroU64>,
     pub local_body_timeout_secs: Option<std::num::NonZeroU64>,
+}
+
+impl Default for HttpTimeouts {
+    fn default() -> Self {
+        Self {
+            request_header_timeout_secs: NoneOrOne::Unspecified,
+            response_header_timeout_secs: None,
+            upstream_body_progress_timeout_secs: None,
+            keepalive_idle_timeout_secs: std::num::NonZeroU64::new(60),
+            local_body_timeout_secs: std::num::NonZeroU64::new(10),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -528,7 +559,7 @@ impl Http2Config {
 #[derive(Debug, Clone)]
 pub enum TcpAction {
     Raw(RawTcpActionConfig),
-    Http(HttpTcpActionConfig),
+    Http(Box<HttpTcpActionConfig>),
 }
 
 impl<'de> Deserialize<'de> for TcpAction {
@@ -566,7 +597,7 @@ impl<'de> Deserialize<'de> for TcpAction {
             "http" => {
                 let config = HttpTcpActionConfig::deserialize(serde_json::Value::Object(map))
                     .map_err(serde::de::Error::custom)?;
-                Ok(TcpAction::Http(config))
+                Ok(TcpAction::Http(Box::new(config)))
             }
             _ => Err(serde::de::Error::unknown_variant(
                 protocol,
@@ -940,7 +971,7 @@ pub struct ServerTlsConfig {
     pub mode: TlsMode,
 
     #[serde(default)]
-    pub handshake_timeout_secs: Option<std::num::NonZeroU64>,
+    pub handshake_timeout_secs: NoneOrOne<std::num::NonZeroU64>,
 
     #[serde(default, alias = "sni_hostname")]
     pub sni_hostnames: NoneOrSome<SniValue>,
@@ -973,6 +1004,14 @@ pub struct ServerTlsConfig {
 }
 
 impl ServerTlsConfig {
+    pub fn handshake_timeout(&self) -> Option<std::num::NonZeroU64> {
+        self.handshake_timeout_secs.resolve(if self.is_terminate() {
+            std::num::NonZeroU64::new(10)
+        } else {
+            None
+        })
+    }
+
     pub fn is_passthrough(&self) -> bool {
         self.mode == TlsMode::Passthrough
     }
@@ -985,7 +1024,7 @@ impl ServerTlsConfig {
         // Note: optional flag is now handled by auto-expansion in load_server_configs
         // so we don't validate it here
 
-        if self.is_passthrough() && self.handshake_timeout_secs.is_some() {
+        if self.is_passthrough() && self.handshake_timeout().is_some() {
             return Err("handshake_timeout_secs requires TLS terminate mode".into());
         }
         if self.is_terminate() {
@@ -1426,7 +1465,7 @@ pub async fn load_url(config_url: &str) -> std::io::Result<ServerConfig> {
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     }
 
-    let host_str = url.host_str().ok_or_else(|| {
+    let host = url.host().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "No host specified in URL format",
@@ -1440,17 +1479,21 @@ pub async fn load_url(config_url: &str) -> std::io::Result<ServerConfig> {
         )
     })?;
 
-    let address = tokio::net::lookup_host((host_str, port))
-        .await?
-        .next()
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Unable to resolve bind address",
-            )
-        })?;
+    let address = match host {
+        url::Host::Ipv4(ip) => SocketAddr::new(ip.into(), port),
+        url::Host::Ipv6(ip) => SocketAddr::new(ip.into(), port),
+        url::Host::Domain(host) => tokio::net::lookup_host((host, port))
+            .await?
+            .next()
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Unable to resolve bind address",
+                )
+            })?,
+    };
 
-    match url.scheme() {
+    let config = match url.scheme() {
         "tcp" => {
             let mut locations = vec![];
 
@@ -1499,6 +1542,7 @@ pub async fn load_url(config_url: &str) -> std::io::Result<ServerConfig> {
                 address,
                 use_iptables: false,
                 target_configs: TargetConfigs::Tcp {
+                    tcp_max_connections: default_tcp_max_connections(),
                     tcp_nodelay: true,
                     tcp_keepalive: TcpKeepaliveOption::default(),
                     targets: Box::new(OneOrSome::One(tcp_target_config)),
@@ -1539,7 +1583,8 @@ pub async fn load_url(config_url: &str) -> std::io::Result<ServerConfig> {
                 address,
                 use_iptables: false,
                 target_configs: TargetConfigs::Udp {
-                    udp_max_associations: None,
+                    udp_max_associations: default_udp_max_associations(),
+                    udp_queue_capacity: default_udp_queue_capacity(),
                     targets: OneOrSome::One(udp_target_config),
                 },
             })
@@ -1548,12 +1593,54 @@ pub async fn load_url(config_url: &str) -> std::io::Result<ServerConfig> {
             std::io::ErrorKind::InvalidInput,
             format!("Unknown URL scheme: {}", unknown_scheme),
         )),
+    }?;
+    if !address.ip().to_canonical().is_loopback() {
+        warn!(
+            "URL shortcut on {} allows all source addresses with built-in firewall rules disabled",
+            address
+        );
     }
+    Ok(config)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn group_errors_include_invalid_addresses_without_banning_group_names() {
+        for name in ["missing", "127.0.0.1/33", "127.0.0.999"] {
+            let mut selection: OneOrSome<IpMaskSelection> =
+                serde_json::from_value(serde_json::json!(name)).unwrap();
+            let error =
+                IpMaskSelection::replace_groups(&mut selection, &HashMap::new()).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!("Unknown IP group or invalid IP/CIDR address: {name}")
+            );
+            let groups = HashMap::from([(
+                name.to_owned(),
+                vec![IpMask::try_from("127.0.0.1").unwrap()],
+            )]);
+            IpMaskSelection::replace_groups(&mut selection, &groups).unwrap();
+            assert!(matches!(
+                selection.iter().next().unwrap(),
+                IpMaskSelection::Literal(_)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn ipv6_shortcut_binds_do_not_go_through_dns() {
+        for scheme in ["tcp", "udp"] {
+            for ip in ["::1", "::", "::ffff:127.0.0.1", "2001:db8::1"] {
+                let config = load_url(&format!("{scheme}://[{ip}]:9000?target=127.0.0.1:80"))
+                    .await
+                    .unwrap();
+                assert_eq!(config.address, SocketAddr::new(ip.parse().unwrap(), 9000));
+            }
+        }
+    }
 
     #[tokio::test]
     async fn url_queries_are_decoded_once_and_reject_invalid_utf8() {
@@ -1643,6 +1730,23 @@ mod tests {
             panic!("expected TCP targets");
         };
         assert_eq!(targets.into_vec().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn udp_urls_use_the_same_finite_resource_defaults() {
+        let server = load_url("udp://127.0.0.1:9000?target=127.0.0.1:9001")
+            .await
+            .unwrap();
+        let TargetConfigs::Udp {
+            udp_max_associations,
+            udp_queue_capacity,
+            ..
+        } = server.target_configs
+        else {
+            panic!("UDP expected");
+        };
+        assert_eq!(udp_max_associations.unwrap().get(), 128);
+        assert_eq!(udp_queue_capacity.get(), 8);
     }
 
     fn deser_path_config(yaml: &str) -> HttpPathConfig {
