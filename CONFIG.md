@@ -532,7 +532,7 @@ field-section bytes and pre-consumption response-section counts are also bounded
 Trailer fields are validated independently of initial headers and header patches.
 Pseudoheaders and oversized trailer sections are rejected before conversion to
 ordinary fields, for both ingress requests and upstream H2 responses, using the
-[vendored h2 fixes](vendor/h2/PROVENANCE.md). Literal `#` fragments are rejected
+[pinned h2 fork fixes](README.md#http2-dependency). Literal `#` fragments are rejected
 before URI normalization on both H2 ingress and H1-to-H2 forwarding, so the backend
 cannot receive a different path from the one used for routing. Encoded `%23`
 remains permitted. These checks require no additional configuration flags.
