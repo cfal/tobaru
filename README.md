@@ -252,24 +252,6 @@ connections. GOAWAY retires an H2 backend; a request racing retirement may fail
 without being replayed. Local responses end one stream; the `close` action still
 closes the entire frontend connection, including siblings.
 
-#### HTTP/2 Dependency
-
-HTTP/2 receive validation uses our [h2 fork](https://github.com/cfal/h2/tree/4b0f4fc3c54101b2d6ad3a191304cac07f014318),
-pinned to commit `4b0f4fc3c54101b2d6ad3a191304cac07f014318` in `Cargo.toml` and
-`Cargo.lock`. The patch is based on fork tip
-[`e64c166`](https://github.com/cfal/h2/commit/e64c1662ebb14794fc19cbcbb5b5dd0f67925f27)
-(`h2 0.4.20` plus upstream fixes), with the same three receive-validation checks
-previously vendored here:
-reject pseudoheaders in trailers, oversized trailer sections, and raw `:path`
-fragments. The fork retains upstream's MIT license and adds request/response
-regression tests. Apart from those checks, its production source matches that
-fork-tip revision, rather than the previously vendored `0.4.19` release.
-
-The Git dependency deliberately has no registry-version fallback. This supports
-source installs and release binaries, but blocks `cargo package` and
-`cargo publish` rather than allowing Cargo to substitute an unpatched registry
-release. Restore registry publishing only after a released dependency includes
-equivalent fixes and passes the raw-wire corpus, full suite, and HTTP/2 smoke test.
 Malformed or oversized trailer sections and raw request-target fragments are
 rejected before the library can discard their validation metadata. Failed H1
 uploads never receive a synthesized terminal chunk and their backend sockets
@@ -319,6 +301,27 @@ CONNECT, extended CONNECT/WebSocket, server push and H3 are not implemented on t
 new paths. Existing H1-to-H1 Upgrade handling is unchanged; H1 Upgrade requests
 directed to H2-only backends are rejected. Local H2 actions require a final status
 (at least 200); custom H1 reason phrases do not appear on the H2 wire.
+
+#### HTTP/2 Dependency
+
+HTTP/2 receive validation uses our [h2 fork](https://github.com/cfal/h2/tree/9bf98f9e7e0a62f04b660395d6cd33850f220b14),
+pinned to commit `9bf98f9e7e0a62f04b660395d6cd33850f220b14` in `Cargo.toml` and
+`Cargo.lock`. The patch is based on fork tip
+[`e64c166`](https://github.com/cfal/h2/commit/e64c1662ebb14794fc19cbcbb5b5dd0f67925f27)
+(`h2 0.4.20` plus upstream fixes), with the same three receive-validation checks
+previously vendored here:
+reject pseudoheaders in trailers, oversized trailer sections, and raw `:path`
+fragments. The fork retains upstream's MIT license and adds request/response
+regression tests. Apart from those checks, its production source matches that
+fork-tip revision, rather than the previously vendored `0.4.19` release.
+Keep published pinned commits reachable when updating the fork; do not rewrite
+or delete their only branch or tag.
+
+The Git dependency deliberately has no registry-version fallback. This supports
+source installs and release binaries, but blocks `cargo package` and
+`cargo publish` rather than allowing Cargo to substitute an unpatched registry
+release. Restore registry publishing only after a released dependency includes
+equivalent fixes and passes the raw-wire corpus, full suite, and HTTP/2 smoke test.
 
 ### Mixed TLS Modes on Same Port
 
