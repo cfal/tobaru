@@ -308,10 +308,12 @@ HTTP/2 receive validation uses our [h2 fork](https://github.com/cfal/h2/tree/1a0
 pinned to commit `1a0ec784f3e23757768676645a91f540649cda96` in `Cargo.toml` and
 `Cargo.lock`. The patch is based on fork tip
 [`e64c166`](https://github.com/cfal/h2/commit/e64c1662ebb14794fc19cbcbb5b5dd0f67925f27)
-(`h2 0.4.20` plus upstream fixes), with the same three receive-validation checks
-previously vendored here:
-reject pseudoheaders in trailers, oversized trailer sections, and raw `:path`
-fragments. The fork retains upstream's MIT license and adds request/response
+(`h2 0.4.20` plus upstream fixes), carrying the receive-validation fixes previously
+vendored here: reject pseudoheaders in trailers, oversized trailer sections, and
+raw `:path` fragments. Trailer checks apply only while the receive side is still
+streaming; other states retain upstream's state validation, including connection
+`GOAWAY(PROTOCOL_ERROR)` for unexpected HEADERS after request END_STREAM.
+The fork retains upstream's MIT license and adds request/response
 regression tests. Apart from those checks, its production source matches that
 fork-tip revision, rather than the previously vendored `0.4.19` release.
 Keep published pinned commits reachable when updating the fork; do not rewrite
@@ -321,7 +323,9 @@ The Git dependency deliberately has no registry-version fallback. This supports
 source installs and release binaries, but blocks `cargo package` and
 `cargo publish` rather than allowing Cargo to substitute an unpatched registry
 release. Restore registry publishing only after a released dependency includes
-equivalent fixes and passes the raw-wire corpus, full suite, and HTTP/2 smoke test.
+equivalent fixes and passes the fork's receive-validation regressions, including
+stream-state error ordering, plus Tobaru's raw-wire corpus, full suite, and HTTP/2
+smoke test.
 
 ### Mixed TLS Modes on Same Port
 
