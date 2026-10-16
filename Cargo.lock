@@ -502,7 +502,7 @@ dependencies = [
 [[package]]
 name = "h2"
 version = "0.4.20"
-source = "git+https://github.com/cfal/h2?rev=9bf98f9e7e0a62f04b660395d6cd33850f220b14#9bf98f9e7e0a62f04b660395d6cd33850f220b14"
+source = "git+https://github.com/cfal/h2?rev=1a0ec784f3e23757768676645a91f540649cda96#1a0ec784f3e23757768676645a91f540649cda96"
 dependencies = [
  "atomic-waker",
  "bytes",

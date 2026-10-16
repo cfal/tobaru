@@ -304,8 +304,8 @@ directed to H2-only backends are rejected. Local H2 actions require a final stat
 
 #### HTTP/2 Dependency
 
-HTTP/2 receive validation uses our [h2 fork](https://github.com/cfal/h2/tree/9bf98f9e7e0a62f04b660395d6cd33850f220b14),
-pinned to commit `9bf98f9e7e0a62f04b660395d6cd33850f220b14` in `Cargo.toml` and
+HTTP/2 receive validation uses our [h2 fork](https://github.com/cfal/h2/tree/1a0ec784f3e23757768676645a91f540649cda96),
+pinned to commit `1a0ec784f3e23757768676645a91f540649cda96` in `Cargo.toml` and
 `Cargo.lock`. The patch is based on fork tip
 [`e64c166`](https://github.com/cfal/h2/commit/e64c1662ebb14794fc19cbcbb5b5dd0f67925f27)
 (`h2 0.4.20` plus upstream fixes), with the same three receive-validation checks
