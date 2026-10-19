@@ -198,6 +198,40 @@ fn equivalent_ipv4_non_tls_prefixes_keep_configuration_order() {
 }
 
 #[test]
+fn non_tls_registration_masks_host_bits_before_ipv4_alias_lookups() {
+    for (first_mask, second_mask) in [("all", "::ffff:0:0/80"), ("::ffff:0:0/80", "all")] {
+        let mut routes = RoutingTable::default();
+        let first = raw_target();
+        let second = raw_target();
+        routes
+            .insert_non_tls(&masks(&[first_mask]), first.clone())
+            .unwrap();
+        routes
+            .insert_non_tls(&masks(&[second_mask]), second.clone())
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &routes
+                .ip_targets(peer("192.0.2.1"))
+                .direct_target()
+                .unwrap(),
+            &first,
+        ));
+        assert!(Arc::ptr_eq(
+            &routes.ip_targets(peer("::1")).direct_target().unwrap(),
+            if first_mask == "all" { &second } else { &first },
+        ));
+    }
+
+    let mut routes = RoutingTable::default();
+    assert!(routes
+        .insert_non_tls(&masks(&["::ffff:0:0/80", "::/80"]), raw_target())
+        .is_err());
+    assert!(routes
+        .insert_non_tls(&masks(&["192.0.2.123/26", "192.0.2.64/26"]), raw_target())
+        .is_err());
+}
+
+#[test]
 fn ipv4_catch_all_normalization_preserves_narrower_and_native_ipv6_routes() {
     let mut routes = RoutingTable::default();
     let broad = raw_target();

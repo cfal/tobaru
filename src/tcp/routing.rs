@@ -109,6 +109,7 @@ impl RoutingTable {
     ) -> std::io::Result<()> {
         let mut seen = IpLookupTable::new();
         for &IpMask(address, prefix_len) in allowlist {
+            let address = address.mask(prefix_len);
             if seen.insert(address, prefix_len, ()).is_some() {
                 return Err(std::io::Error::other(format!(
                     "Address {address}/{prefix_len} is duplicated in the target allowlist."
@@ -117,8 +118,8 @@ impl RoutingTable {
             // Canonicalize broad IPv6 prefixes for mapped IPv4 too, so `all`
             // and IPv4 /0 ties retain configuration order in longest_match.
             let ipv4 = Ipv4Addr::UNSPECIFIED.to_ipv6_mapped();
-            let ipv4_alias = (prefix_len < 96 && address.mask(prefix_len) == ipv4.mask(prefix_len))
-                .then_some((ipv4, 96));
+            let ipv4_alias =
+                (prefix_len < 96 && address == ipv4.mask(prefix_len)).then_some((ipv4, 96));
             for (address, prefix_len) in std::iter::once((address, prefix_len)).chain(ipv4_alias) {
                 if self.non_tls.exact_match(address, prefix_len).is_none() {
                     self.non_tls.insert(address, prefix_len, target.clone());

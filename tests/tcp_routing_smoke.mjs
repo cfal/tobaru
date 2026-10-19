@@ -119,6 +119,7 @@ try {
   }]);
   const mixedFamilyPorts = [];
   const mixedFamilyTiePorts = [];
+  mixedFamilyTiePorts.push(await listener([raw(plainPort, 'all'), raw(rawPort, '::ffff:0:0/80')]));
   for (const broad of ['all', '::/0']) {
     for (const [rawMask, tlsMask] of [['0.0.0.0/0', broad], [broad, '0.0.0.0/0']]) {
       mixedFamilyPorts.push(await listener([
