@@ -150,6 +150,11 @@ Controls which source IPs may use this target. An IP outside this target's
 allowlist may still use another eligible target on the listener. Connections
 from IPs not matching any target's allowlist are rejected.
 
+CIDRs are normalized to their network address: `192.0.2.123/26` means
+`192.0.2.64/26`. Host bits are cleared without changing the prefix length, for
+IPv4 and IPv6 literals and named-group entries. Equivalent spellings count as
+the same network for duplicate checks. Bare addresses still match only that host.
+
 ```yaml
 # Allow all IPv4
 allowlist: 0.0.0.0/0

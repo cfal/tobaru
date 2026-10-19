@@ -1,5 +1,6 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 
+use ip_network_table_deps_treebitmap::address::Address;
 use serde::Deserialize;
 
 #[derive(Debug, Clone)]
@@ -82,7 +83,7 @@ impl TryFrom<&str> for IpMask {
             ));
         }
 
-        Ok(Self(addr, masklen))
+        Ok(Self(addr.mask(masklen), masklen))
     }
 }
 
@@ -114,6 +115,73 @@ impl<'de> Deserialize<'de> for IpMask {
 mod tests {
     use super::*;
     use ip_network_table_deps_treebitmap::IpLookupTable;
+
+    #[test]
+    fn cidrs_normalize_host_bits_in_literals_json_and_yaml() {
+        for (input, expected_address, expected_prefix) in [
+            ("192.0.2.123/26", "::ffff:192.0.2.64", 122),
+            ("192.0.2.200/24", "::ffff:192.0.2.0", 120),
+            ("192.0.2.123/0", "::ffff:0.0.0.0", 96),
+            ("192.0.2.123", "::ffff:192.0.2.123", 128),
+            ("::ffff:192.0.2.123/122", "::ffff:192.0.2.64", 122),
+            ("::ffff:192.0.2.123/80", "::", 80),
+            (
+                "2001:db8:1234:5678:ffff::1/65",
+                "2001:db8:1234:5678:8000::",
+                65,
+            ),
+            ("2001:db8::abcd/64", "2001:db8::", 64),
+            ("2001:db8::abcd/0", "::", 0),
+            ("2001:db8::abcd", "2001:db8::abcd", 128),
+            ("all", "::", 0),
+        ] {
+            for IpMask(address, prefix) in [
+                IpMask::try_from(input).unwrap(),
+                serde_json::from_value(serde_json::json!(input)).unwrap(),
+                serde_yaml::from_str(input).unwrap(),
+            ] {
+                assert_eq!(
+                    address,
+                    expected_address.parse::<Ipv6Addr>().unwrap(),
+                    "{input}"
+                );
+                assert_eq!(prefix, expected_prefix, "{input}");
+                let round_trip = IpMask::try_from(format!("{address}/{prefix}").as_str()).unwrap();
+                assert_eq!((round_trip.0, round_trip.1), (address, prefix));
+            }
+        }
+    }
+
+    #[test]
+    fn every_prefix_clears_only_host_bits_and_can_be_inserted() {
+        for prefix in 0..=128 {
+            let input = format!("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff/{prefix}");
+            let IpMask(address, stored_prefix) = IpMask::try_from(input.as_str()).unwrap();
+            let expected = u128::MAX.checked_shl(128 - prefix).unwrap_or(0);
+            assert_eq!(address, Ipv6Addr::from(expected), "{input}");
+            assert_eq!(stored_prefix, prefix);
+            let mut table = IpLookupTable::new();
+            table.insert(address, stored_prefix, ());
+            assert!(table.longest_match(Ipv6Addr::from(u128::MAX)).is_some());
+        }
+        for prefix in 0..=32 {
+            let input = format!("255.255.255.255/{prefix}");
+            let IpMask(address, stored_prefix) = IpMask::try_from(input.as_str()).unwrap();
+            let expected = u32::MAX.checked_shl(32 - prefix).unwrap_or(0);
+            assert_eq!(
+                address,
+                Ipv4Addr::from(expected).to_ipv6_mapped(),
+                "{input}"
+            );
+            assert_eq!(stored_prefix, 96 + prefix);
+            let mut table = IpLookupTable::new();
+            table.insert(address, stored_prefix, ());
+            assert!(table
+                .longest_match(Ipv4Addr::BROADCAST.to_ipv6_mapped())
+                .is_some());
+            assert!(table.longest_match(Ipv6Addr::LOCALHOST).is_none());
+        }
+    }
 
     #[test]
     fn ipv4_prefixes_are_validated_before_mapping() {
