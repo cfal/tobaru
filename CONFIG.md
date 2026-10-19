@@ -154,6 +154,8 @@ CIDRs are normalized to their network address: `192.0.2.123/26` means
 `192.0.2.64/26`. Host bits are cleared without changing the prefix length, for
 IPv4 and IPv6 literals and named-group entries. Equivalent spellings count as
 the same network for duplicate checks. Bare addresses still match only that host.
+Generated IPv4 firewall rules cover the portion of each CIDR within the mapped
+IPv4 block (`::ffff:0:0/96`), including IPv6 prefixes that contain that entire block.
 
 ```yaml
 # Allow all IPv4

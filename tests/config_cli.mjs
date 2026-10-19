@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
-import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 
@@ -45,6 +45,55 @@ try {
     if (duplicate) assert.match(result.stderr, /duplicated/, context);
   }
 
+  const firewallLog = join(root, 'firewall.log');
+  const firewallBin = join(root, 'bin');
+  mkdirSync(firewallBin);
+  for (const command of ['iptables', 'ip6tables']) {
+    writeFileSync(join(firewallBin, command), `#!/bin/sh
+printf '%s' "\${0##*/}" >> "$FIREWALL_LOG"
+printf ' %s' "$@" >> "$FIREWALL_LOG"
+printf '\\n' >> "$FIREWALL_LOG"
+`, { mode: 0o755 });
+  }
+
+  async function checkFirewall(config, expectedSource) {
+    writeFileSync(configPath, JSON.stringify([config]));
+    writeFileSync(firewallLog, '');
+    const child = spawn(binary, ['-t', '1', configPath], {
+      timeout: 5000, killSignal: 'SIGKILL',
+      env: { ...process.env, PATH: firewallBin, FIREWALL_LOG: firewallLog, RUST_LOG: 'warn' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const closed = new Promise(resolve => child.once('close', resolve));
+    let output = '';
+    let errors = '';
+    child.stderr.on('data', data => { errors += data; });
+    try {
+      await new Promise((resolve, reject) => {
+        child.stdout.on('data', data => {
+          output += data;
+          if (output.includes(`Listening (${config.transport.toUpperCase()})`)) resolve();
+        });
+        child.once('error', reject);
+        child.once('exit', (code, signal) => reject(new Error(`Startup failed: ${code}/${signal}\n${errors}`)));
+      });
+      const commands = readFileSync(firewallLog, 'utf8').trim().split('\n').map(line => line.split(' '));
+      const context = `${JSON.stringify(config)}\n${JSON.stringify(commands)}`;
+      const accepts = commands.filter(args => args[0] === 'iptables' && args.includes('ACCEPT'));
+      assert.deepEqual(accepts.map(args => args[args.indexOf('-s') + 1]),
+        expectedSource === null ? [] : [expectedSource], context);
+      for (const command of ['iptables', 'ip6tables']) {
+        assert.equal(commands.filter(args => args[0] === command && args.includes('DROP')).length, 1, context);
+      }
+      assert.equal(commands.filter(args => args[0] === 'ip6tables' && args.includes('ACCEPT')).length, 1, context);
+      assert(commands.filter(args => args.includes('-A'))
+        .every(args => args[args.indexOf('--protocol') + 1] === config.transport), context);
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+      await closed;
+    }
+  }
+
   const accepted = [
     ['192.0.2.123/26'],
     ['2001:db8:1234:5678:ffff::1/65'],
@@ -79,6 +128,22 @@ try {
     }
     for (const pair of duplicates) {
       check([server(pair.map(target))], transport === 'udp');
+    }
+    for (const [allowlist, expectedSource] of [
+      ['::ffff:192.0.2.123/81', '0.0.0.0/0'],
+      ['::ffff:192.0.2.123/95', '0.0.0.0/0'],
+      ['::ffff:192.0.2.123/80', '0.0.0.0/0'],
+      ['::ffff:192.0.2.123/96', '0.0.0.0/0'],
+      ['::ffff:192.0.2.123/97', '128.0.0.0/1'],
+      ['::ffff:192.0.2.123/122', '192.0.2.64/26'],
+      ['192.0.2.123/26', '192.0.2.64/26'],
+      ['all', '0.0.0.0/0'],
+      ['2001:db8::1234/64', null],
+      ['0:0:0:0:0:ff:c000:27b/88', null],
+      ['::192.0.2.123/122', null],
+      ['::1/128', null],
+    ]) {
+      await checkFirewall({ ...server([target(allowlist)]), iptables: true }, expectedSource);
     }
   }
 } finally {
