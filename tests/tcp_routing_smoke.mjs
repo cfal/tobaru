@@ -111,6 +111,20 @@ try {
   const modeTiePort = await listener([terminate('secure.example'), pass('secure.example')]);
   const rawTiePort = await listener([raw(plainPort, '127.0.0.1/32'), raw(rawPort, '127.0.0.1/32')]);
   const malformedPort = await listener([raw(fallbackPort), pass('specific.example')]);
+  const mixedFamilyPorts = [];
+  const mixedFamilyTiePorts = [];
+  for (const broad of ['all', '::/0']) {
+    for (const [rawMask, tlsMask] of [['0.0.0.0/0', broad], [broad, '0.0.0.0/0']]) {
+      mixedFamilyPorts.push(await listener([
+        raw(rawPort, rawMask), pass('specific.example', undefined, tlsMask),
+      ]));
+      mixedFamilyPorts.push(await listener([
+        { ...pass('any', undefined, rawMask), location: `127.0.0.1:${rawPort}` },
+        pass('specific.example', undefined, tlsMask),
+      ]));
+      mixedFamilyTiePorts.push(await listener([raw(plainPort, rawMask), raw(rawPort, tlsMask)]));
+    }
+  }
   const configPath = path.join(root, 'routes.json');
   await writeFile(configPath, JSON.stringify(configs));
   child = spawn(binary, ['-t', '1', configPath]);
@@ -138,9 +152,12 @@ try {
   assert.equal(await tlsResponse(ancestorsPort, 'api.example.com'), 'raw');
   assert.equal(await tlsResponse(httpShadowPort, 'qa.snailcdn.com'), 'raw');
   assert.equal(await tlsResponse(modeTiePort, 'secure.example'), 'plain');
+  for (const port of mixedFamilyPorts) {
+    assert.equal(await tlsResponse(port, 'specific.example'), 'passthrough');
+  }
 
   // A narrower raw route must not wait for ClientHello, even with a TLS catch-all.
-  for (const port of [rawOverridePort, rawTiePort]) {
+  for (const port of [rawOverridePort, rawTiePort, ...mixedFamilyTiePorts]) {
     const socket = track(net.connect(port, '127.0.0.1'));
     socket.setTimeout(1000, () => socket.destroy(new Error('raw route waited for ClientHello')));
     assert.equal(await response(socket), 'plain');

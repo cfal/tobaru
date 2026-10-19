@@ -201,6 +201,11 @@ prefix lengths, a matching TLS catch-all wins over a raw catch-all. Configuratio
 order does not override these specificity rules. UDP retains longest-prefix IP
 routing without TLS inspection.
 
+IP specificity is measured within the client's address family. For IPv4 clients,
+`all`, `::/0`, and `0.0.0.0/0` have equal specificity; the internal IPv4-mapped
+IPv6 representation does not give an IPv4 catch-all extra priority. IPv6 prefixes
+covering the entire mapped IPv4 range likewise have IPv4 `/0` specificity.
+
 ```yaml
 targets:
   # Internal users get admin backend
@@ -861,7 +866,8 @@ Named, reusable sets of IP ranges. Define groups before referencing them in serv
       - trusted
 ```
 
-The built-in group `all` is equivalent to `0.0.0.0/0` (all IPv4).
+The built-in group `all` is equivalent to `::/0`, covering both IPv4 and IPv6.
+Use `0.0.0.0/0` to allow only IPv4.
 
 `ip_mask` (singular) is accepted as an alias for `ip_masks`.
 

@@ -1,8 +1,8 @@
 use std::cmp::Reverse;
-use std::net::Ipv6Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
-use ip_network_table_deps_treebitmap::IpLookupTable;
+use ip_network_table_deps_treebitmap::{address::Address, IpLookupTable};
 
 use super::{TargetActionData, TargetData, TlsTargetData};
 use crate::config::{IpMask, NoneOrSome, SniValue};
@@ -93,6 +93,14 @@ pub(super) enum SelectedTarget {
     Tls(Arc<TlsTargetData>, AlpnMatch),
 }
 
+fn prefix_specificity(ip: Ipv6Addr, prefix_len: u32) -> u32 {
+    if ip.to_ipv4_mapped().is_some() {
+        prefix_len.saturating_sub(96)
+    } else {
+        prefix_len
+    }
+}
+
 impl RoutingTable {
     pub fn insert_non_tls(
         &mut self,
@@ -106,15 +114,20 @@ impl RoutingTable {
                     "Address {address}/{prefix_len} is duplicated in the target allowlist."
                 )));
             }
-            // Targets are registered in configuration order; equal prefixes keep
-            // the first eligible target in each protocol class.
-            if self.non_tls.exact_match(address, prefix_len).is_none() {
-                self.non_tls.insert(address, prefix_len, target.clone());
-            }
-            if matches!(target.action_data, TargetActionData::Raw { .. })
-                && self.raw.exact_match(address, prefix_len).is_none()
-            {
-                self.raw.insert(address, prefix_len, target.clone());
+            // Canonicalize broad IPv6 prefixes for mapped IPv4 too, so `all`
+            // and IPv4 /0 ties retain configuration order in longest_match.
+            let ipv4 = Ipv4Addr::UNSPECIFIED.to_ipv6_mapped();
+            let ipv4_alias = (prefix_len < 96 && address.mask(prefix_len) == ipv4.mask(prefix_len))
+                .then_some((ipv4, 96));
+            for (address, prefix_len) in std::iter::once((address, prefix_len)).chain(ipv4_alias) {
+                if self.non_tls.exact_match(address, prefix_len).is_none() {
+                    self.non_tls.insert(address, prefix_len, target.clone());
+                }
+                if matches!(target.action_data, TargetActionData::Raw { .. })
+                    && self.raw.exact_match(address, prefix_len).is_none()
+                {
+                    self.raw.insert(address, prefix_len, target.clone());
+                }
             }
         }
         Ok(())
@@ -152,7 +165,7 @@ impl RoutingTable {
             table
                 .longest_match(ip)
                 .map(|(_, prefix_len, target)| IpMatch {
-                    prefix_len,
+                    prefix_len: prefix_specificity(ip, prefix_len),
                     target: target.clone(),
                 })
         };
@@ -162,7 +175,7 @@ impl RoutingTable {
             tls_prefix_len: self
                 .tls
                 .longest_match(ip)
-                .map(|(_, prefix_len, _)| prefix_len),
+                .map(|(_, prefix_len, _)| prefix_specificity(ip, prefix_len)),
         }
     }
 
@@ -183,7 +196,7 @@ impl RoutingTable {
                     continue;
                 };
                 let rank = TlsRank {
-                    ip_prefix_len,
+                    ip_prefix_len: prefix_specificity(ip, ip_prefix_len),
                     sni_specificity,
                     alpn,
                     config_order: Reverse(candidate.config_order),

@@ -127,6 +127,106 @@ fn ip_specificity_precedes_protocol_and_sni_for_both_address_families() {
 }
 
 #[test]
+fn ipv4_catch_all_spellings_have_equal_specificity() {
+    for broad in ["all", "::/0", "::/80", "::ffff:0:0/96"] {
+        for (raw_mask, tls_mask) in [("0.0.0.0/0", broad), (broad, "0.0.0.0/0")] {
+            let mut routes = RoutingTable::default();
+            let raw = raw_target();
+            routes
+                .insert_non_tls(&masks(&[raw_mask]), raw.clone())
+                .unwrap();
+            let tls = add_tls(
+                &mut routes,
+                tls_target(0, &[tls_mask], &[]),
+                &["api.example.com"],
+            );
+            assert!(routes
+                .ip_targets(peer("192.0.2.1"))
+                .direct_target()
+                .is_none());
+            assert!(Arc::ptr_eq(
+                &select(&routes, "192.0.2.1", Some("api.example.com"), &[]).unwrap(),
+                &tls,
+            ));
+            assert!(Arc::ptr_eq(
+                &select(&routes, "192.0.2.1", Some("other.example.com"), &[]).unwrap(),
+                &raw,
+            ));
+
+            let mut routes = RoutingTable::default();
+            add_tls(&mut routes, tls_target(0, &[raw_mask], &[]), &["any"]);
+            let exact = add_tls(
+                &mut routes,
+                tls_target(1, &[tls_mask], &[]),
+                &["api.example.com"],
+            );
+            assert!(Arc::ptr_eq(
+                &select(&routes, "192.0.2.1", Some("api.example.com"), &[]).unwrap(),
+                &exact,
+            ));
+        }
+    }
+}
+
+#[test]
+fn equivalent_ipv4_non_tls_prefixes_keep_configuration_order() {
+    for broad in ["all", "::/0", "::/80", "::ffff:0:0/96"] {
+        for (first_mask, second_mask) in [(broad, "0.0.0.0/0"), ("0.0.0.0/0", broad)] {
+            for http_first in [false, true] {
+                let mut routes = RoutingTable::default();
+                let first = if http_first {
+                    protocol_tests::target(HttpProtocols::default())
+                } else {
+                    raw_target()
+                };
+                let second = raw_target();
+                routes
+                    .insert_non_tls(&masks(&[first_mask]), first.clone())
+                    .unwrap();
+                routes
+                    .insert_non_tls(&masks(&[second_mask]), second.clone())
+                    .unwrap();
+                let candidates = routes.ip_targets(peer("192.0.2.1"));
+                assert!(Arc::ptr_eq(&candidates.fallback(false).unwrap(), &first));
+                assert!(Arc::ptr_eq(
+                    &candidates.fallback(true).unwrap(),
+                    if http_first { &second } else { &first },
+                ));
+            }
+        }
+    }
+}
+
+#[test]
+fn ipv4_catch_all_normalization_preserves_narrower_and_native_ipv6_routes() {
+    let mut routes = RoutingTable::default();
+    let broad = raw_target();
+    let narrow = raw_target();
+    routes
+        .insert_non_tls(&masks(&["all"]), broad.clone())
+        .unwrap();
+    routes
+        .insert_non_tls(&masks(&["::/80", "192.0.2.0/24"]), narrow.clone())
+        .unwrap();
+    for (address, expected) in [
+        ("192.0.2.1", &narrow),
+        ("198.51.100.1", &broad),
+        ("::1", &narrow),
+        ("2001:db8::1", &broad),
+    ] {
+        assert!(Arc::ptr_eq(
+            &routes.ip_targets(peer(address)).direct_target().unwrap(),
+            expected
+        ));
+    }
+    let mut routes = RoutingTable::default();
+    routes
+        .insert_non_tls(&masks(&["::/96", "2001:db8::/32"]), raw_target())
+        .unwrap();
+    assert!(routes.ip_targets(peer("192.0.2.1")).is_empty());
+}
+
+#[test]
 fn sni_specificity_precedes_alpn_and_configuration_order() {
     let mut routes = RoutingTable::default();
     let any = add_tls(&mut routes, tls_target(0, &["all"], &["h2"]), &["any"]);
