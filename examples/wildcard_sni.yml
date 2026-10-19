@@ -9,7 +9,8 @@
 #   ".example.com"    -- matches both example.com and any subdomain
 #   "*"               -- catch-all, matches everything (same as "any")
 #
-# Matching priority: exact > deepest wildcard > shallower wildcard > no match
+# At equal IP specificity: exact > deepest wildcard > shallower wildcard > any.
+# IP/ALPN mismatches do not hide eligible broader patterns.
 #
 # Works with both passthrough and terminate modes.
 

@@ -4,7 +4,7 @@ use tokio::io::AsyncWriteExt;
 
 const PEER: SocketAddr = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 1);
 
-fn target(protocols: HttpProtocols) -> Arc<TargetData> {
+pub(super) fn target(protocols: HttpProtocols) -> Arc<TargetData> {
     let config: HttpTcpActionConfig = serde_json::from_value(json!({
         "default_http_action": {"type":"serve-message", "status_code":200, "content":"selected"}
     }))
@@ -32,15 +32,12 @@ async fn optional_tls_hands_off_after_four_plaintext_bytes() {
         let mut client = client.unwrap();
         let (server, peer) = accepted.unwrap();
         let owner = tokio::spawn(async move {
-            process_tls_stream(
-                server,
-                &peer,
-                std::net::Ipv4Addr::LOCALHOST.to_ipv6_mapped(),
-                Some(target(HttpProtocols::default())),
-                Arc::new(DomainTrie::new()),
-                Arc::new(vec![]),
-            )
-            .await
+            let mut routes = RoutingTable::default();
+            routes
+                .insert_non_tls(&[IpMask::all()], target(HttpProtocols::default()))
+                .unwrap();
+            let ip = std::net::Ipv4Addr::LOCALHOST.to_ipv6_mapped();
+            process_tls_stream(server, &peer, ip, routes.ip_targets(ip), &routes).await
         });
         for byte in b"PRI " {
             client.write_all(&[*byte]).await.unwrap();

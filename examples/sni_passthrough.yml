@@ -123,6 +123,22 @@
         mode: passthrough
         sni_hostnames: app.example.com
 
+# Example 7: Raw catch-all alongside a specific TLS route
+- address: 0.0.0.0:13443
+  transport: tcp
+  targets:
+    # All remaining traffic, including unmatched or malformed TLS.
+    # This grants fallback access; other targets' allowlists are not global denies.
+    - location: /run/catch-all.sock
+      allowlist: 0.0.0.0/0
+
+    # At equal IP specificity, matching TLS wins even though raw is listed first.
+    - location: special-backend:443
+      allowlist: 0.0.0.0/0
+      server_tls:
+        mode: passthrough
+        sni_hostnames: special.example.com
+
 # Testing commands:
 #
 # Test SNI routing with openssl:

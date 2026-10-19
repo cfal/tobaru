@@ -146,7 +146,9 @@ The `address` and `addresses` field names are accepted as aliases for `location`
 
 ### Allowlist
 
-Controls which source IPs may connect to this target. Connections from IPs not matching any allowlist entry are rejected.
+Controls which source IPs may use this target. An IP outside this target's
+allowlist may still use another eligible target on the listener. Connections
+from IPs not matching any target's allowlist are rejected.
 
 ```yaml
 # Allow all IPv4
@@ -175,7 +177,34 @@ allowlist:
 
 ### Target Evaluation Order
 
-When multiple targets are defined, they are evaluated in order. The first target whose allowlist matches the client IP (and whose TLS settings match the connection, if applicable) handles the connection.
+TCP routing checks all applicable conditions before selecting a target. A TLS
+target must match the source IP, SNI, and ALPN offer. A raw forwarding target
+without `server_tls` accepts arbitrary bytes, including TLS. A plaintext HTTP
+target is not an opaque TLS fallback.
+
+Eligible targets are ranked in this order:
+
+1. Longest matching source-IP prefix in the target's allowlist.
+2. TLS over raw forwarding at the same IP prefix length.
+3. Exact SNI over the deepest matching wildcard, then shallower wildcards, then `any`.
+4. An explicitly matched ALPN protocol over `any`.
+5. Earlier target in configuration order for remaining ties.
+
+Passthrough and termination have equal priority. A more specific SNI pattern
+whose IP or ALPN conditions fail does not hide eligible broader patterns.
+When a target lists multiple IP prefixes or SNI patterns, its most specific
+matching entry is used. Repeated IP prefixes across TCP targets are allowed;
+duplicates within a single target's allowlist remain errors.
+
+For example, a raw `/32` overrides a TLS `/0` for that source IP. At equal IP
+prefix lengths, a matching TLS catch-all wins over a raw catch-all. Configuration
+order does not override these specificity rules. UDP retains longest-prefix IP
+routing without TLS inspection.
+
+IP specificity is measured within the client's address family. For IPv4 clients,
+`all`, `::/0`, and `0.0.0.0/0` have equal specificity; the internal IPv4-mapped
+IPv6 representation does not give an IPv4 catch-all extra priority. IPv6 prefixes
+covering the entire mapped IPv4 range likewise have IPv4 `/0` specificity.
 
 ```yaml
 targets:
@@ -193,6 +222,44 @@ targets:
       mode: passthrough
       sni_hostnames: app.example.com
 ```
+
+### Raw Catch-All
+
+A `location` or `locations` target without `server_tls` is protocol-agnostic.
+It remains eligible when no TLS route matches, including when another TLS
+target allows the same source IP. Its position in the target list does not
+make it override a more specific eligible route.
+
+```yaml
+targets:
+  # Forward everything not selected by a more specific route, including TLS.
+  - allowlist: 0.0.0.0/0
+    location: /run/catch-all.sock
+
+  - allowlist: 0.0.0.0/0
+    location: /run/api.sock
+    server_tls:
+      mode: passthrough
+      sni_hostnames: api.example.com
+```
+
+Here, TLS for `api.example.com` uses `/run/api.sock`; TLS for other names,
+connections without SNI, and non-TLS traffic use `/run/catch-all.sock`.
+
+When inspection is necessary, the ClientHello read has a five-second deadline.
+Malformed, incomplete, or oversized ClientHellos may fall back to an eligible
+raw target, replaying every buffered byte unchanged. Server-first protocols may
+wait for this deadline. A raw target known to outrank every applicable TLS route
+can be selected immediately without inspection. TLS-looking bytes never fall
+back to a plaintext HTTP target.
+
+Once a target is selected, TLS handshake/authentication errors and backend
+connection errors terminate the connection. They do not retry another target.
+
+**Access control:** a broad raw target intentionally grants fallback access,
+including when a specific TLS target's IP or ALPN condition fails. A target's
+allowlist is not a global deny rule for its SNI hostname. Remove or narrow the
+raw fallback, and any broader TLS routes, when unmatched traffic must be rejected.
 
 ## Server TLS
 
@@ -217,7 +284,7 @@ server_tls:
   client_fingerprints: [string]    # SHA256 fingerprints
 
   # Deprecated
-  optional: false                  # Auto-migrated to two separate targets
+  optional: false                  # true is auto-migrated to two separate targets
 ```
 
 ### TLS Modes
@@ -262,7 +329,9 @@ sni_hostnames:                      # Multiple patterns
   - none
 ```
 
-Matching priority: exact match > deepest wildcard > shallower wildcard.
+Among eligible TLS targets at the same IP prefix length, matching priority is
+exact match > deepest wildcard > shallower wildcard > `any`. All matching
+patterns are considered before applying the [target ranking](#target-evaluation-order).
 
 Hostnames are case-insensitive. Trailing dots are stripped.
 
@@ -290,12 +359,13 @@ alpn_protocols: h2                 # Single protocol
 alpn_protocols:                    # Multiple protocols
   - h2
   - http/1.1
-alpn_protocols: any                # Match any ALPN
+alpn_protocols: any                # Match any nonempty ALPN offer
 alpn_protocols: none               # Match only when no ALPN
 ```
 
 `any` controls matching, not protocol negotiation. Termination advertises only
 explicit protocol names; `any` without explicit names negotiates no ALPN.
+`any` does not match an absent ALPN offer; use `[any, none]` to accept both.
 Passthrough leaves negotiation to the backend. HTTP actions dispatch negotiated
 `h2` to HTTP/2 and otherwise retain the HTTP/1 session, including legacy custom
 ALPN names. Use `[h2, http/1.1, none]` to accept both standard protocols and clients
@@ -796,7 +866,8 @@ Named, reusable sets of IP ranges. Define groups before referencing them in serv
       - trusted
 ```
 
-The built-in group `all` is equivalent to `0.0.0.0/0` (all IPv4).
+The built-in group `all` is equivalent to `::/0`, covering both IPv4 and IPv6.
+Use `0.0.0.0/0` to allow only IPv4.
 
 `ip_mask` (singular) is accepted as an alias for `ip_masks`.
 
@@ -883,4 +954,4 @@ These fields are accepted with a deprecation warning and will be removed in a fu
 | `serverTls` | `server_tls` |
 | `bindAddress` | `address` |
 | `addresses` (in targets) | `locations` |
-| `optional` (in server_tls) | Split into two explicit targets (auto-migrated) |
+| `optional` (in server_tls) | `true` auto-migrates to TLS and non-TLS targets; raw forwarding also accepts unmatched/malformed TLS. See [migration notes](UPGRADING.md#tcp-target-routing). |
