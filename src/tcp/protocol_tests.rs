@@ -252,7 +252,8 @@ async fn detection_uses_the_request_header_timeout_override() {
     let TargetActionData::Http(http) = &mut Arc::get_mut(&mut target).unwrap().action_data else {
         unreachable!()
     };
-    http.http_timeouts.request_header_timeout_secs = std::num::NonZeroU64::new(1);
+    http.http_timeouts.request_header_timeout_secs =
+        NoneOrOne::One(std::num::NonZeroU64::new(1).unwrap());
     let start = tokio::time::Instant::now();
     let error = run_stream_action(Box::new(server), &PEER, target, None)
         .await
@@ -286,6 +287,8 @@ async fn h2_local_validation_applies_to_default_and_explicit_protocols() {
             true,
             TcpKeepaliveOption::default(),
             vec![config],
+            std::num::NonZeroUsize::new(256),
+            Arc::new(Admission::default()),
         )
         .await;
         assert_eq!(result.is_ok(), allowed);

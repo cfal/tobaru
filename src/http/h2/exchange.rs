@@ -9,6 +9,7 @@ use crate::http::{
     line_reader::LineReader,
     message::{self, invalid, io_error, progress, ReceiveBody, Respond},
     string_util,
+    upload::Upload,
 };
 use crate::tcp::{setup_http_target_stream, TargetHttpActionData};
 use http::{Method, Request, Response};
@@ -147,12 +148,13 @@ pub(super) async fn forward(
     output: &mut (impl Respond + ?Sized),
     has_body: bool,
 ) -> io::Result<bool> {
+    let activity = message::Activity::new(context.config.body_progress_timeout_secs.get());
     let _exchange = match context.backends.clone().try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
             output.early_final();
-            output
-                .head(Response::builder().status(503).body(()).unwrap(), true)
+            activity
+                .wait(output.head(Response::builder().status(503).body(()).unwrap(), true))
                 .await?;
             return Ok(false);
         }
@@ -177,8 +179,17 @@ pub(super) async fn forward(
     else {
         unreachable!()
     };
-    let final_received = Arc::new(AtomicBool::new(false));
-    let expect = message::expect_continue(request.headers())?;
+    let mut upload_state = Upload::new(message::expect_continue(request.headers())?);
+    body.watch_upload(&mut upload_state);
+    let upload_policy = message::BodyPolicy {
+        activity: &activity,
+        upstream_seconds: context.timeouts.upstream_body_progress_timeout_secs,
+        upload: Some(&upload_state),
+    };
+    let response_policy = message::BodyPolicy {
+        upload: None,
+        ..upload_policy
+    };
     let deadline = || {
         HeaderDeadline::new(
             context
@@ -186,7 +197,6 @@ pub(super) async fn forward(
                 .response_header_timeout_secs
                 .map(|n| n.get()),
             has_body,
-            expect,
         )
     };
     let seconds = config.body_progress_timeout_secs.get();
@@ -195,12 +205,20 @@ pub(super) async fn forward(
             .clients
             .open(plan.action, request, !has_body, context)
             .await?;
-        let mut send = H2Send::new(open.send, !has_body);
-        let deadline = deadline();
-        let activity = message::Activity::new(seconds);
+        let mut send = H2Send::new(
+            open.send,
+            !has_body,
+            context.timeouts.upstream_body_progress_timeout_secs,
+        );
+        let deadline = deadline()?;
         let upload = async {
             if has_body {
-                message::copy_body(body, &mut send, expected, &activity, limit).await?;
+                tokio::select! {
+                    // Forward a ready EOF or trailers before early-final cancellation.
+                    biased;
+                    result = message::copy_body(body, &mut send, expected, &upload_policy, limit) => result?,
+                    _ = upload_state.stopped() => return Ok(false),
+                }
             }
             deadline.uploaded();
             Ok(true)
@@ -211,11 +229,11 @@ pub(super) async fn forward(
             &method,
             output,
             &deadline,
-            &activity,
+            &response_policy,
+            &upload_state,
             config,
-            &final_received,
         );
-        let result = concurrent(upload, response, &final_received).await;
+        let result = concurrent(upload, response).await;
         drop(open._client);
         result
     } else {
@@ -248,25 +266,33 @@ pub(super) async fn forward(
             bridge::write_request(&mut write, request, has_body),
         )
         .await?;
-        let mut send = bridge::H1Send::new(write, has_body);
-        let deadline = deadline();
-        let activity = message::Activity::new(seconds);
-        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let mut send = bridge::H1Send::new(
+            crate::http::body_io::UpstreamIo::new(
+                write,
+                context.timeouts.upstream_body_progress_timeout_secs,
+            ),
+            has_body,
+        );
+        let deadline = deadline()?;
+        let final_received = AtomicBool::new(false);
         let upload = async {
             if !has_body {
                 return Ok(true);
             }
             tokio::select! {
-                result = message::copy_body(body, &mut send, expected, &activity, limit) => {
+                result = message::copy_body(body, &mut send, expected, &upload_policy, limit) => {
                     if let Err(error) = result {
                         // An early response may need upload EOF before its body can finish.
-                        let _ = progress(seconds, send.io.shutdown()).await;
+                        progress(seconds, send.io.shutdown()).await?;
+                        if error.kind() != io::ErrorKind::TimedOut && final_received.load(Ordering::Acquire) {
+                            return Ok(false);
+                        }
                         return Err(error);
                     }
                     deadline.uploaded();
                     Ok(true)
                 },
-                _ = async { if stop_rx.await.is_err() { std::future::pending::<()>().await; } } => {
+                _ = upload_state.stopped() => {
                     progress(seconds, send.io.shutdown()).await?;
                     Ok(false)
                 }
@@ -284,24 +310,27 @@ pub(super) async fn forward(
                             return Ok(response);
                         }
                         informational += 1;
-                        if informational > 16 {
+                        if informational > message::MAX_INFORMATIONAL_RESPONSES {
                             return Err(invalid("Too many informational responses"));
                         }
                         bridge::framing(response.headers(), true)?;
                         message::strip_hop_headers(response.headers_mut(), false)?;
                         message::validate_response(&mut response, limit)?;
-                        deadline.informational(response.status());
-                        output.head(response, false).await?;
-                        activity.touch();
+                        let status = response.status();
+                        activity.wait(output.head(response, false)).await?;
+                        if status == http::StatusCode::CONTINUE {
+                            upload_state.started();
+                        }
                     }
                 })
                 .await?;
             final_received.store(true, Ordering::Release);
             if !deadline.upload_complete() {
                 output.early_final();
+                upload_state.stop_if_pending();
             }
             if response.status().is_client_error() || response.status().is_server_error() {
-                let _ = stop_tx.send(());
+                upload_state.stop();
             }
             let empty = message::bodyless(&method, response.status());
             let framing = if empty {
@@ -320,30 +349,35 @@ pub(super) async fn forward(
                 .wait(output.head(response, framing == bridge::Framing::Empty))
                 .await?;
             if framing != bridge::Framing::Empty {
+                let read = crate::http::body_io::UpstreamIo::new(
+                    read,
+                    context.timeouts.upstream_body_progress_timeout_secs,
+                );
                 let mut source = bridge::H1Body::new(read, reader, framing, limit);
-                message::copy_body(&mut source, output, expected, &activity, limit).await?;
+                let policy = message::BodyPolicy {
+                    upstream_seconds: None,
+                    ..response_policy
+                };
+                message::copy_body(&mut source, output, expected, &policy, limit).await?;
             }
             Ok(())
         };
-        concurrent(upload, response, &final_received).await
+        concurrent(upload, response).await
     }
 }
 
 async fn concurrent(
     upload: impl Future<Output = io::Result<bool>>,
     response: impl Future<Output = io::Result<()>>,
-    final_received: &AtomicBool,
 ) -> io::Result<bool> {
     tokio::pin!(upload, response);
     tokio::select! {
         biased;
         result = &mut response => { result?; Ok(false) },
         result = &mut upload => {
-            match result {
-                Ok(complete) => { response.await?; Ok(complete) }
-                Err(_) if final_received.load(Ordering::Acquire) => { response.await?; Ok(false) }
-                Err(error) => Err(error),
-            }
+            let complete = result?;
+            response.await?;
+            Ok(complete)
         }
     }
 }
@@ -360,9 +394,9 @@ async fn response_h2(
     method: &Method,
     output: &mut (impl Respond + ?Sized),
     deadline: &HeaderDeadline,
-    activity: &message::Activity,
+    policy: &message::BodyPolicy<'_>,
+    upload_state: &Upload,
     config: Http2Config,
-    final_received: &AtomicBool,
 ) -> io::Result<()> {
     let limit = config.max_header_list_size.get() as usize;
     let response = deadline
@@ -386,22 +420,26 @@ async fn response_h2(
                 match event {
                     Head::Informational(mut head) => {
                         informational += 1;
-                        if informational > 16 || head.status().as_u16() == 101 {
+                        if informational > message::MAX_INFORMATIONAL_RESPONSES
+                            || head.status().as_u16() == 101
+                        {
                             return Err(invalid("Invalid informational response sequence"));
                         }
                         message::validate_response(&mut head, limit)?;
-                        deadline.informational(head.status());
-                        output.head(head, false).await?;
-                        activity.touch();
+                        let status = head.status();
+                        policy.activity.wait(output.head(head, false)).await?;
+                        if status == http::StatusCode::CONTINUE {
+                            upload_state.started();
+                        }
                     }
                     Head::Final(head) => return Ok(head),
                 }
             }
         })
         .await?;
-    final_received.store(true, Ordering::Release);
     if !deadline.upload_complete() {
         output.early_final();
+        upload_state.stop_if_pending();
     }
     let (parts, body) = response.into_parts();
     let mut response = Response::from_parts(parts, ());
@@ -419,9 +457,12 @@ async fn response_h2(
     if end && !empty && expected.is_some_and(|n| n != 0) {
         return Err(invalid("Missing declared response body"));
     }
-    activity.wait(output.head(response, empty || end)).await?;
+    policy
+        .activity
+        .wait(output.head(response, empty || end))
+        .await?;
     if !empty && !end {
-        message::copy_body(&mut H2Body::new(body), output, expected, activity, limit).await?;
+        message::copy_body(&mut H2Body::new(body), output, expected, policy, limit).await?;
     }
     Ok(())
 }

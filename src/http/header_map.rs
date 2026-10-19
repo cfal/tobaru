@@ -77,9 +77,7 @@ pub trait HeaderMap {
         let mut expect = false;
         for value in self.header_values("expect") {
             if !value.eq_ignore_ascii_case("100-continue") {
-                return Err(std::io::Error::other(format!(
-                    "Invalid expect value: {value}"
-                )));
+                return Err(std::io::Error::other("Invalid Expect field value"));
             }
             expect = true;
         }

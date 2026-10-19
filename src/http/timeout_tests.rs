@@ -106,7 +106,9 @@ async fn request_header_deadline_does_not_reset_on_partial_progress() {
         stream,
         &addr,
         HttpTimeouts {
-            request_header_timeout_secs: std::num::NonZeroU64::new(1),
+            request_header_timeout_secs: crate::config::NoneOrOne::One(
+                std::num::NonZeroU64::new(1).unwrap(),
+            ),
             ..Default::default()
         },
     );
@@ -128,7 +130,9 @@ async fn keepalive_idle_and_header_deadlines_are_separate() {
         stream,
         &addr,
         HttpTimeouts {
-            request_header_timeout_secs: std::num::NonZeroU64::new(1),
+            request_header_timeout_secs: crate::config::NoneOrOne::One(
+                std::num::NonZeroU64::new(1).unwrap(),
+            ),
             keepalive_idle_timeout_secs: std::num::NonZeroU64::new(5),
             ..Default::default()
         },
@@ -146,10 +150,32 @@ async fn keepalive_idle_and_header_deadlines_are_separate() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn omitted_timeouts_allow_delayed_headers() {
+async fn default_frontend_header_and_idle_timeouts_are_finite() {
+    for (keepalive, seconds) in [(false, 10), (true, 60)] {
+        let (_client, stream) = tokio::io::duplex(4096);
+        let addr = "127.0.0.1:1".parse().unwrap();
+        let mut session = session(stream, &addr, HttpTimeouts::default());
+        let start = tokio::time::Instant::now();
+        assert_eq!(
+            session.read_request(keepalive).await.err().unwrap().kind(),
+            ErrorKind::TimedOut
+        );
+        assert_eq!(start.elapsed(), Duration::from_secs(seconds));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn explicit_null_timeouts_allow_delayed_headers() {
     let (mut client, stream) = tokio::io::duplex(4096);
     let addr = "127.0.0.1:1".parse().unwrap();
-    let mut session = session(stream, &addr, HttpTimeouts::default());
+    let mut session = session(
+        stream,
+        &addr,
+        serde_json::from_value(serde_json::json!({
+            "request_header_timeout_secs":null, "keepalive_idle_timeout_secs":null
+        }))
+        .unwrap(),
+    );
     let (result, ()) = tokio::join!(session.read_request(true), async {
         sleep(Duration::from_secs(3600)).await;
         client.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();

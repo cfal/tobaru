@@ -1,6 +1,10 @@
 use super::header_map::HeaderMap;
 use super::http_parser::ParsedHttpData;
 
+pub(super) fn log_path(path: &str) -> impl std::fmt::Display + '_ {
+    path.split('?').next().unwrap().escape_debug()
+}
+
 pub fn create_message(data: &ParsedHttpData) -> String {
     let mut msg = String::with_capacity(4096);
     msg.push_str(data.first_line());
@@ -66,6 +70,19 @@ fn replace_path_prefix(request_path: &str, base_path: &str, new_base_path: &str)
             new_path.push_str(sub_path);
             new_path
         }
+    }
+}
+
+#[test]
+fn logged_paths_exclude_queries_and_escape_control_characters() {
+    for (path, expected) in [
+        ("/download?token=secret&x=1", "/download"),
+        ("/a%3Fb?key=secret", "/a%3Fb"),
+        ("/a\n\r\t\u{1b}", "/a\\n\\r\\t\\u{1b}"),
+        ("/a\u{85}\u{2028}", "/a\\u{85}\\u{2028}"),
+        ("/plain", "/plain"),
+    ] {
+        assert_eq!(log_path(path).to_string(), expected);
     }
 }
 

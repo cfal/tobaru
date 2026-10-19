@@ -28,6 +28,9 @@ use crate::rustls_util::{
 };
 use crate::tokio_util::resolve_host;
 
+mod admission;
+pub(crate) use admission::{Admission, Admissions};
+
 #[cfg(test)]
 mod protocol_tests;
 #[cfg(test)]
@@ -334,6 +337,8 @@ pub async fn prepare_tcp_server(
     tcp_nodelay: bool,
     tcp_keepalive: TcpKeepaliveOption,
     target_configs: Vec<TcpTargetConfig>,
+    max_connections: Option<std::num::NonZeroUsize>,
+    admission: Arc<Admission>,
 ) -> std::io::Result<impl std::future::Future<Output = std::io::Result<()>> + Send> {
     let (generation, retired) = tokio::sync::watch::channel(());
     let mut non_tls_lookup_table: IpLookupTable<Ipv6Addr, Arc<TargetData>> = IpLookupTable::new();
@@ -374,24 +379,23 @@ pub async fn prepare_tcp_server(
                     .collect::<std::io::Result<_>>()?,
                 next_address_index: AtomicUsize::new(0),
             },
-            TcpAction::Http(HttpTcpActionConfig {
-                http_protocols,
-                http2,
-                http_timeouts,
-                http_paths,
-                default_http_action,
-            }) => {
+            TcpAction::Http(config) => {
+                let HttpTcpActionConfig {
+                    http_protocols,
+                    http2,
+                    http_timeouts,
+                    http_paths,
+                    default_http_action,
+                } = *config;
                 let http_protocols = HttpProtocols::resolve(http_protocols, server_tls.as_mut())?;
                 let http2 = *http2;
                 http2.validate()?;
                 let disabled: Vec<_> = [
                     (
                         "request_header_timeout_secs",
-                        http_timeouts.request_header_timeout_secs,
-                    ),
-                    (
-                        "response_header_timeout_secs",
-                        http_timeouts.response_header_timeout_secs,
+                        http_timeouts
+                            .request_header_timeout_secs
+                            .resolve(Some(http2.header_timeout_secs)),
                     ),
                     (
                         "keepalive_idle_timeout_secs",
@@ -399,7 +403,11 @@ pub async fn prepare_tcp_server(
                     ),
                     (
                         "local_body_timeout_secs",
-                        http_timeouts.local_body_timeout_secs,
+                        if http_protocols.http1 {
+                            http_timeouts.local_body_timeout_secs
+                        } else {
+                            Some(http2.body_progress_timeout_secs)
+                        },
                     ),
                 ]
                 .into_iter()
@@ -469,7 +477,7 @@ pub async fn prepare_tcp_server(
                 let tls_mode = if tls_config.is_passthrough() {
                     TlsMode::Passthrough
                 } else {
-                    if tls_config.handshake_timeout_secs.is_none() {
+                    if tls_config.handshake_timeout().is_none() {
                         warn!(
                             "TLS target on {} has no handshake_timeout_secs",
                             server_address
@@ -528,7 +536,7 @@ pub async fn prepare_tcp_server(
 
                 // Create unified TlsTargetData
                 let tls_target_data = Arc::new(TlsTargetData {
-                    handshake_timeout_secs: tls_config.handshake_timeout_secs,
+                    handshake_timeout_secs: tls_config.handshake_timeout(),
                     allow_no_alpn,
                     allow_any_alpn,
                     alpn_protocols,
@@ -632,6 +640,11 @@ pub async fn prepare_tcp_server(
                 continue;
             }
 
+            let Some(permit) = admission.try_acquire(max_connections) else {
+                debug!("TCP connection limit reached on {}", server_address);
+                continue;
+            };
+
             if tcp_nodelay {
                 if let Err(e) = stream.set_nodelay(true) {
                     error!("Failed to set tcp_nodelay on server stream: {}", e);
@@ -653,6 +666,7 @@ pub async fn prepare_tcp_server(
                 let cloned_sni_trie = sni_trie.clone();
                 let cloned_no_sni = no_sni_targets.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     if let Err(e) = process_tls_stream(
                         stream,
                         &addr,
@@ -670,6 +684,7 @@ pub async fn prepare_tcp_server(
                 });
             } else {
                 tokio::spawn(async move {
+                    let _permit = permit;
                     if let Err(e) =
                         run_stream_action(Box::new(stream), &addr, non_tls_data.unwrap(), None)
                             .await
@@ -1127,12 +1142,11 @@ async fn run_stream_action_with_protocol(
                 let seconds = http
                     .http_timeouts
                     .request_header_timeout_secs
-                    .unwrap_or(http.http2.header_timeout_secs)
-                    .get();
+                    .resolve(Some(http.http2.header_timeout_secs));
                 crate::http::detect::protocol(
                     &mut source_stream,
                     &mut initial_data,
-                    Duration::from_secs(seconds),
+                    seconds.map(|seconds| Duration::from_secs(seconds.get())),
                 )
                 .await?
             } else if http.http_protocols.http2 {
