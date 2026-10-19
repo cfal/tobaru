@@ -106,15 +106,27 @@ impl<V> DomainTrie<V> {
     /// Comparison is ASCII case-insensitive, and a trailing dot (FQDN form)
     /// is stripped before matching.
     pub fn lookup(&self, hostname: &str) -> Option<&V> {
+        let mut best = None;
+        self.for_each_match(hostname, |_, value| best = Some(value));
+        best
+    }
+
+    /// Visits all matching patterns from least to most specific. The rank is the
+    /// number of matched labels: zero for `*`, suffix depth for a wildcard, and
+    /// hostname depth for an exact match. Broader matches remain available when
+    /// a caller rejects a more specific pattern's additional routing conditions.
+    pub fn for_each_match<'a>(&'a self, hostname: &str, mut visit: impl FnMut(usize, &'a V)) {
         let hostname = hostname.strip_suffix('.').unwrap_or(hostname);
         if hostname.is_empty() {
-            return None;
+            return;
         }
 
         let lowered = hostname.to_ascii_lowercase();
         let label_count = lowered.split('.').count();
         let mut current = &self.root;
-        let mut best_wildcard: Option<&V> = self.root.wildcard_value.as_ref();
+        if let Some(value) = &self.root.wildcard_value {
+            visit(0, value);
+        }
 
         for (i, label) in lowered.split('.').rev().enumerate() {
             let is_last = i == label_count - 1;
@@ -125,21 +137,63 @@ impl<V> DomainTrie<V> {
                     // on this node means "match any subdomain below here."
                     if !is_last {
                         if let Some(ref wv) = current.wildcard_value {
-                            best_wildcard = Some(wv);
+                            visit(i + 1, wv);
                         }
                     }
                 }
-                None => return best_wildcard,
+                None => return,
             }
         }
 
-        current.exact_value.as_ref().or(best_wildcard)
+        if let Some(value) = &current.exact_value {
+            visit(label_count, value);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn visits_all_matching_patterns_with_specificity() {
+        let mut t = DomainTrie::new();
+        t.insert("*", 0);
+        t.insert("*.example.com", 1);
+        t.insert("*.api.example.com", 2);
+        t.insert("v1.api.example.com", 3);
+        t.insert("api.example.com", 4);
+        for (hostname, expected) in [
+            ("V1.API.EXAMPLE.COM.", vec![(0, 0), (2, 1), (3, 2), (4, 3)]),
+            ("v2.api.example.com", vec![(0, 0), (2, 1), (3, 2)]),
+            ("api.example.com", vec![(0, 0), (2, 1), (3, 4)]),
+            ("example.com", vec![(0, 0)]),
+            ("foo.exampleX.com", vec![(0, 0)]),
+            ("", vec![]),
+            (".", vec![]),
+        ] {
+            let mut matches = Vec::new();
+            t.for_each_match(hostname, |rank, value| matches.push((rank, *value)));
+            assert_eq!(matches, expected, "{hostname}");
+        }
+    }
+
+    #[test]
+    fn visits_dot_shorthand_and_single_label_matches() {
+        let mut t = DomainTrie::new();
+        t.insert(".Example.Com.", 1);
+        t.insert("localhost", 2);
+        for (hostname, expected) in [
+            ("example.com", vec![(2, 1)]),
+            ("sub.example.com", vec![(2, 1)]),
+            ("LOCALHOST.", vec![(1, 2)]),
+            ("other", vec![]),
+        ] {
+            let mut matches = Vec::new();
+            t.for_each_match(hostname, |rank, value| matches.push((rank, *value)));
+            assert_eq!(matches, expected, "{hostname}");
+        }
+    }
 
     #[test]
     fn exact_single_entry() {
