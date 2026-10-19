@@ -17,11 +17,9 @@ use crate::config::{
     AlpnValue, HttpForwardConfig, HttpHeaderPatch, HttpPathAction, HttpProtocol, HttpProtocols,
     HttpServeDirectoryConfig, HttpServeMessageConfig, HttpTcpActionConfig, HttpTimeouts,
     HttpValueMatch, IpMask, IpMaskSelection, Location, NetLocation, NoneOrOne, RawTcpActionConfig,
-    SniValue, TcpAction, TcpKeepaliveConfig, TcpKeepaliveOption, TcpTargetConfig,
-    TcpTargetLocation,
+    TcpAction, TcpKeepaliveConfig, TcpKeepaliveOption, TcpTargetConfig, TcpTargetLocation,
 };
 use crate::copy_bidirectional::copy_bidirectional;
-use crate::domain_trie::DomainTrie;
 use crate::iptables_util::{configure_iptables, Protocol};
 use crate::rustls_util::{
     create_server_config, get_dummy_server_name, load_certs, load_private_key,
@@ -30,9 +28,13 @@ use crate::tokio_util::resolve_host;
 
 mod admission;
 pub(crate) use admission::{Admission, Admissions};
+mod routing;
+use routing::{AlpnMatch, RoutingTable, SelectedTarget};
 
 #[cfg(test)]
 mod protocol_tests;
+#[cfg(test)]
+mod routing_tests;
 #[cfg(test)]
 mod security_tests;
 
@@ -255,6 +257,7 @@ enum TlsMode {
 }
 
 struct TlsTargetData {
+    pub config_order: usize,
     pub handshake_timeout_secs: Option<std::num::NonZeroU64>,
     pub allow_no_alpn: bool,
     pub allow_any_alpn: bool,
@@ -341,15 +344,11 @@ pub async fn prepare_tcp_server(
     admission: Arc<Admission>,
 ) -> std::io::Result<impl std::future::Future<Output = std::io::Result<()>> + Send> {
     let (generation, retired) = tokio::sync::watch::channel(());
-    let mut non_tls_lookup_table: IpLookupTable<Ipv6Addr, Arc<TargetData>> = IpLookupTable::new();
-
-    let mut tls_lookup_table: IpLookupTable<Ipv6Addr, bool> = IpLookupTable::new();
-    let mut sni_trie: DomainTrie<Vec<Arc<TlsTargetData>>> = DomainTrie::new();
-    let mut no_sni_targets: Vec<Arc<TlsTargetData>> = Vec::new();
+    let mut routes = RoutingTable::default();
 
     let mut iptable_masks = vec![];
 
-    for target_config in target_configs {
+    for (config_order, target_config) in target_configs.into_iter().enumerate() {
         let TcpTargetConfig {
             allowlist,
             mut server_tls,
@@ -522,10 +521,6 @@ pub async fn prepare_tcp_server(
                 // Build IP lookup table (common for both modes)
                 let mut config_lookup_table = IpLookupTable::new();
                 for IpMask(addr, masklen) in allowlist.iter() {
-                    // addresses can be the same across different TLS configs
-                    let _ = tls_lookup_table.insert(*addr, *masklen, true);
-
-                    // .. but shouldn't be duplicated in a single config.
                     if config_lookup_table.insert(*addr, *masklen, true).is_some() {
                         return Err(std::io::Error::other(format!(
                             "Address {}/{} is duplicated in the TLS config.",
@@ -536,6 +531,7 @@ pub async fn prepare_tcp_server(
 
                 // Create unified TlsTargetData
                 let tls_target_data = Arc::new(TlsTargetData {
+                    config_order,
                     handshake_timeout_secs: tls_config.handshake_timeout(),
                     allow_no_alpn,
                     allow_any_alpn,
@@ -545,28 +541,7 @@ pub async fn prepare_tcp_server(
                     target_data: target_data.clone(),
                 });
 
-                // Register SNI hostnames (common for both modes)
-                let sni_hostnames = if tls_config.sni_hostnames.is_empty() {
-                    vec![SniValue::Any, SniValue::None]
-                } else {
-                    tls_config.sni_hostnames.clone().into_vec()
-                };
-
-                for sni_hostname in sni_hostnames {
-                    match sni_hostname {
-                        SniValue::None => {
-                            no_sni_targets.push(tls_target_data.clone());
-                        }
-                        SniValue::Any => {
-                            sni_trie.entry_or_default("*").push(tls_target_data.clone());
-                        }
-                        SniValue::Specified(pattern) => {
-                            sni_trie
-                                .entry_or_default(&pattern)
-                                .push(tls_target_data.clone());
-                        }
-                    }
-                }
+                routes.insert_tls(&tls_config.sni_hostnames, tls_target_data);
 
                 tls_config.optional
             }
@@ -574,24 +549,13 @@ pub async fn prepare_tcp_server(
         };
 
         if is_non_tls_target {
-            for IpMask(addr, masklen) in allowlist.iter() {
-                if non_tls_lookup_table
-                    .insert(*addr, *masklen, target_data.clone())
-                    .is_some()
-                {
-                    return Err(std::io::Error::other(format!(
-                        "Address {}/{} is duplicated in another non-tls target.",
-                        addr, masklen
-                    )));
-                }
-            }
+            routes.insert_non_tls(&allowlist, target_data)?;
         }
 
         iptable_masks.extend(allowlist);
     }
 
-    let sni_trie = Arc::new(sni_trie);
-    let no_sni_targets = Arc::new(no_sni_targets);
+    let routes = Arc::new(routes);
 
     Ok(async move {
         let _generation = generation;
@@ -630,12 +594,8 @@ pub async fn prepare_tcp_server(
                 IpAddr::V6(a) => a,
             };
 
-            let non_tls_data = non_tls_lookup_table
-                .longest_match(ip)
-                .map(|(_, _, m)| m.clone());
-            let has_tls_data = tls_lookup_table.longest_match(ip).is_some();
-
-            if non_tls_data.is_none() && !has_tls_data {
+            let ip_targets = routes.ip_targets(ip);
+            if ip_targets.is_empty() {
                 debug!("Unknown address, not allowing: {}", addr.ip());
                 continue;
             }
@@ -662,107 +622,22 @@ pub async fn prepare_tcp_server(
                 }
             }
 
-            if has_tls_data {
-                let cloned_sni_trie = sni_trie.clone();
-                let cloned_no_sni = no_sni_targets.clone();
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    if let Err(e) = process_tls_stream(
-                        stream,
-                        &addr,
-                        ip,
-                        non_tls_data,
-                        cloned_sni_trie,
-                        cloned_no_sni,
-                    )
-                    .await
-                    {
-                        error!("{} finished with error: {:?}", addr, e);
-                    } else {
-                        debug!("{} finished successfully", addr);
-                    }
-                });
-            } else {
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    if let Err(e) =
-                        run_stream_action(Box::new(stream), &addr, non_tls_data.unwrap(), None)
-                            .await
-                    {
-                        error!("{} finished with error: {:?}", addr, e);
-                    } else {
-                        debug!("{} finished successfully", addr);
-                    }
-                });
-            }
+            let routes = routes.clone();
+            tokio::spawn(async move {
+                let _permit = permit;
+                let result = if let Some(target) = ip_targets.direct_target() {
+                    run_stream_action(Box::new(stream), &addr, target, None).await
+                } else {
+                    process_tls_stream(stream, &addr, ip, ip_targets, &routes).await
+                };
+                if let Err(e) = result {
+                    error!("{} finished with error: {:?}", addr, e);
+                } else {
+                    debug!("{} finished successfully", addr);
+                }
+            });
         }
     })
-}
-
-/// Resolves SNI candidates from a parsed ClientHello.
-fn resolve_tls_candidates<'a>(
-    parsed: &crate::tls_parser::ParsedClientHello,
-    sni_trie: &'a DomainTrie<Vec<Arc<TlsTargetData>>>,
-    no_sni_targets: &'a [Arc<TlsTargetData>],
-) -> Option<&'a [Arc<TlsTargetData>]> {
-    match &parsed.server_name {
-        Some(hostname) => sni_trie.lookup(hostname).map(Vec::as_slice),
-        None if no_sni_targets.is_empty() => None,
-        None => Some(no_sni_targets),
-    }
-}
-
-/// Returns true if the candidate matches the client's ALPN offer.
-fn alpn_matches(candidate: &TlsTargetData, protocols: &[Vec<u8>]) -> bool {
-    if protocols.is_empty() {
-        candidate.allow_no_alpn
-    } else {
-        protocols
-            .iter()
-            .any(|p| candidate.alpn_protocols.contains(p))
-            || candidate.allow_any_alpn
-    }
-}
-
-/// Find matching terminate target based on SNI and ALPN from parsed ClientHello
-fn find_matching_terminate_target(
-    parsed: &crate::tls_parser::ParsedClientHello,
-    ip: Ipv6Addr,
-    sni_trie: &DomainTrie<Vec<Arc<TlsTargetData>>>,
-    no_sni_targets: &[Arc<TlsTargetData>],
-) -> Option<(Arc<TlsTargetData>, Arc<rustls::ServerConfig>)> {
-    let candidates = resolve_tls_candidates(parsed, sni_trie, no_sni_targets)?;
-
-    for candidate in candidates {
-        let (alpn_tls_config, no_alpn_tls_config) = match &candidate.tls_mode {
-            TlsMode::Terminate {
-                alpn_tls_config,
-                no_alpn_tls_config,
-            } => (alpn_tls_config, no_alpn_tls_config),
-            TlsMode::Passthrough => continue,
-        };
-
-        if candidate.ip_lookup_table.longest_match(ip).is_none() {
-            continue;
-        }
-
-        // Select the appropriate rustls config based on ALPN match type
-        if parsed.alpn_protocols.is_empty() {
-            if candidate.allow_no_alpn {
-                return Some((candidate.clone(), no_alpn_tls_config.clone()));
-            }
-        } else if parsed
-            .alpn_protocols
-            .iter()
-            .any(|p| candidate.alpn_protocols.contains(p))
-        {
-            return Some((candidate.clone(), alpn_tls_config.clone()));
-        } else if candidate.allow_any_alpn {
-            return Some((candidate.clone(), no_alpn_tls_config.clone()));
-        }
-    }
-
-    None
 }
 
 /// Feed data into rustls ServerConnection
@@ -859,30 +734,6 @@ async fn handle_terminate_with_parsed(
     ))
 }
 
-/// Find matching passthrough target based on SNI and ALPN
-fn find_matching_passthrough_target(
-    parsed: &crate::tls_parser::ParsedClientHello,
-    ip: Ipv6Addr,
-    sni_trie: &DomainTrie<Vec<Arc<TlsTargetData>>>,
-    no_sni_targets: &[Arc<TlsTargetData>],
-) -> Option<Arc<TlsTargetData>> {
-    let candidates = resolve_tls_candidates(parsed, sni_trie, no_sni_targets)?;
-
-    for candidate in candidates {
-        if !matches!(candidate.tls_mode, TlsMode::Passthrough) {
-            continue;
-        }
-        if candidate.ip_lookup_table.longest_match(ip).is_none() {
-            continue;
-        }
-        if alpn_matches(candidate, &parsed.alpn_protocols) {
-            return Some(candidate.clone());
-        }
-    }
-
-    None
-}
-
 /// Handle passthrough stream - forward ClientHello + remaining data without decryption
 async fn handle_passthrough_stream(
     stream: TcpStream,
@@ -956,31 +807,26 @@ async fn handle_passthrough_stream(
     copy_result.map(|_| ())
 }
 
-/// Replay plaintext, including any bytes read ahead during protocol detection.
-async fn fallback_to_non_tls(
+/// Replay all wire bytes read ahead during protocol detection, including TLS.
+async fn run_buffered_fallback(
     stream: TcpStream,
     addr: &std::net::SocketAddr,
-    non_tls_data: Arc<TargetData>,
+    target_data: Arc<TargetData>,
     reader: crate::tls_reader::TlsReader,
 ) -> std::io::Result<()> {
     let (mut buf, _pos, end) = reader.into_inner();
     buf.truncate(end);
     let initial_data = if buf.is_empty() { None } else { Some(buf) };
-    run_stream_action(Box::new(stream), addr, non_tls_data, initial_data).await
+    run_stream_action(Box::new(stream), addr, target_data, initial_data).await
 }
 
 async fn process_tls_stream(
     mut stream: TcpStream,
     addr: &std::net::SocketAddr,
     ip: Ipv6Addr,
-    non_tls_data: Option<Arc<TargetData>>,
-    sni_trie: Arc<DomainTrie<Vec<Arc<TlsTargetData>>>>,
-    no_sni_targets: Arc<Vec<Arc<TlsTargetData>>>,
+    ip_targets: routing::IpTargets,
+    routes: &RoutingTable,
 ) -> std::io::Result<()> {
-    // UNIFIED APPROACH: Always parse ClientHello first
-    // This allows us to route to either passthrough or terminate targets
-
-    // Create TlsReader for parsing
     let mut reader = crate::tls_reader::TlsReader::new();
 
     // Try to parse ClientHello with timeout
@@ -992,22 +838,22 @@ async fn process_tls_stream(
     let parsed = match parse_timeout.await {
         Ok(Ok(parsed)) => parsed,
         Ok(Err(e)) => {
-            if let Some(non_tls_data) = non_tls_data.filter(|_| !reader.starts_with_tls()) {
+            if let Some(target) = ip_targets.fallback(reader.starts_with_tls()) {
                 debug!(
-                    "Failed to parse TLS ClientHello from {}: {}, trying non-TLS target",
+                    "Failed to parse TLS ClientHello from {}: {}, using fallback target",
                     addr, e
                 );
-                return fallback_to_non_tls(stream, addr, non_tls_data, reader).await;
+                return run_buffered_fallback(stream, addr, target, reader).await;
             }
             return Err(e);
         }
         Err(elapsed) => {
-            if let Some(non_tls_data) = non_tls_data.filter(|_| !reader.starts_with_tls()) {
+            if let Some(target) = ip_targets.fallback(reader.starts_with_tls()) {
                 warn!(
-                    "TLS ClientHello parse timed out for {}, assuming non-TLS connection",
+                    "TLS ClientHello parse timed out for {}, using fallback target",
                     addr
                 );
-                return fallback_to_non_tls(stream, addr, non_tls_data, reader).await;
+                return run_buffered_fallback(stream, addr, target, reader).await;
             }
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
@@ -1021,20 +867,28 @@ async fn process_tls_stream(
         addr, parsed.server_name, parsed.alpn_protocols
     );
 
-    // Get the buffered ClientHello data for replay and truncate to actual data
+    let selected = routes.select(ip, &parsed, &ip_targets);
+    if let Some(SelectedTarget::Raw(target)) = selected {
+        return run_buffered_fallback(stream, addr, target, reader).await;
+    }
+
     let (mut buf, _pos, end) = reader.into_inner();
     buf.truncate(end);
 
-    // Try to match passthrough targets first (higher priority)
-    if let Some(target) = find_matching_passthrough_target(&parsed, ip, &sni_trie, &no_sni_targets)
-    {
-        return handle_passthrough_stream(stream, addr, buf, target).await;
-    }
-
-    // Try to match terminate targets
-    if let Some((target, tls_config)) =
-        find_matching_terminate_target(&parsed, ip, &sni_trie, &no_sni_targets)
-    {
+    // Selection is final: execution errors must not retry through another route.
+    if let Some(SelectedTarget::Tls(target, alpn)) = selected {
+        let tls_config = match &target.tls_mode {
+            TlsMode::Passthrough => {
+                return handle_passthrough_stream(stream, addr, buf, target).await;
+            }
+            TlsMode::Terminate {
+                alpn_tls_config,
+                no_alpn_tls_config,
+            } => match alpn {
+                AlpnMatch::Exact => alpn_tls_config.clone(),
+                AlpnMatch::Any | AlpnMatch::Absent => no_alpn_tls_config.clone(),
+            },
+        };
         let (tls_stream, target_data) =
             handle_terminate_with_parsed(stream, addr, buf, target, tls_config).await?;
         return run_stream_action_with_protocol(
@@ -1331,6 +1185,7 @@ mod tests {
         let _client = client.unwrap();
         let (server, peer) = accepted.unwrap();
         let target = Arc::new(TlsTargetData {
+            config_order: 0,
             handshake_timeout_secs: std::num::NonZeroU64::new(1),
             allow_no_alpn: true,
             allow_any_alpn: true,

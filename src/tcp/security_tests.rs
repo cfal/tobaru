@@ -33,6 +33,7 @@ fn tls_target(address: SocketAddr) -> TlsTargetData {
     let mut ip_lookup_table = IpLookupTable::new();
     ip_lookup_table.insert(Ipv6Addr::UNSPECIFIED, 0, true);
     TlsTargetData {
+        config_order: 0,
         handshake_timeout_secs: None,
         allow_no_alpn: false,
         allow_any_alpn: false,
@@ -46,39 +47,50 @@ fn tls_target(address: SocketAddr) -> TlsTargetData {
 #[test]
 fn alpn_matching_uses_exact_opaque_identifiers_and_preserves_fallbacks() {
     let mut target = tls_target("127.0.0.1:1".parse().unwrap());
-    assert!(alpn_matches(&target, &[b"other".to_vec(), b"h2".to_vec()]));
+    assert_eq!(
+        routing::alpn_match(&target, &[b"other".to_vec(), b"h2".to_vec()]),
+        Some(AlpnMatch::Exact)
+    );
     for offer in [
         vec![],
         vec![b"H2".to_vec()],
         vec![b"h2-extra".to_vec()],
         vec![vec![0xff]],
     ] {
-        assert!(!alpn_matches(&target, &offer));
+        assert_eq!(routing::alpn_match(&target, &offer), None);
     }
     target.allow_no_alpn = true;
-    assert!(alpn_matches(&target, &[]));
-    assert!(!alpn_matches(&target, &[vec![0xff]]));
+    assert_eq!(routing::alpn_match(&target, &[]), Some(AlpnMatch::Absent));
+    assert_eq!(routing::alpn_match(&target, &[vec![0xff]]), None);
     target.allow_any_alpn = true;
-    assert!(alpn_matches(&target, &[vec![0xff]]));
+    assert_eq!(
+        routing::alpn_match(&target, &[vec![0xff]]),
+        Some(AlpnMatch::Any)
+    );
 }
 
 #[tokio::test(start_paused = true)]
-async fn malformed_and_incomplete_tls_never_reach_a_plaintext_target() {
+async fn malformed_and_incomplete_tls_cannot_fall_back_to_plaintext_http() {
     for bytes in [
         b"\x16".as_slice(),
         b"\x16\x03\x03\x00\x04\x02\x00\x00\x00",
         b"\x17\x03\x03\x00\x01\x00",
     ] {
-        let (backend, address) = listener().await;
+        let mut routes = RoutingTable::default();
+        routes
+            .insert_non_tls(
+                &[IpMask::all()],
+                protocol_tests::target(HttpProtocols::default()),
+            )
+            .unwrap();
         let (mut client, server, peer) = pair().await;
         client.write_all(bytes).await.unwrap();
         let error = process_tls_stream(
             server,
             &peer,
             Ipv6Addr::LOCALHOST,
-            Some(raw_target(address)),
-            Arc::new(DomainTrie::new()),
-            Arc::new(vec![]),
+            routes.ip_targets(Ipv6Addr::LOCALHOST),
+            &routes,
         )
         .await
         .unwrap_err();
@@ -90,16 +102,17 @@ async fn malformed_and_incomplete_tls_never_reach_a_plaintext_target() {
                 std::io::ErrorKind::InvalidData
             }
         );
-        assert!(timeout(Duration::from_millis(10), backend.accept())
-            .await
-            .is_err());
     }
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn plaintext_and_server_first_connections_keep_their_raw_fallback() {
     for server_first in [false, true] {
         let (backend, address) = listener().await;
+        let mut routes = RoutingTable::default();
+        routes
+            .insert_non_tls(&[IpMask::all()], raw_target(address))
+            .unwrap();
         let (mut client, server, peer) = pair().await;
         if !server_first {
             client.write_all(b"G").await.unwrap();
@@ -109,9 +122,8 @@ async fn plaintext_and_server_first_connections_keep_their_raw_fallback() {
             server,
             &peer,
             Ipv6Addr::LOCALHOST,
-            Some(raw_target(address)),
-            Arc::new(DomainTrie::new()),
-            Arc::new(vec![]),
+            routes.ip_targets(Ipv6Addr::LOCALHOST),
+            &routes,
         );
         let upstream = async {
             let (mut stream, _) = backend.accept().await.unwrap();
@@ -127,60 +139,278 @@ async fn plaintext_and_server_first_connections_keep_their_raw_fallback() {
             assert_eq!(&reply, b"reply");
             client.shutdown().await.unwrap();
         };
-        let (result, (), ()) = tokio::join!(proxy, upstream, downstream);
+        let (result, (), ()) = timeout(Duration::from_secs(10), async {
+            tokio::join!(proxy, upstream, downstream)
+        })
+        .await
+        .unwrap();
         result.unwrap();
     }
 }
 
 #[tokio::test]
-async fn fragmented_passthrough_replays_original_records_and_following_bytes() {
+async fn fragmented_tls_replays_original_records_and_following_bytes_for_raw_and_passthrough() {
     timeout(Duration::from_secs(5), async {
-        let config = crate::rustls_util::create_client_config_with_cert(
-            false,
-            None,
-            vec![b"h2".to_vec()],
-            true,
-            vec![],
-        )
-        .unwrap();
-        let mut tls = rustls::ClientConnection::new(
-            config,
-            rustls::pki_types::ServerName::try_from("localhost").unwrap(),
-        )
-        .unwrap();
-        let mut hello = Vec::new();
-        tls.write_tls(&mut hello).unwrap();
-        let mut wire = Vec::new();
-        for chunk in hello[5..].chunks(7) {
-            wire.extend([0x16, 3, 3]);
-            wire.extend((chunk.len() as u16).to_be_bytes());
-            wire.extend(chunk);
+        for matching_tls in [false, true] {
+            let config = crate::rustls_util::create_client_config_with_cert(
+                false,
+                None,
+                vec![b"h2".to_vec()],
+                true,
+                vec![],
+            )
+            .unwrap();
+            let mut tls = rustls::ClientConnection::new(
+                config,
+                rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+            )
+            .unwrap();
+            let mut hello = Vec::new();
+            tls.write_tls(&mut hello).unwrap();
+            let mut wire = Vec::new();
+            for chunk in hello[5..].chunks(7) {
+                wire.extend([0x16, 3, 3]);
+                wire.extend((chunk.len() as u16).to_be_bytes());
+                wire.extend(chunk);
+            }
+            wire.extend(b"following bytes");
+            let (backend, address) = listener().await;
+            let (mut client, server, peer) = pair().await;
+            let mut routes = RoutingTable::default();
+            routes
+                .insert_non_tls(&[IpMask::all()], raw_target(address))
+                .unwrap();
+            let names = serde_json::from_value(serde_json::json!(if matching_tls {
+                "localhost"
+            } else {
+                "other.example"
+            }))
+            .unwrap();
+            routes.insert_tls(&names, Arc::new(tls_target(address)));
+            client.write_all(&wire).await.unwrap();
+            client.shutdown().await.unwrap();
+            let proxy = process_tls_stream(
+                server,
+                &peer,
+                Ipv6Addr::LOCALHOST,
+                routes.ip_targets(Ipv6Addr::LOCALHOST),
+                &routes,
+            );
+            let upstream = async {
+                let (mut stream, _) = backend.accept().await.unwrap();
+                let mut received = Vec::new();
+                stream.read_to_end(&mut received).await.unwrap();
+                assert_eq!(received, wire);
+                stream.shutdown().await.unwrap();
+            };
+            let (result, ()) = tokio::join!(proxy, upstream);
+            result.unwrap();
         }
-        wire.extend(b"following bytes");
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn raw_fallback_replays_malformed_and_timed_out_tls_without_losing_read_ahead() {
+    for bytes in [
+        b"\x16".as_slice(),
+        b"\x16\x03\x03\x00\x01\x01\x16\x03",
+        b"\x16\x03\x03\x00\x04\x02\x00\x00\x00following bytes",
+        b"\x17\x03\x03\x00\x01\x00following bytes",
+        b"\x16\x03\x03\xff\xfffollowing bytes",
+    ] {
         let (backend, address) = listener().await;
+        let mut routes = RoutingTable::default();
+        routes
+            .insert_non_tls(&[IpMask::all()], raw_target(address))
+            .unwrap();
         let (mut client, server, peer) = pair().await;
-        let mut trie = DomainTrie::new();
-        trie.insert("localhost", vec![Arc::new(tls_target(address))]);
-        client.write_all(&wire).await.unwrap();
-        client.shutdown().await.unwrap();
+        client.write_all(bytes).await.unwrap();
         let proxy = process_tls_stream(
             server,
             &peer,
             Ipv6Addr::LOCALHOST,
-            None,
-            Arc::new(trie),
-            Arc::new(vec![]),
+            routes.ip_targets(Ipv6Addr::LOCALHOST),
+            &routes,
         );
         let upstream = async {
             let (mut stream, _) = backend.accept().await.unwrap();
-            let mut received = Vec::new();
-            stream.read_to_end(&mut received).await.unwrap();
-            assert_eq!(received, wire);
+            let mut received = vec![0; bytes.len()];
+            stream.read_exact(&mut received).await.unwrap();
+            assert_eq!(received, bytes);
+            stream.write_all(b"reply").await.unwrap();
             stream.shutdown().await.unwrap();
         };
-        let (result, ()) = tokio::join!(proxy, upstream);
+        let downstream = async {
+            let mut reply = [0; 5];
+            client.read_exact(&mut reply).await.unwrap();
+            assert_eq!(&reply, b"reply");
+            client.shutdown().await.unwrap();
+        };
+        let (result, (), ()) = timeout(Duration::from_secs(10), async {
+            tokio::join!(proxy, upstream, downstream)
+        })
+        .await
+        .unwrap();
         result.unwrap();
+    }
+}
+
+fn client_config() -> Arc<rustls::ClientConfig> {
+    crate::rustls_util::create_client_config_with_cert(
+        false,
+        None,
+        vec![b"h2".to_vec()],
+        true,
+        vec![],
+    )
+    .unwrap()
+}
+
+fn terminate_target(address: SocketAddr, require_client_cert: bool) -> TlsTargetData {
+    let identity = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let fingerprints = if require_client_cert {
+        vec!["00".repeat(32)]
+    } else {
+        vec![]
+    };
+    let (alpn_tls_config, no_alpn_tls_config) = build_rustls_configs(
+        load_certs(identity.cert.pem().as_bytes()).unwrap(),
+        &load_private_key(identity.signing_key.serialize_pem().as_bytes()).unwrap(),
+        &serde_json::from_value(serde_json::json!(["h2"])).unwrap(),
+        &crate::config::NoneOrSome::Some(fingerprints),
+        &[],
+    )
+    .unwrap();
+    let mut target = tls_target(address);
+    target.handshake_timeout_secs = std::num::NonZeroU64::new(1);
+    target.tls_mode = TlsMode::Terminate {
+        alpn_tls_config,
+        no_alpn_tls_config,
+    };
+    target
+}
+
+#[tokio::test]
+async fn selected_tls_authentication_and_backend_failures_never_use_raw_fallback() {
+    timeout(Duration::from_secs(5), async {
+        for require_client_cert in [true, false] {
+            let (raw_backend, raw_address) = listener().await;
+            let (closed_backend, closed_address) = listener().await;
+            drop(closed_backend);
+            let mut routes = RoutingTable::default();
+            routes
+                .insert_non_tls(&[IpMask::all()], raw_target(raw_address))
+                .unwrap();
+            routes.insert_tls(
+                &Default::default(),
+                Arc::new(terminate_target(closed_address, require_client_cert)),
+            );
+            let (client, server, peer) = pair().await;
+            let proxy = process_tls_stream(
+                server,
+                &peer,
+                Ipv6Addr::LOCALHOST,
+                routes.ip_targets(Ipv6Addr::LOCALHOST),
+                &routes,
+            );
+            let downstream = async {
+                let connector = tokio_rustls::TlsConnector::from(client_config());
+                let mut stream = connector
+                    .connect(
+                        rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+                        client,
+                    )
+                    .await?;
+                let mut buf = Vec::new();
+                stream.read_to_end(&mut buf).await
+            };
+            let (result, _) = tokio::join!(proxy, downstream);
+            let error = result.unwrap_err();
+            if require_client_cert {
+                assert!(error.to_string().contains("certificate"), "{error}");
+            } else {
+                assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
+            }
+            assert!(timeout(Duration::from_millis(10), raw_backend.accept())
+                .await
+                .is_err());
+        }
     })
     .await
     .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn selected_tls_handshake_timeout_never_uses_raw_fallback() {
+    let (raw_backend, raw_address) = listener().await;
+    let mut routes = RoutingTable::default();
+    routes
+        .insert_non_tls(&[IpMask::all()], raw_target(raw_address))
+        .unwrap();
+    routes.insert_tls(
+        &Default::default(),
+        Arc::new(terminate_target(raw_address, false)),
+    );
+    let (mut client, server, peer) = pair().await;
+    let mut tls = rustls::ClientConnection::new(
+        client_config(),
+        rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+    )
+    .unwrap();
+    let mut hello = Vec::new();
+    tls.write_tls(&mut hello).unwrap();
+    client.write_all(&hello).await.unwrap();
+    let error = process_tls_stream(
+        server,
+        &peer,
+        Ipv6Addr::LOCALHOST,
+        routes.ip_targets(Ipv6Addr::LOCALHOST),
+        &routes,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.to_string(), "TLS handshake timed out");
+    assert!(timeout(Duration::from_millis(10), raw_backend.accept())
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn selected_passthrough_backend_failure_never_uses_raw_fallback() {
+    let (raw_backend, raw_address) = listener().await;
+    let (closed_backend, closed_address) = listener().await;
+    drop(closed_backend);
+    let mut routes = RoutingTable::default();
+    routes
+        .insert_non_tls(&[IpMask::all()], raw_target(raw_address))
+        .unwrap();
+    routes.insert_tls(&Default::default(), Arc::new(tls_target(closed_address)));
+    let (mut client, server, peer) = pair().await;
+    let mut tls = rustls::ClientConnection::new(
+        client_config(),
+        rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+    )
+    .unwrap();
+    let mut hello = Vec::new();
+    tls.write_tls(&mut hello).unwrap();
+    client.write_all(&hello).await.unwrap();
+    let error = timeout(
+        Duration::from_secs(5),
+        process_tls_stream(
+            server,
+            &peer,
+            Ipv6Addr::LOCALHOST,
+            routes.ip_targets(Ipv6Addr::LOCALHOST),
+            &routes,
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
+    assert!(timeout(Duration::from_millis(10), raw_backend.accept())
+        .await
+        .is_err());
 }

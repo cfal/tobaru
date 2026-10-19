@@ -32,6 +32,7 @@ impl<V> Default for DomainTrie<V> {
 }
 
 impl<V> DomainTrie<V> {
+    #[cfg(test)]
     pub fn new() -> Self {
         Self::default()
     }
@@ -105,6 +106,7 @@ impl<V> DomainTrie<V> {
     /// Priority: exact match > deepest wildcard > no match.
     /// Comparison is ASCII case-insensitive, and a trailing dot (FQDN form)
     /// is stripped before matching.
+    #[cfg(test)]
     pub fn lookup(&self, hostname: &str) -> Option<&V> {
         let mut best = None;
         self.for_each_match(hostname, |_, value| best = Some(value));
