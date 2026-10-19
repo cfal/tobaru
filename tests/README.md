@@ -52,3 +52,14 @@ records, not only rejection of oversized record-length fields. The CLI's
 authentication-failure check counts raw backend TCP accepts, including connections
 whose TLS handshake never completes. It also verifies that auto-migrated optional
 TLS forwarding targets receive unmatched and malformed TLS at their raw backend.
+
+Configuration CLI checks also require `openssl`. Preflight cases use `--dry-run`
+without binding listeners. They cover shortcut exposure diagnostics, CIDR
+normalization, named groups, overlapping-prefix order, and duplicate-network errors
+across raw TCP, TLS passthrough, TLS termination, and UDP. Firewall cases start
+ephemeral listeners with stubbed `iptables` and `ip6tables` commands; they check
+mapped IPv4 coverage without requiring privileges or changing real firewall rules:
+
+```sh
+node tests/config_cli.mjs target/release/tobaru
+```
