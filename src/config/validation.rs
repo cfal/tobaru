@@ -509,11 +509,11 @@ mod tests {
         }
     }
     #[test]
-    fn tcp_connection_admission_defaults_and_opt_out_are_validated() {
+    fn tcp_connection_admission_is_opt_in_and_requires_positive_values() {
         use super::super::TargetConfigs;
         let base = json!({"transport":"tcp", "target":{"allowlist":"127.0.0.1", "location":"127.0.0.1:80"}});
         for (value, expected) in [
-            (None, Some(256)),
+            (None, None),
             (Some(json!(null)), None),
             (Some(json!(12)), Some(12)),
         ] {
@@ -521,14 +521,20 @@ mod tests {
             if let Some(value) = value {
                 config["tcp_max_connections"] = value;
             }
-            let TargetConfigs::Tcp {
-                tcp_max_connections,
-                ..
-            } = serde_json::from_value(config).unwrap()
-            else {
-                panic!("TCP expected")
-            };
-            assert_eq!(tcp_max_connections.map(|limit| limit.get()), expected);
+            let configs: [TargetConfigs; 2] = [
+                serde_json::from_value(config.clone()).unwrap(),
+                serde_yaml::from_str(&serde_yaml::to_string(&config).unwrap()).unwrap(),
+            ];
+            for config in configs {
+                let TargetConfigs::Tcp {
+                    tcp_max_connections,
+                    ..
+                } = config
+                else {
+                    panic!("TCP expected")
+                };
+                assert_eq!(tcp_max_connections.map(|limit| limit.get()), expected);
+            }
         }
         for value in [json!(0), json!(-1), json!(1.5)] {
             let mut config = base.clone();
@@ -538,34 +544,54 @@ mod tests {
     }
 
     #[test]
-    fn udp_limits_are_finite_by_default_and_require_positive_values() {
+    fn udp_limits_preserve_legacy_defaults_and_require_positive_values() {
         use super::super::TargetConfigs;
         let base = json!({"transport":"udp", "target":{"allowlist":"127.0.0.1", "location":"127.0.0.1:53"}});
-        let config: TargetConfigs = serde_json::from_value(base.clone()).unwrap();
-        let TargetConfigs::Udp {
-            udp_max_associations,
-            udp_queue_capacity,
-            ..
-        } = config
-        else {
-            panic!("UDP expected");
-        };
-        assert_eq!(udp_max_associations.unwrap().get(), 128);
-        assert_eq!(udp_queue_capacity.get(), 8);
-        for value in [json!(null), json!(1), json!(4096)] {
-            let mut config = base.clone();
-            config["udp_max_associations"] = value;
-            assert!(serde_json::from_value::<TargetConfigs>(config).is_ok());
+        for (association_limit, expected_limit) in [
+            (None, None),
+            (Some(json!(null)), None),
+            (Some(json!(1)), Some(1)),
+            (Some(json!(4096)), Some(4096)),
+        ] {
+            for (queue_capacity, expected_capacity) in [
+                (None, 1024),
+                (Some(1), 1),
+                (Some(8), 8),
+                (Some(1024), 1024),
+                (Some(65535), 65535),
+            ] {
+                let mut config = base.clone();
+                if let Some(value) = &association_limit {
+                    config["udp_max_associations"] = value.clone();
+                }
+                if let Some(value) = queue_capacity {
+                    config["udp_queue_capacity"] = json!(value);
+                }
+                let configs: [TargetConfigs; 2] = [
+                    serde_json::from_value(config.clone()).unwrap(),
+                    serde_yaml::from_str(&serde_yaml::to_string(&config).unwrap()).unwrap(),
+                ];
+                for config in configs {
+                    let TargetConfigs::Udp {
+                        udp_max_associations,
+                        udp_queue_capacity,
+                        ..
+                    } = config
+                    else {
+                        panic!("UDP expected");
+                    };
+                    assert_eq!(
+                        udp_max_associations.map(|limit| limit.get()),
+                        expected_limit
+                    );
+                    assert_eq!(udp_queue_capacity.get(), expected_capacity);
+                }
+            }
         }
         for value in [json!(0), json!(-1), json!(1.5)] {
             let mut config = base.clone();
             config["udp_max_associations"] = value;
             assert!(serde_json::from_value::<TargetConfigs>(config).is_err());
-        }
-        for value in [json!(1), json!(8), json!(1024), json!(65535)] {
-            let mut config = base.clone();
-            config["udp_queue_capacity"] = value;
-            assert!(serde_json::from_value::<TargetConfigs>(config).is_ok());
         }
         for value in [json!(null), json!(0), json!(-1), json!(1.5), json!(65536)] {
             let mut config = base.clone();
