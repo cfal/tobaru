@@ -156,6 +156,52 @@ async fn plaintext_and_server_first_connections_keep_their_raw_fallback() {
     }
 }
 
+async fn check_idle_http_fallback(with_raw: bool) {
+    let (backend, address) = listener().await;
+    let mut routes = RoutingTable::default();
+    routes
+        .insert_non_tls(
+            &[IpMask::try_from("127.0.0.1/32").unwrap()],
+            protocol_tests::target(HttpProtocols::default()),
+        )
+        .unwrap();
+    if with_raw {
+        routes
+            .insert_non_tls(&[IpMask::all()], raw_target(address))
+            .unwrap();
+    }
+    routes.insert_tls(&Default::default(), Arc::new(tls_target(address)));
+    let (mut client, server, peer) = pair().await;
+    let ip = std::net::Ipv4Addr::LOCALHOST.to_ipv6_mapped();
+    let ip_targets = routes.ip_targets(ip);
+    assert!(ip_targets.direct_target().is_none());
+    let proxy = process_tls_stream(server, &peer, ip, ip_targets, &routes);
+    let downstream = async {
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: example\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response:?}");
+    };
+    tokio::select! {
+        accepted = backend.accept() => panic!("unexpected backend connection: {accepted:?}"),
+        (result, ()) = async { tokio::join!(proxy, downstream) } => result.unwrap(),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn idle_plaintext_after_inspection_timeout_reaches_http() {
+    check_idle_http_fallback(false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn idle_plaintext_after_inspection_timeout_does_not_use_raw() {
+    check_idle_http_fallback(true).await;
+}
+
 #[tokio::test]
 async fn fragmented_tls_replays_original_records_and_following_bytes_for_raw_and_passthrough() {
     timeout(Duration::from_secs(5), async {
