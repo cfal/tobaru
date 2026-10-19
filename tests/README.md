@@ -1,4 +1,4 @@
-# HTTP Smoke Tests
+# Protocol Tests
 
 The Rust suite includes deterministic protocol tests and local TCP, Unix, and
 TLS session tests:
@@ -15,6 +15,7 @@ required; no npm packages are needed.
 CARGO_BUILD_JOBS=1 cargo build --release --locked
 node tests/http_smoke.mjs target/release/tobaru
 node tests/http2_smoke.mjs target/release/tobaru
+node tests/tcp_routing_smoke.mjs target/release/tobaru
 ```
 
 Omitting the argument selects `target/release/tobaru` relative to the repository.
@@ -37,3 +38,12 @@ repeated cookies, request/response trailers, backend reuse, Unix prior knowledge
 outbound pins and CA verification failures, inbound and outbound mTLS, and rejection
 of a backend that cannot negotiate H2. It does not measure Internet-scale throughput
 or claim exhaustive RFC conformance.
+
+The TCP routing smoke test also requires `openssl`. It checks the actual CLI's
+configuration registration and routing: raw forwarding of unmatched TLS,
+specific routes and competing catch-alls, source-IP/SNI/ALPN precedence,
+absent SNI/ALPN, fallback across wildcard patterns, plaintext HTTP isolation,
+immediate server-first raw overrides, configuration-order ties, and terminal
+client-authentication failures. The Rust tests additionally exercise fragmented
+and malformed ClientHellos, byte-exact replay after inspection timeouts, IPv6
+precedence, and handshake/backend failures without fallback.

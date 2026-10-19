@@ -1,5 +1,38 @@
 # Upgrading
 
+## TCP Target Routing
+
+TCP target selection now checks complete routing conditions before ranking
+eligible targets by source-IP prefix length, TLS/SNI/ALPN specificity, and
+configuration order. Passthrough no longer has implicit priority over termination.
+Broader SNI patterns remain eligible when a narrower pattern fails its IP or ALPN
+conditions. Equal IP prefixes across TCP targets are accepted and use the same
+ranking rules; duplicate entries within one target's allowlist remain invalid.
+
+Raw forwarding targets without `server_tls` are now genuine catch-alls. They can
+receive unmatched TLS and malformed, incomplete, or oversized ClientHellos,
+with all buffered bytes replayed unchanged. Previously, the presence of any
+TLS route for a source IP could prevent its raw catch-all from receiving TLS.
+Plaintext HTTP targets are not opaque TLS fallbacks. Selected TLS routes still
+fail closed on handshake, client authentication, and backend connection errors.
+
+Review configurations that depended on the old implicit rejections:
+
+- A broad raw target grants fallback access even when a specific TLS target's
+  IP or ALPN condition fails. Remove or narrow fallback routes when that traffic
+  must be rejected. The same consideration applies to broader TLS SNI patterns.
+- More-specific IP prefixes now take priority across raw and TLS routes, and
+  across TLS targets. Configuration order breaks ties rather than determining
+  every match.
+- Configurations relying on passthrough always winning over termination should
+  use distinct conditions or put the intended winner first when conditions tie.
+- A per-host passthrough rule used only to reach an existing raw catch-all can
+  be removed when the raw target's allowlist already admits that source.
+
+No new configuration fields or dependency changes are required. See
+[target precedence](CONFIG.md#target-evaluation-order) and
+[raw catch-all behavior](CONFIG.md#raw-catch-all) for the complete contract.
+
 ## Upgrading from 0.7.1 and lower
 
 ### Breaking changes

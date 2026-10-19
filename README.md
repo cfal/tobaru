@@ -382,7 +382,10 @@ Route all subdomains of a domain to a single backend:
         sni_hostnames: api.example.com
 ```
 
-Matching priority: exact match > deepest wildcard > shallower wildcard > no match.
+Among eligible TLS targets at the same source-IP prefix length, matching priority
+is exact match > deepest wildcard > shallower wildcard > `any`. IP and ALPN
+conditions are checked before choosing a target, so an ineligible specific
+pattern does not hide a matching wildcard. See [target precedence](CONFIG.md#target-evaluation-order).
 
 ### Host Header Routing
 
@@ -517,6 +520,18 @@ openssl x509 -in server.crt -noout -fingerprint -sha256
     - location: backend3:8080
       allowlist: 0.0.0.0/0
 ```
+
+Raw forwarding targets without `server_tls` accept arbitrary bytes, including
+TLS that does not match another eligible route. Routing prefers the longest
+matching source-IP prefix, then TLS/SNI/ALPN specificity, then configuration
+order. At equal IP specificity, a TLS catch-all handles matching TLS while a raw
+catch-all handles the remaining traffic. TLS handshake/authentication or backend
+failures after selection do not trigger fallback.
+
+A broad raw target also permits malformed or incomplete TLS after bounded
+inspection. Its allowlist grants fallback access; another target's narrower
+allowlist is not a global deny rule. See [raw catch-all behavior](CONFIG.md#raw-catch-all)
+and the [migration notes](UPGRADING.md#tcp-target-routing).
 
 ### IP Groups
 
