@@ -16,7 +16,7 @@ TLS route for a source IP could prevent its raw catch-all from receiving TLS.
 Plaintext HTTP targets are not opaque TLS fallbacks. Selected TLS routes still
 fail closed on handshake, client authentication, and backend connection errors.
 
-Review configurations that depended on the old implicit rejections:
+Review configurations that depended on the old routing or implicit rejections:
 
 - A broad raw target grants fallback access even when a specific TLS target's
   IP or ALPN condition fails. Remove or narrow fallback routes when that traffic
@@ -31,6 +31,12 @@ Review configurations that depended on the old implicit rejections:
 - More-specific IP prefixes now take priority across raw and TLS routes, and
   across TLS targets. Configuration order breaks ties rather than determining
   every match.
+- IPv4/IPv6 split TCP listeners can change even without TLS. For IPv4 clients,
+  `all`, `::/0`, and other IPv6 prefixes covering `::ffff:0:0/96` now tie with
+  `0.0.0.0/0`; configuration order decides. Previously, `0.0.0.0/0` always won
+  among non-TLS targets regardless of order. Put the IPv4-only target first to
+  preserve a family split. This also applies to raw/HTTP competition, where
+  plaintext can move from raw forwarding to HTTP handling. UDP is unchanged.
 - Configurations relying on passthrough always winning over termination should
   use distinct conditions or put the intended winner first when conditions tie.
 - A per-host passthrough rule used only to reach an existing raw catch-all can
