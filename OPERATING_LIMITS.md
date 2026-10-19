@@ -6,24 +6,29 @@ Enable them only when an application needs a deadline enforced by the proxy.
 
 ## Listener Resources
 
-TCP listeners default to `tcp_max_connections: 256`. A permit covers the entire accepted
-connection, including protocol detection and TLS. At capacity, new connections are closed
+TCP listeners default to no connection cap (`tcp_max_connections: null`). Set a positive
+integer to enable the cap. A permit covers the entire accepted connection, including
+protocol detection and TLS. At capacity, new connections are closed
 without starting a forwarding task. Existing connections count across reloads of the same
 bind address, including removal and re-addition while connections survive. Lowering a cap
 does not evict existing connections; admission resumes when their count falls below it.
 Explicit `null` disables the cap. Unlimited generations are still counted for later reloads.
 
-UDP listeners default to `udp_max_associations: 128` and `udp_queue_capacity: 8` packets
-per association. New associations and packets are dropped at capacity; existing associations
-continue. `udp_max_associations: null` disables the association cap. Queue depth must be
-between 1 and 65,535. Both settings are listener fields, alongside `address` and `transport`.
+UDP listeners default to no association cap (`udp_max_associations: null`) and
+`udp_queue_capacity: 1024` packets per association. Set a positive association cap to limit
+the number of source IP/port pairs. New associations are dropped at that cap; existing
+associations continue. Packets are dropped when an association's queue is full. Queue depth
+must be between 1 and 65,535. Both settings are listener fields, alongside `address` and
+`transport`.
 
-The UDP defaults allow at most approximately 64 MiB of queued maximum-size payload per
-listener (128 times 8 times 64 KiB). In-flight payloads, sockets, tasks, and kernel buffers
-are additional. Multiple listeners multiply the budget. Raising both settings can grow
-memory consumption dramatically. TCP limits likewise exclude backend sockets and other
-listeners; size them against the process FD and memory limits. These are conservative
-defaults, not throughput guarantees.
+These defaults preserve legacy capacity but do not protect against total FD or memory
+exhaustion. Configure limits to suit the deployment. For example, an explicit cap of 128
+UDP associations with an eight-packet queue allows at most approximately 64 MiB of queued
+maximum-size payload per listener (128 times 8 times 64 KiB). This is a sizing example,
+not a throughput guarantee. In-flight payloads, sockets, tasks, and kernel buffers are
+additional. Multiple listeners multiply the budget. Raising both settings can grow memory
+consumption dramatically. TCP limits likewise exclude backend sockets and other listeners;
+size them against the process FD and memory limits.
 
 TCP and UDP URL shortcuts use these same defaults. They still allow all peers and disable
 built-in firewall handling. Non-loopback shortcut binds produce one warning per URL load;
@@ -66,7 +71,8 @@ are rejected.
 
 Omitted or `null` response-header and upstream-body settings impose no application latency
 deadline in any H1/H2 forwarding combination. A stalled backend may retain an admitted
-connection or stream until cancellation or closure. Resource caps still apply.
+connection or stream until cancellation or closure. Configured `tcp_max_connections` and
+HTTP/2 admission limits still apply; H1-to-H1 forwarding has no connection cap by default.
 
 An explicit `response_header_timeout_secs` is an absolute budget from submission of the
 request head through receipt of the final response head. It includes concurrent upload
