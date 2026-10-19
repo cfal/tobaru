@@ -64,13 +64,16 @@ try {
   const cert = await readFile(certPath);
   const key = await readFile(keyPath);
   let rawConnections = 0;
-  const rawPort = await listen(tls.createServer({ cert, key }, socket => {
-    rawConnections++;
-    socket.end('raw');
-  }));
+  const rawServer = tls.createServer({ cert, key }, socket => socket.end('raw'));
+  rawServer.on('connection', () => rawConnections++);
+  const rawPort = await listen(rawServer);
   const passPort = await listen(tls.createServer({ cert, key, ALPNProtocols: ['h2', 'http/1.1'] }, socket => socket.end('passthrough')));
   const plainPort = await listen(net.createServer(socket => socket.end('plain')));
-  const fallbackPort = await listen(net.createServer(socket => socket.once('data', bytes => socket.end(bytes))));
+  const fallbackFirstBytes = [];
+  const fallbackPort = await listen(net.createServer(socket => socket.once('data', bytes => {
+    fallbackFirstBytes.push(bytes[0]);
+    socket.end(bytes);
+  })));
   const configs = [];
   async function listener(targets) {
     const port = await freePort();
@@ -111,6 +114,9 @@ try {
   const modeTiePort = await listener([terminate('secure.example'), pass('secure.example')]);
   const rawTiePort = await listener([raw(plainPort, '127.0.0.1/32'), raw(rawPort, '127.0.0.1/32')]);
   const malformedPort = await listener([raw(fallbackPort), pass('specific.example')]);
+  const optionalPort = await listener([{
+    ...terminate('secure.example', { optional: true }), location: `127.0.0.1:${fallbackPort}`,
+  }]);
   const mixedFamilyPorts = [];
   const mixedFamilyTiePorts = [];
   for (const broad of ['all', '::/0']) {
@@ -166,14 +172,21 @@ try {
   httpSocket.write('GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n');
   assert.match(await response(httpSocket), /http-shadow/);
   const malformed = Buffer.from([0x17, 3, 3, 0, 1, 0, 65, 66, 67]);
-  const malformedSocket = track(net.connect(malformedPort, '127.0.0.1'));
-  malformedSocket.write(malformed);
-  assert.equal(await response(malformedSocket), malformed.toString());
+  for (const port of [malformedPort, optionalPort]) {
+    const socket = track(net.connect(port, '127.0.0.1'));
+    socket.write(malformed);
+    assert.equal(await response(socket), malformed.toString());
+  }
+  const beforeOptional = fallbackFirstBytes.length;
+  await assert.rejects(tlsResponse(optionalPort, 'other.example'));
+  assert.equal(fallbackFirstBytes.length, beforeOptional + 1);
+  assert.equal(fallbackFirstBytes.at(-1), 0x16, 'optional raw target did not receive the unmatched ClientHello');
   const before = rawConnections;
   await assert.rejects(tlsResponse(authPort, 'secure.example'));
+  await delay(50, undefined, { signal });
   assert.equal(rawConnections, before, 'failed client authentication reached raw fallback');
 
-  console.log('TCP routing smoke passed: raw TLS fallback, specific routes, competing catch-alls, IP/SNI/ALPN precedence, absent SNI/ALPN, wildcard fallback, HTTP isolation, server-first raw overrides, byte replay, and terminal authentication failure.');
+  console.log('TCP routing smoke passed: raw TLS fallback, specific routes, competing catch-alls, IP/SNI/ALPN precedence, mixed-family catch-alls, absent SNI/ALPN, wildcard fallback, HTTP isolation, server-first raw overrides, optional TLS migration, byte replay, and terminal authentication failure.');
 } catch (error) {
   console.error(logs);
   throw error;

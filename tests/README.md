@@ -47,3 +47,8 @@ immediate server-first raw overrides, configuration-order ties, and terminal
 client-authentication failures. The Rust tests additionally exercise fragmented
 and malformed ClientHellos, byte-exact replay after inspection timeouts, IPv6
 precedence, and handshake/backend failures without fallback.
+Raw replay coverage includes inspection-buffer exhaustion with unread trailing
+records, not only rejection of oversized record-length fields. The CLI's
+authentication-failure check counts raw backend TCP accepts, including connections
+whose TLS handshake never completes. It also verifies that auto-migrated optional
+TLS forwarding targets receive unmatched and malformed TLS at their raw backend.

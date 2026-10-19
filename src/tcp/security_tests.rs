@@ -257,6 +257,68 @@ async fn raw_fallback_replays_malformed_and_timed_out_tls_without_losing_read_ah
     }
 }
 
+#[tokio::test]
+async fn raw_fallback_replays_inspection_buffer_exhaustion_and_unread_trailing_bytes() {
+    timeout(Duration::from_secs(5), async {
+        let mut body = vec![3, 3];
+        body.extend([0; 32]);
+        body.extend([0, 0, 2, 0x13, 1, 1, 0]);
+        body.extend(44004u16.to_be_bytes());
+        body.extend([0x12, 0x34]);
+        body.extend(44000u16.to_be_bytes());
+        body.extend(vec![0x42; 44000]);
+        let mut hello = vec![1];
+        hello.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+        hello.extend(body);
+
+        // Small records exhaust the wire buffer before this valid ClientHello
+        // is complete; the remaining records and suffix must still be forwarded.
+        let mut wire = Vec::new();
+        for chunk in hello.chunks(8) {
+            wire.extend([0x16, 3, 3]);
+            wire.extend((chunk.len() as u16).to_be_bytes());
+            wire.extend(chunk);
+        }
+        assert!(hello.len() < crate::tls_reader::TLS_BUFFER_MAX_LEN);
+        assert!(wire.len() > crate::tls_reader::TLS_BUFFER_MAX_LEN);
+        wire.extend(b"unread trailing bytes");
+
+        let (backend, address) = listener().await;
+        let (mut client, server, peer) = pair().await;
+        let mut routes = RoutingTable::default();
+        routes
+            .insert_non_tls(&[IpMask::all()], raw_target(address))
+            .unwrap();
+        routes.insert_tls(&Default::default(), Arc::new(tls_target(address)));
+        let proxy = process_tls_stream(
+            server,
+            &peer,
+            Ipv6Addr::LOCALHOST,
+            routes.ip_targets(Ipv6Addr::LOCALHOST),
+            &routes,
+        );
+        let upstream = async {
+            let (mut stream, _) = backend.accept().await.unwrap();
+            let mut received = Vec::new();
+            stream.read_to_end(&mut received).await.unwrap();
+            assert_eq!(received, wire);
+            stream.write_all(b"reply").await.unwrap();
+            stream.shutdown().await.unwrap();
+        };
+        let downstream = async {
+            client.write_all(&wire).await.unwrap();
+            client.shutdown().await.unwrap();
+            let mut reply = Vec::new();
+            client.read_to_end(&mut reply).await.unwrap();
+            assert_eq!(reply, b"reply");
+        };
+        let (result, (), ()) = tokio::join!(proxy, upstream, downstream);
+        result.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
 fn client_config() -> Arc<rustls::ClientConfig> {
     crate::rustls_util::create_client_config_with_cert(
         false,
