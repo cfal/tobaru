@@ -21,6 +21,13 @@ Review configurations that depended on the old implicit rejections:
 - A broad raw target grants fallback access even when a specific TLS target's
   IP or ALPN condition fails. Remove or narrow fallback routes when that traffic
   must be rejected. The same consideration applies to broader TLS SNI patterns.
+- Deprecated `server_tls.optional: true` expands into TLS and non-TLS targets
+  with the same action and allowlist. For `location`/`locations` forwarding, the
+  generated non-TLS target is now a raw fallback too: unmatched or malformed TLS
+  reaches the backend unchanged, even if that backend expects plaintext. To
+  reject it, remove `optional: true` and avoid an equivalent raw fallback; use a
+  separate listener if plaintext access is also required. Generated plaintext
+  HTTP targets still reject TLS-looking traffic rather than treating it as HTTP.
 - More-specific IP prefixes now take priority across raw and TLS routes, and
   across TLS targets. Configuration order breaks ties rather than determining
   every match.

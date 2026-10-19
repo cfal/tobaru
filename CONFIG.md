@@ -284,7 +284,7 @@ server_tls:
   client_fingerprints: [string]    # SHA256 fingerprints
 
   # Deprecated
-  optional: false                  # Auto-migrated to two separate targets
+  optional: false                  # true is auto-migrated to two separate targets
 ```
 
 ### TLS Modes
@@ -954,4 +954,4 @@ These fields are accepted with a deprecation warning and will be removed in a fu
 | `serverTls` | `server_tls` |
 | `bindAddress` | `address` |
 | `addresses` (in targets) | `locations` |
-| `optional` (in server_tls) | Split into two explicit targets (auto-migrated) |
+| `optional` (in server_tls) | `true` auto-migrates to TLS and non-TLS targets; raw forwarding also accepts unmatched/malformed TLS. See [migration notes](UPGRADING.md#tcp-target-routing). |
