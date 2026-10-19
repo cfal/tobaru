@@ -102,6 +102,14 @@ async fn malformed_and_incomplete_tls_cannot_fall_back_to_plaintext_http() {
                 std::io::ErrorKind::InvalidData
             }
         );
+        if bytes.len() == 1 {
+            assert!(
+                error
+                    .to_string()
+                    .starts_with("TLS ClientHello parse timed out"),
+                "{error}"
+            );
+        }
     }
 }
 
