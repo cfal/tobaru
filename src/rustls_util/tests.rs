@@ -83,6 +83,26 @@ async fn exchange(
 }
 
 #[test]
+fn bundled_roots_exclude_distrusted_emsign_cas() {
+    let store = get_root_cert_store();
+    assert!(!store.is_empty());
+    for name in [
+        "emSign ECC Root CA - G3",
+        "emSign Root CA - C1",
+        "emSign ECC Root CA - C3",
+    ] {
+        assert!(
+            store.roots.iter().all(|root| !root
+                .subject
+                .as_ref()
+                .windows(name.len())
+                .any(|part| part == name.as_bytes())),
+            "distrusted root remains bundled: {name}"
+        );
+    }
+}
+
+#[test]
 fn loads_certificate_chain_from_mixed_pem() {
     let first = identity();
     let second = identity();

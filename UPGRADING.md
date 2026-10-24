@@ -46,6 +46,29 @@ No new configuration fields or dependency changes are required. See
 [target precedence](CONFIG.md#target-evaluation-order) and
 [raw catch-all behavior](CONFIG.md#raw-catch-all) for the complete contract.
 
+## eMudhra CA compromise (CVE-2026-111943)
+
+Rebuild or upgrade existing binaries to receive the updated certificate validation
+and bundled trust roots. Source builds must use the checked-in `Cargo.lock`
+(`cargo build --release --locked`).
+
+The updated `rustls-webpki` rejects the eight compromised intermediate public keys,
+including cross-signed chains. The updated `webpki-roots` removes `emSign ECC Root
+CA - G3`, `emSign Root CA - C1`, and `emSign ECC Root CA - C3`. Root removal alone
+does not protect against cross-signed compromised intermediates.
+
+Affected backends need certificates with an unaffected CA chain. Do not disable
+certificate verification to restore connectivity.
+
+Existing authentication exceptions remain unchanged. `verify: false` (including
+`client_tls: "no-verify"`) bypasses server Web PKI chain validation;
+`server_fingerprints` still constrain that mode when configured. With verification
+enabled, server pins do not override a chain failure. A matching
+`client_fingerprints` pin accepts a client even if `client_ca_certs` validation
+fails.
+
+See the [incident report](https://emudhra.we-have-a-problem.com/).
+
 ## Upgrading from 0.7.1 and lower
 
 ### Breaking changes
