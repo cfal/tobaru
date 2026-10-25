@@ -7,6 +7,14 @@ TLS session tests:
 CARGO_BUILD_JOBS=1 cargo test --locked
 ```
 
+Configuration watcher tests cover atomic replacement, symlink retargeting, and
+reusing recreated target directories. CI also runs these tests on native macOS
+to exercise the FSEvents backend:
+
+```sh
+CARGO_BUILD_JOBS=1 cargo test --locked lifecycle::tests::config_watches_
+```
+
 The CLI smoke test starts the actual binary with a temporary configuration and
 uses Node's standard HTTP implementation as its peer. Node 22 or newer is
 required; no npm packages are needed.

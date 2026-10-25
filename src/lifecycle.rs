@@ -321,7 +321,12 @@ mod tests {
                     // rename notification occupied its single slot.
                     _ = retry.tick() => std::fs::write(path, "updated").unwrap(),
                     event = changes.recv() => {
-                        if event.unwrap().paths.iter().any(|changed| changed == path) { break; }
+                        let event = event.unwrap();
+                        if matches!(event.kind, EventKind::Modify(ModifyKind::Data(_) | ModifyKind::Any))
+                            && event.paths.iter().any(|changed| changed == path)
+                        {
+                            break;
+                        }
                     }
                 }
             }
@@ -362,15 +367,31 @@ mod tests {
 
         let replacement = files.0.join("replacement.json");
         std::os::unix::fs::symlink(&second, &replacement).unwrap();
-        std::fs::rename(replacement, &link).unwrap();
+        std::fs::rename(&replacement, &link).unwrap();
         std::fs::remove_dir_all(files.0.join("a")).unwrap();
         watcher.refresh(&paths).unwrap();
-        assert_eq!(*watcher.paths.lock(), HashSet::from([link, second.clone()]));
+        assert_eq!(
+            *watcher.paths.lock(),
+            HashSet::from([link.clone(), second.clone()])
+        );
         assert_eq!(
             watcher.parents,
             HashSet::from([files.0.clone(), files.0.join("b")])
         );
         assert_file_changes_observed(&mut changes, &second).await;
+
+        std::fs::create_dir(files.0.join("a")).unwrap();
+        std::fs::write(&first, "recreated").unwrap();
+        std::os::unix::fs::symlink(&first, &replacement).unwrap();
+        std::fs::rename(replacement, &link).unwrap();
+        std::fs::remove_dir_all(files.0.join("b")).unwrap();
+        watcher.refresh(&paths).unwrap();
+        assert_eq!(*watcher.paths.lock(), HashSet::from([link, first.clone()]));
+        assert_eq!(
+            watcher.parents,
+            HashSet::from([files.0.clone(), files.0.join("a")])
+        );
+        assert_file_changes_observed(&mut changes, &first).await;
     }
 
     #[tokio::test(start_paused = true)]
