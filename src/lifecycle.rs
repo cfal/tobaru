@@ -287,22 +287,30 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use notify::event::{CreateKind, ModifyKind, RemoveKind};
+    use notify::event::{CreateKind, DataChange, MetadataKind, ModifyKind, RemoveKind, RenameMode};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     struct WatchFiles(PathBuf);
 
     impl WatchFiles {
         fn new() -> Self {
-            let suffix = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let root = PathBuf::from(std::env::var_os("HOME").unwrap())
-                .join("tmp")
-                .join(format!("tobaru-watch-{}-{suffix}", std::process::id()));
-            std::fs::create_dir_all(root.join("a")).unwrap();
-            std::fs::create_dir_all(root.join("b")).unwrap();
-            Self(std::fs::canonicalize(root).unwrap())
+            static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+            let parent = PathBuf::from(std::env::var_os("HOME").unwrap()).join("tmp");
+            std::fs::create_dir_all(&parent).unwrap();
+            loop {
+                let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+                let root = parent.join(format!("tobaru-watch-{}-{id}", std::process::id()));
+                match std::fs::create_dir(&root) {
+                    Ok(()) => {
+                        let files = Self(std::fs::canonicalize(root).unwrap());
+                        std::fs::create_dir(files.0.join("a")).unwrap();
+                        std::fs::create_dir(files.0.join("b")).unwrap();
+                        return files;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("Cannot create watcher test directory: {error}"),
+                }
+            }
         }
     }
 
@@ -312,27 +320,49 @@ mod tests {
         }
     }
 
-    async fn assert_file_changes_observed(changes: &mut Receiver<Event>, path: &Path) {
+    async fn assert_file_changes_observed(
+        changes: &mut Receiver<Event>,
+        path: &Path,
+        contents: &str,
+    ) {
+        // Drain setup/retarget notifications before making a fresh content edit.
         tokio::time::timeout(Duration::from_secs(3), async {
+            while let Ok(event) =
+                tokio::time::timeout(Duration::from_millis(100), changes.recv()).await
+            {
+                event.expect("Config watcher stopped while settling");
+            }
+        })
+        .await
+        .expect("Config watcher did not settle before editing");
+        let targets = HashSet::from([path.to_path_buf()]);
+        std::fs::write(path, contents).unwrap();
+        let mut last_event = None;
+        let result = tokio::time::timeout(Duration::from_secs(3), async {
             let mut retry = tokio::time::interval(Duration::from_millis(20));
             loop {
                 tokio::select! {
                     // The production queue coalesces events. Retry a write if a stale
                     // rename notification occupied its single slot.
-                    _ = retry.tick() => std::fs::write(path, "updated").unwrap(),
+                    _ = retry.tick() => std::fs::write(path, contents).unwrap(),
                     event = changes.recv() => {
                         let event = event.unwrap();
-                        if matches!(event.kind, EventKind::Modify(ModifyKind::Data(_) | ModifyKind::Any))
-                            && event.paths.iter().any(|changed| changed == path)
-                        {
+                        // FSEvents can deliver Create/Metadata before Data for one write.
+                        // The single-slot queue retains a reload trigger, not every kind.
+                        if relevant_event(&event, &targets) {
                             break;
                         }
+                        last_event = Some(event);
                     }
                 }
             }
         })
-        .await
-        .expect("No modification event for the expected config target");
+        .await;
+        assert!(
+            result.is_ok(),
+            "No reload event for {} after {contents:?}; last event: {last_event:?}",
+            path.display()
+        );
     }
 
     #[tokio::test]
@@ -363,7 +393,11 @@ mod tests {
         std::os::unix::fs::symlink(&first, &link).unwrap();
         let paths = [link.to_str().unwrap().into()];
         let (mut watcher, mut changes) = watch_configs(&paths).unwrap();
-        assert_file_changes_observed(&mut changes, &first).await;
+        assert_file_changes_observed(&mut changes, &first, "initial target edited").await;
+        assert_eq!(
+            std::fs::read_to_string(&link).unwrap(),
+            "initial target edited"
+        );
 
         let replacement = files.0.join("replacement.json");
         std::os::unix::fs::symlink(&second, &replacement).unwrap();
@@ -378,7 +412,8 @@ mod tests {
             watcher.parents,
             HashSet::from([files.0.clone(), files.0.join("b")])
         );
-        assert_file_changes_observed(&mut changes, &second).await;
+        assert_file_changes_observed(&mut changes, &second, "retargeted to b").await;
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "retargeted to b");
 
         std::fs::create_dir(files.0.join("a")).unwrap();
         std::fs::write(&first, "recreated").unwrap();
@@ -386,12 +421,19 @@ mod tests {
         std::fs::rename(replacement, &link).unwrap();
         std::fs::remove_dir_all(files.0.join("b")).unwrap();
         watcher.refresh(&paths).unwrap();
-        assert_eq!(*watcher.paths.lock(), HashSet::from([link, first.clone()]));
+        assert_eq!(
+            *watcher.paths.lock(),
+            HashSet::from([link.clone(), first.clone()])
+        );
         assert_eq!(
             watcher.parents,
             HashSet::from([files.0.clone(), files.0.join("a")])
         );
-        assert_file_changes_observed(&mut changes, &first).await;
+        assert_file_changes_observed(&mut changes, &first, "retargeted to recreated a").await;
+        assert_eq!(
+            std::fs::read_to_string(&link).unwrap(),
+            "retargeted to recreated a"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -429,8 +471,12 @@ mod tests {
         let path = PathBuf::from("/srv/config.yaml");
         let paths = HashSet::from([path.clone()]);
         for kind in [
+            EventKind::Any,
             EventKind::Create(CreateKind::File),
             EventKind::Modify(ModifyKind::Any),
+            EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+            EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any)),
+            EventKind::Modify(ModifyKind::Name(RenameMode::Any)),
             EventKind::Remove(RemoveKind::File),
         ] {
             assert!(relevant_event(

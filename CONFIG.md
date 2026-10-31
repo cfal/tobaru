@@ -614,6 +614,14 @@ before URI normalization on both H2 ingress and H1-to-H2 forwarding, so the back
 cannot receive a different path from the one used for routing. Encoded `%23`
 remains permitted. These checks require no additional configuration flags.
 
+For sections received over HTTP/2, `max_header_list_size` is an inclusive receive
+policy, counting each field's name, value, and 32-byte overhead. Valid trailer
+sections exactly at the limit are preserved in full; sections one byte over it
+are rejected, not truncated. HTTP/1 fields on translation paths retain their
+existing accounting: raw field-line length, including the colon and whitespace,
+plus 32 bytes. The configured policy is distinct from the H2 decoder's additional
+abuse limits, which can terminate the connection rather than only the stream.
+
 All H2 timeouts must be positive and at most 86400 seconds. The connect deadline
 includes action-slot waiting, DNS/TCP/Unix setup, TLS and H2 handshake/readiness.
 The header deadline is absolute for incomplete frames/header blocks, not extended
