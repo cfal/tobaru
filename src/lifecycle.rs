@@ -288,21 +288,29 @@ pub async fn run(
 mod tests {
     use super::*;
     use notify::event::{CreateKind, ModifyKind, RemoveKind};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     struct WatchFiles(PathBuf);
 
     impl WatchFiles {
         fn new() -> Self {
-            let suffix = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let root = PathBuf::from(std::env::var_os("HOME").unwrap())
-                .join("tmp")
-                .join(format!("tobaru-watch-{}-{suffix}", std::process::id()));
-            std::fs::create_dir_all(root.join("a")).unwrap();
-            std::fs::create_dir_all(root.join("b")).unwrap();
-            Self(std::fs::canonicalize(root).unwrap())
+            static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+            let parent = PathBuf::from(std::env::var_os("HOME").unwrap()).join("tmp");
+            std::fs::create_dir_all(&parent).unwrap();
+            loop {
+                let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+                let root = parent.join(format!("tobaru-watch-{}-{id}", std::process::id()));
+                match std::fs::create_dir(&root) {
+                    Ok(()) => {
+                        let files = Self(std::fs::canonicalize(root).unwrap());
+                        std::fs::create_dir(files.0.join("a")).unwrap();
+                        std::fs::create_dir(files.0.join("b")).unwrap();
+                        return files;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("Cannot create watcher test directory: {error}"),
+                }
+            }
         }
     }
 
@@ -313,7 +321,8 @@ mod tests {
     }
 
     async fn assert_file_changes_observed(changes: &mut Receiver<Event>, path: &Path) {
-        tokio::time::timeout(Duration::from_secs(3), async {
+        let mut last_event = None;
+        let result = tokio::time::timeout(Duration::from_secs(3), async {
             let mut retry = tokio::time::interval(Duration::from_millis(20));
             loop {
                 tokio::select! {
@@ -327,12 +336,17 @@ mod tests {
                         {
                             break;
                         }
+                        last_event = Some(event);
                     }
                 }
             }
         })
-        .await
-        .expect("No modification event for the expected config target");
+        .await;
+        assert!(
+            result.is_ok(),
+            "No modification event for {}; last event: {last_event:?}",
+            path.display()
+        );
     }
 
     #[tokio::test]
