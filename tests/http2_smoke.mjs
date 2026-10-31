@@ -192,6 +192,18 @@ async function h1Upload(session, payload) {
   assert.equal(status, 200);
 }
 
+async function exactLimitTrailers(session) {
+  const value = 'x'.repeat(1024 - 'x-limit'.length - 32);
+  const request = session.request({ ':method': 'POST', ':path': '/limit' }, { waitForTrailers: true });
+  let received;
+  request.on('wantTrailers', () => request.sendTrailers({ 'x-limit': value }));
+  request.on('trailers', fields => { received = fields; });
+  request.resume();
+  request.end('body');
+  await once(request, 'end', { signal });
+  assert.equal(received['x-limit'], value);
+}
+
 try {
   const keyPath = join(directory, 'key.pem');
   const certPath = join(directory, 'cert.pem');
@@ -229,6 +241,16 @@ try {
         stream.end(Buffer.concat(chunks));
       }));
       stream.on('wantTrailers', () => stream.sendTrailers({ 'x-finished': 'yes' }));
+    } else if (headers[':path'] === '/limit') {
+      let received;
+      stream.on('trailers', fields => { received = fields; });
+      stream.resume();
+      stream.on('end', guard(() => {
+        assert.equal(received['x-limit'], 'x'.repeat(1024 - 'x-limit'.length - 32));
+        stream.respond({ ':status': 200 }, { waitForTrailers: true });
+        stream.end();
+      }));
+      stream.on('wantTrailers', () => stream.sendTrailers({ 'x-limit': received['x-limit'] }));
     } else if (headers[':path'] === '/duplex') {
       stream.additionalHeaders({ ':status': 100 });
       stream.additionalHeaders({ ':status': 103, link: '</asset>' });
@@ -301,6 +323,7 @@ try {
     { address: `0.0.0.0:${tlsPort}`, transport: 'tcp', target: {
       allowlist: '127.0.0.1/32',
       server_tls: { cert: certPath, key: keyPath, alpn_protocols: ['h2', 'http/1.1', 'legacy-http', 'none'] },
+      http2: { max_header_list_size: 1024 },
       default_http_action: forward,
       http_paths: {
         '/static/': { http_action: { type: 'serve-directory', path: publicRoot } },
@@ -362,6 +385,7 @@ try {
   assert.equal(backendConnections, 1);
   assert.equal(pushDisabled, true);
   await duplex(client);
+  await exactLimitTrailers(client);
   const h1 = await get(client, '/h1/');
   assert.equal(h1.body, 'h1 backend');
   assert.equal(h1.trailers['x-finished'], 'yes');

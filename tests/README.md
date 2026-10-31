@@ -47,6 +47,11 @@ outbound pins and CA verification failures, inbound and outbound mTLS, and rejec
 of a backend that cannot negotiate H2. It does not measure Internet-scale throughput
 or claim exhaustive RFC conformance.
 
+Trailer regressions cover inclusive configured limits in both receive directions:
+the raw-wire Rust suite verifies exact-limit preservation, one-byte-over wire
+resets, sibling reuse, and connection errors for HEADERS after END_STREAM. The
+independent Node peers also exchange complete exact-limit request/response trailers.
+
 The TCP routing smoke test also requires `openssl`. It checks the actual CLI's
 configuration registration and routing: raw forwarding of unmatched TLS,
 specific routes and competing catch-alls, source-IP/SNI/ALPN precedence,

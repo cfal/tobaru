@@ -619,6 +619,49 @@ async fn oversized_trailers_are_rejected_not_truncated() {
 }
 
 #[tokio::test]
+async fn request_trailer_limit_is_inclusive_and_preserves_all_fields() {
+    for over in [false, true] {
+        checked(async {
+            let (listener, addr) = backend().await;
+            let (mut peer, _server) = raw_frontend(action(
+                json!({"type":"forward", "location":addr.to_string()}),
+            ))
+            .await;
+            peer.headers(1, &request(&[]), false).await;
+            let (mut io, _) = listener.accept().await.unwrap();
+            assert_h1_head(&head(&mut io).await, true);
+            // RFC header-list accounting includes 32 bytes per field.
+            let value = vec![b'a'; 65536 - (7 + 4 + 32) - (6 + 32) + usize::from(over)];
+            peer.headers(
+                1,
+                &vec![field(b"x-first", b"kept"), field(b"x-last", &value)],
+                true,
+            )
+            .await;
+            let mut wire = Vec::new();
+            if over {
+                io.read_to_end(&mut wire).await.unwrap();
+                assert!(wire.is_empty(), "overflow must not complete H1 framing");
+                assert_eq!(peer.ended(1).await, Ending::Reset(1));
+            } else {
+                let mut expected = b"0\r\nx-first: kept\r\nx-last: ".to_vec();
+                expected.extend_from_slice(&value);
+                expected.extend_from_slice(b"\r\n\r\n");
+                wire.resize(expected.len(), 0);
+                io.read_exact(&mut wire).await.unwrap();
+                assert_eq!(wire, expected);
+                io.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
+                    .await
+                    .unwrap();
+                assert_eq!(peer.completed(1).await, b"OK");
+            }
+            forwarded_sibling(&mut peer, &listener, 3).await;
+        })
+        .await;
+    }
+}
+
+#[tokio::test]
 async fn rejected_trailers_preserve_hpack_state_for_forwarded_siblings() {
     checked(async {
         let (listener, addr) = backend().await;
@@ -679,6 +722,41 @@ async fn trailers_without_end_stream_never_complete_h1_framing() {
         peer.ended(1).await;
     })
     .await;
+}
+
+#[tokio::test]
+async fn headers_after_request_end_stream_preserve_connection_error() {
+    for fields in [
+        vec![],
+        vec![field(b":path", b"/unexpected")],
+        vec![field(b"x-large", &vec![b'a'; 66000])],
+    ] {
+        checked(async {
+            let (listener, addr) = backend().await;
+            let (mut peer, _server) = raw_frontend(action(
+                json!({"type":"forward", "location":addr.to_string()}),
+            ))
+            .await;
+            peer.headers(1, &request(&[]), true).await;
+            let (mut io, _) = listener.accept().await.unwrap();
+            assert_h1_head(&head(&mut io).await, false);
+            if fields.is_empty() {
+                peer.frame(1, 5, 1, &[]).await;
+            } else {
+                peer.headers(1, &fields, true).await;
+            }
+            loop {
+                let frame = peer.read().await.expect("expected GOAWAY");
+                assert_ne!(frame.kind, 3, "state error must not become a stream reset");
+                if frame.kind == 7 {
+                    assert_eq!(frame.stream, 0);
+                    assert_eq!(&frame.payload[4..8], &1u32.to_be_bytes());
+                    break;
+                }
+            }
+        })
+        .await;
+    }
 }
 
 #[tokio::test]
@@ -1068,8 +1146,20 @@ async fn path_fragments_are_rejected_before_uri_normalization() {
 }
 
 #[tokio::test]
-async fn malformed_upstream_h2_trailers_are_rejected_and_connection_remains_usable() {
+async fn upstream_h2_trailers_enforce_validation_and_inclusive_limit() {
     let mut cases = vec![("oversized", vec![field(b"x-large", &vec![b'a'; 66000])])];
+    for (name, over) in [("exact", 0), ("one over", 1)] {
+        cases.push((
+            name,
+            vec![
+                field(b"x-first", b"kept"),
+                field(
+                    b"x-last",
+                    &vec![b'a'; 65536 - (7 + 4 + 32) - (6 + 32) + over],
+                ),
+            ],
+        ));
+    }
     for (name, value) in [
         (b":status".as_slice(), b"200".as_slice()),
         (b":path", b"/other"),
@@ -1109,12 +1199,22 @@ async fn malformed_upstream_h2_trailers_are_rejected_and_connection_remains_usab
                 .await;
             backend.frame(0, 0, id, b"hello").await;
             backend.headers(id, &trailers, true).await;
-            rejected_response(response, name).await;
-            assert_eq!(
-                backend.ended(id).await,
-                Ending::Reset(1),
-                "{name}: expected PROTOCOL_ERROR"
-            );
+            if name == "exact" {
+                let (body, received) = collect(response.await.unwrap().into_body()).await;
+                assert_eq!(body, b"hello");
+                assert_eq!(received.len(), trailers.len());
+                for (name, value) in &trailers {
+                    let name = http::HeaderName::from_bytes(name).unwrap();
+                    assert_eq!(received.get(name).unwrap().as_bytes(), value);
+                }
+            } else {
+                rejected_response(response, name).await;
+                assert_eq!(
+                    backend.ended(id).await,
+                    Ending::Reset(1),
+                    "{name}: expected PROTOCOL_ERROR"
+                );
+            }
             let (sibling, _) = client
                 .send_request(
                     Request::builder()
