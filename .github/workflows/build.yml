@@ -161,7 +161,11 @@ jobs:
 
       - name: Test native macOS configuration watching
         if: matrix.target == 'aarch64-apple-darwin'
-        run: cargo test --locked lifecycle::tests::config_watches_
+        run: |
+          for attempt in {1..10}; do
+            echo "Watcher test iteration $attempt"
+            cargo test --locked lifecycle::tests::config_watches_
+          done
 
       - name: Verify binary exists
         run: |
