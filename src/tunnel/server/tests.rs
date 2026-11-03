@@ -241,3 +241,88 @@ async fn idle_channel_pings_at_twenty_seconds_and_closes_after_ten_without_pong(
     assert_eq!(session.state.lock().as_ref().unwrap().idle, 0);
     assert_released(&peer);
 }
+
+#[tokio::test]
+async fn authenticated_attachment_cannot_commit_after_retirement_or_replacement() {
+    for retire_generation in [true, false] {
+        let tls = Tls::new();
+        let (peer, _, _) = harness(1, 1);
+        let (writer, mut messages) = tokio::sync::mpsc::channel(64);
+        let session = Arc::new(Session::new(
+            Id::new(),
+            tls.fingerprint.clone(),
+            HashSet::from(["web".into()]),
+            writer,
+        ));
+        peer.install(session.clone()).unwrap();
+        session.refill(&peer).unwrap();
+        let Message::CreateData { channel_id } = messages.recv().await.unwrap() else {
+            panic!()
+        };
+        let server = Arc::new(Server {
+            address: "0.0.0.0:0".parse().unwrap(),
+            tls: tls.server,
+            gate: peer.gate.clone(),
+            endpoint: peer.endpoint.clone(),
+            peers: HashMap::from([("home".into(), peer.clone())]),
+            identities: HashMap::from([(tls.fingerprint, "home".into())]),
+            handshakes: Arc::default(),
+            max_handshakes: 16,
+        });
+        let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let tcp = TcpStream::connect(("127.0.0.1", listener.local_addr().unwrap().port()))
+            .await
+            .unwrap();
+        let (accepted, _) = listener.accept().await.unwrap();
+        let s = server.clone();
+        let worker = tokio::spawn(async move {
+            let permit = s.endpoint.accept().unwrap();
+            let handshake = s.handshakes.acquire(16).unwrap();
+            s.connection(accepted, permit, handshake).await
+        });
+        let mut agent = tls
+            .connector
+            .connect("localhost".try_into().unwrap(), tcp)
+            .await
+            .unwrap();
+        // Pause after authentication, before the first metadata frame.
+        timeout(Duration::from_secs(1), async {
+            while server.handshakes.count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        if retire_generation {
+            peer.gate.retire();
+        } else {
+            let (writer, _rx) = tokio::sync::mpsc::channel(64);
+            peer.install(Arc::new(Session::new(
+                Id::new(),
+                vec![1],
+                HashSet::new(),
+                writer,
+            )))
+            .unwrap();
+        }
+        protocol::write(
+            &mut agent,
+            &Message::DataHello {
+                version: 1,
+                peer: "home".into(),
+                session_id: session.id.clone(),
+                channel_id,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(timeout(Duration::from_secs(1), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err());
+        assert!(protocol::read(&mut agent).await.is_err());
+        session.close();
+        assert_released(&peer);
+    }
+}

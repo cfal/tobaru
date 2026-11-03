@@ -176,7 +176,9 @@ try {
     socket.on('end', () => socket.end('finished'));
   }));
   let httpAccepts = 0;
+  let cachedOrigin;
   const web = http.createServer((req, res) => {
+    if (req.url === '/pre-reload-cache') cachedOrigin = req.socket;
     res.setHeader('set-cookie', 'test=yes; Path=/');
     res.end(JSON.stringify({ path: req.url, host: req.headers.host }));
   });
@@ -370,11 +372,19 @@ try {
   await once(stale, 'secureConnect', { signal });
   const activeClosed = once(active, 'close', { signal });
   const staleClosed = once(stale, 'close', { signal });
+  await request(publicHttp, '/home/pre-reload-cache', httpAgent);
+  assert(cachedOrigin && !cachedOrigin.destroyed);
+  const cachedOriginClosed = once(cachedOrigin, 'close', { signal });
+  const cachedFrontend = Object.values(httpAgent.freeSockets).flat()[0];
+  assert(cachedFrontend && !cachedFrontend.destroyed);
   // Removing an unused export must not prevent the remaining intersection registering.
   publicConfig[0].peers.home.services = services.filter(name => name !== 'spare');
   await writeFile(publicPath, JSON.stringify(publicConfig));
-  await Promise.all([activeClosed, staleClosed]);
+  await Promise.all([activeClosed, staleClosed, cachedOriginClosed]);
   await eventually(async () => assert.equal((await request(publicHttp, '/home/reloaded')).status, 200));
+  assert(!cachedFrontend.destroyed, 'Idle H1 frontend should survive backend revocation');
+  await assert.rejects(request(publicHttp, '/home/retired-generation', httpAgent));
+  assert.equal((await request(publicHttp, '/home/new-generation', httpAgent)).status, 200);
   assert.match(clientChild.logs, /exports not accepted/);
 
   const clientActive = await raw(publicRaw);
