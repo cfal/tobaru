@@ -76,7 +76,13 @@ async fn idle_channel_shrinks_when_its_queued_caller_cancels() {
     let (idle, channel, mut agent) = channel(&peer, &session, &mut messages).await;
     caller.abort();
     let _ = caller.await;
-    assert!(serve_data(peer.clone(), idle, channel).await.is_err());
+    assert!(timeout(
+        Duration::from_secs(1),
+        serve_data(peer.clone(), idle, channel)
+    )
+    .await
+    .expect("surplus idle channel was not retired promptly")
+    .is_err());
     assert_eq!(session.state.lock().as_ref().unwrap().idle, 0);
     let closed = agent.read(&mut [0]).await;
     assert!(closed.is_err() || closed.unwrap() == 0);
@@ -140,21 +146,29 @@ async fn accept_errors_retry_with_backoff_until_recovery() {
 
 #[tokio::test(start_paused = true)]
 async fn retirement_interrupts_accept_backoff() {
-    let gate = Gate::default();
+    let gate = Arc::new(Gate::default());
     gate.activate();
+    let server = Arc::new(Server {
+        address: "0.0.0.0:0".parse().unwrap(),
+        tls: Tls::new().server,
+        gate: gate.clone(),
+        endpoint: Arc::new(Endpoint::new(Arc::default(), Arc::default(), 16)),
+        peers: HashMap::new(),
+        identities: HashMap::new(),
+        handshakes: Arc::default(),
+        max_handshakes: 16,
+    });
     let start = Instant::now();
-    let accept = accept_retry(
-        || {
-            gate.retire();
-            std::future::ready(Err::<(), _>(io::Error::from_raw_os_error(24)))
-        },
-        "0.0.0.0:7443".parse().unwrap(),
-    );
-    tokio::select! {
-        biased;
-        _ = accept => panic!("failed accept cannot succeed"),
-        _ = gate.stop.wait() => {},
-    }
+    let attempts = std::cell::Cell::new(0);
+    let run = server.accept_connections(|| {
+        attempts.set(attempts.get() + 1);
+        std::future::ready(Err(io::Error::from_raw_os_error(24)))
+    });
+    tokio::pin!(run);
+    assert!(futures::poll!(&mut run).is_pending());
+    assert_eq!(attempts.get(), 1);
+    gate.retire();
+    assert!(matches!(futures::poll!(&mut run), Poll::Ready(Ok(()))));
     assert_eq!(start.elapsed(), Duration::ZERO);
 }
 
@@ -235,7 +249,12 @@ async fn idle_channel_pings_at_twenty_seconds_and_closes_after_ten_without_pong(
     assert!(!worker.is_finished());
     tokio::time::advance(Duration::from_secs(1)).await;
     assert_eq!(
-        worker.await.unwrap().unwrap_err().kind(),
+        timeout(Duration::from_millis(1), worker)
+            .await
+            .expect("idle channel exceeded its ten-second pong deadline")
+            .unwrap()
+            .unwrap_err()
+            .kind(),
         io::ErrorKind::TimedOut
     );
     assert_eq!(session.state.lock().as_ref().unwrap().idle, 0);

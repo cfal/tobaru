@@ -573,7 +573,10 @@ mod tests {
         tokio::time::advance(Duration::from_secs(39)).await;
         assert!(!task.is_finished());
         tokio::time::advance(Duration::from_secs(1)).await;
-        task.await.unwrap();
+        timeout(Duration::from_millis(1), task)
+            .await
+            .expect("idle data exceeded its forty-second receive deadline")
+            .unwrap();
         assert!(!stop.is_cancelled());
         assert!(messages.try_recv().is_err());
         assert_eq!(client.sockets.count(), 0);
@@ -601,7 +604,11 @@ mod tests {
         tokio::time::advance(Duration::from_secs(59)).await;
         assert!(!task.is_finished());
         tokio::time::advance(Duration::from_secs(1)).await;
-        assert!(task.await.unwrap().is_err());
+        assert!(timeout(Duration::from_millis(1), task)
+            .await
+            .expect("control exceeded its sixty-second receive deadline")
+            .unwrap()
+            .is_err());
     }
 
     #[tokio::test]

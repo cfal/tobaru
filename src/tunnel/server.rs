@@ -35,7 +35,13 @@ pub struct Server {
 impl Server {
     pub async fn run(self: Arc<Self>) -> io::Result<()> {
         let listener = TcpListener::bind(self.address).await?;
-        let accept = || listener.accept();
+        self.accept_connections(|| listener.accept()).await
+    }
+
+    async fn accept_connections<F: Future<Output = io::Result<(TcpStream, SocketAddr)>>>(
+        self: Arc<Self>,
+        accept: impl FnMut() -> F + Copy,
+    ) -> io::Result<()> {
         let pending_accept = accept_retry(accept, self.address);
         tokio::pin!(pending_accept);
         let mut children = JoinSet::new();
