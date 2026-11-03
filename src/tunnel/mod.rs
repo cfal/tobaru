@@ -6,6 +6,8 @@ mod protocol;
 mod server;
 mod state;
 mod stream;
+#[cfg(test)]
+mod test_support;
 mod tls;
 
 use std::collections::{HashMap, HashSet};

@@ -211,7 +211,7 @@ impl Session {
         self.wake.notify_waiters();
     }
 
-    pub fn attach(&self, id: &Id, fingerprint: &[u8]) -> io::Result<Credit> {
+    pub fn attach(&self, id: &Id, fingerprint: &[u8], peer: &Peer) -> io::Result<Credit> {
         if self.fingerprint != fingerprint {
             return Err(unavailable());
         }
@@ -221,9 +221,13 @@ impl Session {
         if credit.deadline <= Instant::now() {
             return Err(timed_out());
         }
-        state.idle += 1;
         state.failures = 0;
         state.retry_at = Instant::now();
+        state.prune_opens();
+        if state.idle >= peer.config.idle_connections + state.opens.len() {
+            return Err(unavailable());
+        }
+        state.idle += 1;
         self.wake.notify_waiters();
         Ok(credit)
     }
@@ -232,9 +236,11 @@ impl Session {
         let _gate = peer.gate.enter()?;
         let mut guard = self.state.lock();
         let state = guard.as_mut().ok_or_else(unavailable)?;
-        state
-            .opens
-            .retain(|open| !open.reply.is_closed() && open.deadline > Instant::now());
+        let queued = state.opens.len();
+        state.prune_opens();
+        if state.opens.len() != queued {
+            self.wake.notify_waiters();
+        }
         let before = state.credits.len();
         state
             .credits
@@ -275,6 +281,11 @@ impl Session {
 }
 
 impl SessionState {
+    fn prune_opens(&mut self) {
+        self.opens
+            .retain(|open| !open.reply.is_closed() && open.deadline > Instant::now());
+    }
+
     fn backoff(&mut self, peer: &Peer) {
         self.failures = self.failures.saturating_add(1);
         let cap = (1u64 << self.failures.min(4))
@@ -310,6 +321,11 @@ impl Idle {
             self.session.wake.notify_waiters();
             return Ok(Some(open));
         }
+        if state.idle > peer.config.idle_connections {
+            state.idle -= 1;
+            self.assigned = true;
+            return Err(unavailable());
+        }
         Ok(None)
     }
 }
@@ -327,35 +343,8 @@ impl Drop for Idle {
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_support::harness;
     use super::*;
-
-    fn harness(active: usize, idle: usize) -> (Arc<Peer>, Arc<Session>, mpsc::Receiver<Message>) {
-        let config = serde_json::from_value(serde_json::json!({
-            "client_fingerprints":["ab".repeat(32)], "services":["web"],
-            "max_active_connections":active, "max_pending_opens":active,
-            "idle_connections":idle,
-        }))
-        .unwrap();
-        let gate = Arc::new(Gate::default());
-        gate.activate();
-        let peer = Arc::new(Peer::new(
-            gate,
-            config,
-            Arc::new(Endpoint::new(Arc::default(), Arc::default(), 16)),
-            Arc::default(),
-            Arc::default(),
-            Arc::default(),
-        ));
-        let (writer, rx) = mpsc::channel(64);
-        let session = Arc::new(Session::new(
-            Id::new(),
-            vec![1],
-            HashSet::from(["web".into()]),
-            writer,
-        ));
-        peer.install(session.clone()).unwrap();
-        (peer, session, rx)
-    }
 
     #[tokio::test(start_paused = true)]
     async fn zero_idle_at_active_limit_can_create_its_first_channel() {
@@ -374,7 +363,7 @@ mod tests {
         };
         assert_eq!(peer.physical.count(), 1);
         let _accepted = peer.endpoint.accept().unwrap();
-        let credit = session.attach(&channel_id, &[1]).unwrap();
+        let credit = session.attach(&channel_id, &[1], &peer).unwrap();
         let mut idle = Idle::new(session.clone());
         let opening = idle.claim(&peer).unwrap().unwrap();
         drop(credit._endpoint);
@@ -390,6 +379,33 @@ mod tests {
         assert_eq!(peer.active.count(), 0);
         assert_eq!(peer.pending.count(), 0);
         assert_eq!(peer.physical.count(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_demand_rejects_late_attachment_without_retaining_spares() {
+        let (peer, session, mut messages) = harness(1, 0);
+        let p = peer.clone();
+        let caller = tokio::spawn(async move {
+            p.open("web", Instant::now() + Duration::from_secs(60))
+                .await
+        });
+        tokio::task::yield_now().await;
+        session.refill(&peer).unwrap();
+        let Message::CreateData { channel_id } = messages.recv().await.unwrap() else {
+            panic!()
+        };
+        caller.abort();
+        let _ = caller.await;
+        let accepted = peer.endpoint.accept().unwrap();
+        assert!(session.attach(&channel_id, &[1], &peer).is_err());
+        drop(accepted);
+        assert_eq!(session.state.lock().as_ref().unwrap().idle, 0);
+        assert_eq!(peer.active.count(), 0);
+        assert_eq!(peer.pending.count(), 0);
+        assert_eq!(peer.physical.count(), 0);
+        assert_eq!(peer.endpoint.accepted.count(), 0);
+        assert_eq!(peer.endpoint.credits.count(), 0);
+        assert!(!session.stop.is_cancelled());
     }
 
     #[tokio::test(start_paused = true)]

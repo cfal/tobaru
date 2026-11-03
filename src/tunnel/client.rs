@@ -211,6 +211,7 @@ impl Client {
             deadline,
         } = work;
         let _socket = socket;
+        let mut attached = false;
         let setup = async {
             let mut stream = timeout_at(deadline, async {
                 let dial = self
@@ -235,6 +236,7 @@ impl Client {
                 if !matches!(protocol::read(&mut stream).await?, Message::DataReady {}) {
                     return Err(invalid());
                 }
+                attached = true;
                 Ok::<_, io::Error>(stream)
             })
             .await
@@ -334,12 +336,13 @@ impl Client {
             }
             Err(error) => {
                 log::debug!("Tunnel data setup failed: {error}");
-                if writer
-                    .try_send(Message::CreateFailed {
-                        channel_id: channel,
-                        code: Code::ConnectFailed,
-                    })
-                    .is_err()
+                if !attached
+                    && writer
+                        .try_send(Message::CreateFailed {
+                            channel_id: channel,
+                            code: Code::ConnectFailed,
+                        })
+                        .is_err()
                 {
                     stop.cancel();
                 }
@@ -351,5 +354,176 @@ impl Client {
 fn report_child(result: Result<(), tokio::task::JoinError>) {
     if let Err(error) = result {
         log::warn!("Tunnel client task failed: {error}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_support::Tls;
+    use super::*;
+    use tokio::net::TcpListener;
+    use tokio::sync::mpsc;
+
+    async fn harness() -> (Arc<Client>, TcpListener, Tls) {
+        let tls = Tls::new();
+        let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let address = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let config = serde_json::from_value(serde_json::json!({
+            "tunnel_client":"home", "server":address,
+            "client_tls":{"cert":"unused", "key":"unused", "sni_hostname":"localhost"},
+            "services":{"web":{"location":"localhost:1"}}
+        }))
+        .unwrap();
+        let gate = Arc::new(Gate::default());
+        gate.activate();
+        (
+            Arc::new(Client {
+                config,
+                connector: tls.connector.clone(),
+                gate,
+                resolver: Resolver::default(),
+                active: Arc::default(),
+                sockets: Arc::default(),
+                local_dials: Arc::default(),
+                dials: Arc::new(Semaphore::new(4)),
+                jobs: Arc::default(),
+            }),
+            listener,
+            tls,
+        )
+    }
+
+    async fn start_data(
+        client: &Arc<Client>,
+        listener: &TcpListener,
+        tls: &Tls,
+        full_writer: bool,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        super::super::stream::ServerIo,
+        Stop,
+        mpsc::Receiver<Message>,
+    ) {
+        let (writer, receiver) = mpsc::channel(1);
+        if full_writer {
+            writer.try_send(Message::Pong { nonce: 7 }).unwrap();
+        }
+        let stop = Stop::default();
+        let work = Work {
+            address: (
+                std::net::Ipv4Addr::LOCALHOST,
+                listener.local_addr().unwrap().port(),
+            )
+                .into(),
+            session: Id::new(),
+            channel: Id::new(),
+            services: Arc::new(HashSet::from(["web".into()])),
+            stop: stop.clone(),
+            writer,
+            socket: client.sockets.acquire(256).unwrap(),
+            job: client.jobs.acquire(8).unwrap(),
+            deadline: Instant::now() + Duration::from_secs(10),
+        };
+        let c = client.clone();
+        let task = tokio::spawn(async move {
+            c.data(work).await;
+        });
+        let (socket, _) = listener.accept().await.unwrap();
+        socket.set_nodelay(true).unwrap();
+        let mut stream = tokio_rustls::TlsAcceptor::from(tls.server.clone())
+            .accept(socket)
+            .await
+            .unwrap();
+        assert_eq!(tls::identity(stream.get_ref().1).unwrap(), tls.fingerprint);
+        assert!(matches!(
+            protocol::read(&mut stream).await.unwrap(),
+            Message::DataHello { .. }
+        ));
+        (task, stream, stop, receiver)
+    }
+
+    #[tokio::test]
+    async fn attached_failures_do_not_send_create_failed_or_stop_control() {
+        let (client, listener, tls) = harness().await;
+        for full_writer in [false, true] {
+            let (task, mut stream, stop, mut messages) =
+                start_data(&client, &listener, &tls, full_writer).await;
+            protocol::write(&mut stream, &Message::DataReady {})
+                .await
+                .unwrap();
+            protocol::write(
+                &mut stream,
+                &Message::Open {
+                    service: "unauthorized".into(),
+                    budget_ms: 30_000,
+                },
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                protocol::read(&mut stream).await.unwrap(),
+                Message::OpenFailed {
+                    code: Code::Unauthorized
+                }
+            ));
+            timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!stop.is_cancelled());
+            if full_writer {
+                assert!(matches!(
+                    messages.try_recv().unwrap(),
+                    Message::Pong { nonce: 7 }
+                ));
+            }
+            assert!(messages.try_recv().is_err());
+            assert_eq!(client.sockets.count(), 0);
+            assert_eq!(client.jobs.count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn preattachment_failures_still_notify_control_or_stop_on_overflow() {
+        let (client, listener, tls) = harness().await;
+        for full_writer in [false, true] {
+            let (task, mut stream, stop, mut messages) =
+                start_data(&client, &listener, &tls, full_writer).await;
+            protocol::write(&mut stream, &Message::Ready {})
+                .await
+                .unwrap();
+            timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(stop.is_cancelled(), full_writer);
+            if !full_writer {
+                assert!(matches!(
+                    messages.try_recv().unwrap(),
+                    Message::CreateFailed { .. }
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn flushed_data_hello_releases_dial_slots_before_data_ready() {
+        let (client, listener, tls) = harness().await;
+        let mut pending = Vec::new();
+        for _ in 0..5 {
+            pending.push(start_data(&client, &listener, &tls, false).await);
+            assert_eq!(client.dials.available_permits(), 4);
+            assert_eq!(client.jobs.count(), 0);
+        }
+        assert_eq!(client.sockets.count(), 5);
+        for (task, stream, stop, _) in pending {
+            stop.cancel();
+            timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap();
+            drop(stream);
+        }
+        assert_eq!(client.sockets.count(), 0);
     }
 }

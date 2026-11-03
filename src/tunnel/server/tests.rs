@@ -1,0 +1,159 @@
+use super::super::test_support::{harness, Tls};
+use super::*;
+use tokio::io::AsyncReadExt;
+
+async fn channel(
+    peer: &Peer,
+    session: &Arc<Session>,
+    messages: &mut tokio::sync::mpsc::Receiver<Message>,
+) -> (Idle, Channel, tokio_rustls::client::TlsStream<TcpStream>) {
+    let (io, client) = Tls::new().pair().await;
+    session.refill(peer).unwrap();
+    let Message::CreateData { channel_id } = messages.recv().await.unwrap() else {
+        panic!("expected creation credit")
+    };
+    let accepted = peer.endpoint.accept().unwrap();
+    let credit = session.attach(&channel_id, &[1], peer).unwrap();
+    drop(credit._endpoint);
+    (
+        Idle::new(session.clone()),
+        Channel {
+            io,
+            _accepted: accepted,
+            _physical: credit.physical,
+        },
+        client,
+    )
+}
+
+fn assert_released(peer: &Peer) {
+    assert_eq!(peer.active.count(), 0);
+    assert_eq!(peer.pending.count(), 0);
+    assert_eq!(peer.physical.count(), 0);
+    assert_eq!(peer.endpoint.accepted.count(), 0);
+    assert_eq!(peer.endpoint.credits.count(), 0);
+}
+
+#[tokio::test]
+async fn assigned_open_cancellation_closes_channel_without_ready_or_timeout() {
+    let (peer, session, mut messages) = harness(1, 0);
+    let p = peer.clone();
+    let caller = tokio::spawn(async move {
+        p.open("web", Instant::now() + Duration::from_secs(60))
+            .await
+    });
+    tokio::task::yield_now().await;
+    let (idle, channel, mut agent) = channel(&peer, &session, &mut messages).await;
+    let worker = tokio::spawn(serve_data(peer.clone(), idle, channel));
+    assert!(matches!(
+        protocol::read(&mut agent).await.unwrap(),
+        Message::Open { .. }
+    ));
+    assert_eq!(peer.pending.count(), 1);
+    caller.abort();
+    let _ = caller.await;
+    timeout(Duration::from_secs(1), worker)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let closed = timeout(Duration::from_secs(1), agent.read(&mut [0]))
+        .await
+        .unwrap();
+    assert!(closed.is_err() || closed.unwrap() == 0);
+    assert_released(&peer);
+}
+
+#[tokio::test]
+async fn idle_channel_shrinks_when_its_queued_caller_cancels() {
+    let (peer, session, mut messages) = harness(1, 0);
+    let p = peer.clone();
+    let caller = tokio::spawn(async move {
+        p.open("web", Instant::now() + Duration::from_secs(60))
+            .await
+    });
+    tokio::task::yield_now().await;
+    let (idle, channel, mut agent) = channel(&peer, &session, &mut messages).await;
+    caller.abort();
+    let _ = caller.await;
+    assert!(serve_data(peer.clone(), idle, channel).await.is_err());
+    assert_eq!(session.state.lock().as_ref().unwrap().idle, 0);
+    let closed = agent.read(&mut [0]).await;
+    assert!(closed.is_err() || closed.unwrap() == 0);
+    assert_released(&peer);
+}
+
+#[tokio::test]
+async fn ready_after_retirement_or_session_close_cannot_handoff() {
+    for retire_generation in [true, false] {
+        let (peer, session, mut messages) = harness(1, 0);
+        let p = peer.clone();
+        let caller = tokio::spawn(async move {
+            p.open("web", Instant::now() + Duration::from_secs(60))
+                .await
+        });
+        tokio::task::yield_now().await;
+        let (idle, channel, mut agent) = channel(&peer, &session, &mut messages).await;
+        let worker = tokio::spawn(serve_data(peer.clone(), idle, channel));
+        assert!(matches!(
+            protocol::read(&mut agent).await.unwrap(),
+            Message::Open { .. }
+        ));
+        if retire_generation {
+            peer.gate.retire();
+        } else {
+            session.close();
+        }
+        protocol::write(&mut agent, &Message::Ready {})
+            .await
+            .unwrap();
+        assert!(timeout(Duration::from_secs(1), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err());
+        assert!(caller.await.unwrap().is_err());
+        assert_released(&peer);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn accept_errors_retry_with_backoff_until_recovery() {
+    let start = Instant::now();
+    let mut attempts = 0;
+    let accepted = accept_retry(
+        || {
+            attempts += 1;
+            std::future::ready(match attempts {
+                1 => Err(io::Error::from_raw_os_error(24)),
+                2 => Err(io::Error::from(io::ErrorKind::ConnectionAborted)),
+                _ => Ok(42),
+            })
+        },
+        "0.0.0.0:7443".parse().unwrap(),
+    )
+    .await;
+    assert_eq!(accepted, 42);
+    assert_eq!(attempts, 3);
+    assert_eq!(start.elapsed(), Duration::from_secs(2));
+}
+
+#[tokio::test(start_paused = true)]
+async fn retirement_interrupts_accept_backoff() {
+    let gate = Gate::default();
+    gate.activate();
+    let start = Instant::now();
+    let accept = accept_retry(
+        || {
+            gate.retire();
+            std::future::ready(Err::<(), _>(io::Error::from_raw_os_error(24)))
+        },
+        "0.0.0.0:7443".parse().unwrap(),
+    );
+    tokio::select! {
+        biased;
+        _ = accept => panic!("failed accept cannot succeed"),
+        _ = gate.stop.wait() => {},
+    }
+    assert_eq!(start.elapsed(), Duration::ZERO);
+}

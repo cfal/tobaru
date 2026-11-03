@@ -104,7 +104,7 @@ impl Server {
                 let (session, credit) = {
                     let _gate = peer.gate.enter()?;
                     let session = peer.session(&session_id)?;
-                    let credit = session.attach(&channel_id, &fingerprint)?;
+                    let credit = session.attach(&channel_id, &fingerprint, &peer)?;
                     (session, credit)
                 };
                 let idle = Idle::new(session.clone());
@@ -210,50 +210,7 @@ struct SessionCleanup {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test(start_paused = true)]
-    async fn accept_errors_retry_with_backoff_until_recovery() {
-        let start = Instant::now();
-        let mut attempts = 0;
-        let accepted = accept_retry(
-            || {
-                attempts += 1;
-                std::future::ready(match attempts {
-                    1 => Err(io::Error::from_raw_os_error(24)),
-                    2 => Err(io::Error::from(io::ErrorKind::ConnectionAborted)),
-                    _ => Ok(42),
-                })
-            },
-            "0.0.0.0:7443".parse().unwrap(),
-        )
-        .await;
-        assert_eq!(accepted, 42);
-        assert_eq!(attempts, 3);
-        assert_eq!(start.elapsed(), Duration::from_secs(2));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn retirement_interrupts_accept_backoff() {
-        let gate = Gate::default();
-        gate.activate();
-        let start = Instant::now();
-        let accept = accept_retry(
-            || {
-                gate.retire();
-                std::future::ready(Err::<(), _>(io::Error::from_raw_os_error(24)))
-            },
-            "0.0.0.0:7443".parse().unwrap(),
-        );
-        tokio::select! {
-            biased;
-            _ = accept => panic!("failed accept cannot succeed"),
-            _ = gate.stop.wait() => {},
-        }
-        assert_eq!(start.elapsed(), Duration::ZERO);
-    }
-}
+mod tests;
 impl Drop for SessionCleanup {
     fn drop(&mut self) {
         self.peer.remove(&self.session);
@@ -307,7 +264,7 @@ async fn serve_data(peer: Arc<Peer>, mut idle: Idle, mut channel: Channel) -> io
         let wake = session.wake.notified();
         tokio::pin!(wake);
         wake.as_mut().enable();
-        if let Some(open) = idle.claim(&peer)? {
+        if let Some(mut open) = idle.claim(&peer)? {
             if !clean_idle(&mut channel.io).await {
                 let _gate = peer.gate.enter()?;
                 if let Some(state) = session.state.lock().as_mut() {
@@ -316,7 +273,7 @@ async fn serve_data(peer: Arc<Peer>, mut idle: Idle, mut channel: Channel) -> io
                 session.wake.notify_waiters();
                 return Err(unavailable());
             }
-            let result = timeout_at(open.deadline, async {
+            let exchange = timeout_at(open.deadline, async {
                 let remaining = open
                     .deadline
                     .saturating_duration_since(Instant::now())
@@ -345,10 +302,12 @@ async fn serve_data(peer: Arc<Peer>, mut idle: Idle, mut channel: Channel) -> io
                     )),
                     _ => Err(invalid()),
                 }
-            })
-            .await
-            .map_err(|_| timed_out())
-            .and_then(|result| result);
+            });
+            let result = tokio::select! {
+                biased;
+                _ = open.reply.closed() => return Ok(()),
+                result = exchange => result.map_err(|_| timed_out()).and_then(|result| result),
+            };
             if let Err(error) = result {
                 let _ = open.reply.send(Err(error));
                 return Ok(());
