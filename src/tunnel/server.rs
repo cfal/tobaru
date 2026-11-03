@@ -50,12 +50,18 @@ impl Server {
                 biased;
                 _ = self.gate.stop.wait() => break,
                 result = children.join_next(), if !children.is_empty() => {
-                    if let Some(Err(error)) = result { log::warn!("Tunnel connection task failed: {error}"); }
+                    if let Some(Err(error)) = result {
+                        log::warn!("Tunnel connection task failed: {error}");
+                    }
                 }
                 (stream, _) = &mut pending_accept => {
                     pending_accept.set(accept_retry(accept, self.address));
-                    let Ok(permit) = self.endpoint.accept() else { continue; };
-                    let Ok(handshake) = self.handshakes.acquire(self.max_handshakes) else { continue; };
+                    let Ok(permit) = self.endpoint.accept() else {
+                        continue;
+                    };
+                    let Ok(handshake) = self.handshakes.acquire(self.max_handshakes) else {
+                        continue;
+                    };
                     let server = self.clone();
                     children.spawn(async move {
                         if let Err(error) = server.connection(stream, permit, handshake).await {
@@ -240,7 +246,9 @@ async fn run_control(peer: &Peer, session: &Session, pumps: &mut Pumps) -> io::R
             _ = session.stop.wait() => return Ok(()),
             _ = pumps.tasks.join_next() => return Err(unavailable()),
             _ = tick.tick() => {
-                if ping.is_some_and(|(_, deadline)| Instant::now() >= deadline) { return Err(timed_out()); }
+                if ping.is_some_and(|(_, deadline)| Instant::now() >= deadline) {
+                    return Err(timed_out());
+                }
                 if ping.is_none() && last_ping.elapsed() >= Duration::from_secs(20) {
                     let nonce = rand::random();
                     session.send(Message::Ping { nonce })?;
@@ -249,7 +257,9 @@ async fn run_control(peer: &Peer, session: &Session, pumps: &mut Pumps) -> io::R
                 }
             },
             message = pumps.incoming.recv() => match message.ok_or_else(unavailable)? {
-                Message::Pong { nonce } if ping.is_some_and(|(expected, _)| nonce == expected) => { ping = None; }
+                Message::Pong { nonce } if ping.is_some_and(|(expected, _)| nonce == expected) => {
+                    ping = None;
+                }
                 Message::CreateFailed { channel_id, .. } => session.failed(&channel_id, peer),
                 _ => return Err(invalid()),
             },
@@ -258,7 +268,7 @@ async fn run_control(peer: &Peer, session: &Session, pumps: &mut Pumps) -> io::R
     }
 }
 
-async fn clean_idle(stream: &mut ServerIo) -> bool {
+async fn transport_is_idle(stream: &mut ServerIo) -> bool {
     std::future::poll_fn(|cx| {
         let mut byte = [0];
         let mut buf = ReadBuf::new(&mut byte);
@@ -274,84 +284,87 @@ async fn serve_data(peer: Arc<Peer>, mut idle: Idle, mut channel: Channel) -> io
         let wake = session.wake.notified();
         tokio::pin!(wake);
         wake.as_mut().enable();
-        if let Some(mut open) = idle.claim(&peer)? {
-            if !clean_idle(&mut channel.io).await {
-                let _gate = peer.gate.enter()?;
-                if let Some(state) = session.state.lock().as_mut() {
-                    state.opens.push_front(open);
+        let Some(mut open) = idle.claim(&peer)? else {
+            tokio::select! {
+                _ = &mut wake => {},
+                _ = tokio::time::sleep_until(heartbeat_at) => {
+                    let nonce = rand::random();
+                    timeout(Duration::from_secs(10), async {
+                        protocol::write(&mut channel.io, &Message::Ping { nonce }).await?;
+                        match protocol::read(&mut channel.io).await? {
+                            Message::Pong { nonce: reply } if reply == nonce => Ok(()),
+                            _ => Err(invalid()),
+                        }
+                    })
+                    .await
+                    .map_err(|_| timed_out())??;
+                    heartbeat_at = Instant::now() + Duration::from_secs(20);
                 }
-                session.wake.notify_waiters();
-                return Err(unavailable());
             }
-            let exchange = timeout_at(open.deadline, async {
-                let remaining = open
-                    .deadline
-                    .saturating_duration_since(Instant::now())
-                    .as_millis();
-                if remaining == 0 {
-                    return Err(timed_out());
-                }
-                protocol::write(
-                    &mut channel.io,
-                    &Message::Open {
-                        service: open.service.clone(),
-                        budget_ms: remaining.min(protocol::MAX_BUDGET_MS as u128) as u32,
+            continue;
+        };
+        if !transport_is_idle(&mut channel.io).await {
+            let _gate = peer.gate.enter()?;
+            if let Some(state) = session.state.lock().as_mut() {
+                state.opens.push_front(open);
+            }
+            session.wake.notify_waiters();
+            return Err(unavailable());
+        }
+        let exchange = timeout_at(open.deadline, async {
+            let remaining = open
+                .deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis();
+            if remaining == 0 {
+                return Err(timed_out());
+            }
+            protocol::write(
+                &mut channel.io,
+                &Message::Open {
+                    service: open.service.clone(),
+                    budget_ms: remaining.min(protocol::MAX_BUDGET_MS as u128) as u32,
+                },
+            )
+            .await?;
+            match protocol::read(&mut channel.io).await? {
+                Message::Ready {} => Ok(()),
+                Message::OpenFailed { code } => Err(io::Error::new(
+                    match code {
+                        Code::Busy => io::ErrorKind::WouldBlock,
+                        Code::Timeout => io::ErrorKind::TimedOut,
+                        Code::ConnectFailed => io::ErrorKind::ConnectionRefused,
+                        _ => io::ErrorKind::NotConnected,
                     },
-                )
-                .await?;
-                match protocol::read(&mut channel.io).await? {
-                    Message::Ready {} => Ok(()),
-                    Message::OpenFailed { code } => Err(io::Error::new(
-                        match code {
-                            Code::Busy => io::ErrorKind::WouldBlock,
-                            Code::Timeout => io::ErrorKind::TimedOut,
-                            Code::ConnectFailed => io::ErrorKind::ConnectionRefused,
-                            _ => io::ErrorKind::NotConnected,
-                        },
-                        "Tunnel origin setup failed",
-                    )),
-                    _ => Err(invalid()),
-                }
-            });
-            let result = tokio::select! {
-                biased;
-                _ = open.reply.closed() => return Ok(()),
-                result = exchange => result.map_err(|_| timed_out()).and_then(|result| result),
-            };
-            if let Err(error) = result {
-                let _ = open.reply.send(Err(error));
-                return Ok(());
+                    "Tunnel origin setup failed",
+                )),
+                _ => Err(invalid()),
             }
-            let revocation = {
-                let mut gate = peer.gate.enter()?;
-                let state = session.state.lock();
-                if state.is_none() {
-                    return Err(unavailable());
-                }
-                peer.gate.register(&mut gate, channel.io.get_ref().0)?
-            };
-            let stream = DataStream {
-                channel,
-                _active: open.active,
-                _revocation: revocation,
-            };
-            drop(open._pending);
-            let _ = open.reply.send(Ok(stream));
+        });
+        let result = tokio::select! {
+            biased;
+            _ = open.reply.closed() => return Ok(()),
+            result = exchange => result.map_err(|_| timed_out()).and_then(|result| result),
+        };
+        if let Err(error) = result {
+            let _ = open.reply.send(Err(error));
             return Ok(());
         }
-        tokio::select! {
-            _ = &mut wake => {},
-            _ = tokio::time::sleep_until(heartbeat_at) => {
-                let nonce = rand::random();
-                timeout(Duration::from_secs(10), async {
-                    protocol::write(&mut channel.io, &Message::Ping { nonce }).await?;
-                    match protocol::read(&mut channel.io).await? {
-                        Message::Pong { nonce: reply } if reply == nonce => Ok(()),
-                        _ => Err(invalid()),
-                    }
-                }).await.map_err(|_| timed_out())??;
-                heartbeat_at = Instant::now() + Duration::from_secs(20);
+        let revocation = {
+            let mut gate = peer.gate.enter()?;
+            let state = session.state.lock();
+            if state.is_none() {
+                return Err(unavailable());
             }
-        }
+            peer.gate.register(&mut gate, channel.io.get_ref().0)?
+        };
+        let stream = DataStream {
+            channel,
+            _active: open.active,
+            _revocation: revocation,
+        };
+        drop(open._pending);
+        let _ = open.reply.send(Ok(stream));
+        return Ok(());
     }
 }

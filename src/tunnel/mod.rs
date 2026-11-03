@@ -156,8 +156,8 @@ impl Store {
                 active: self.counters.get(format!("{key}/active")),
                 sockets: self.counters.get(format!("{key}/sockets")),
                 local_dials: self.counters.get(format!("{key}/local_dials")),
-                dials: Arc::new(tokio::sync::Semaphore::new(4)),
-                jobs: self.counters.get(format!("{key}/jobs")),
+                data_dial_slots: Arc::new(tokio::sync::Semaphore::new(4)),
+                data_setup_jobs: self.counters.get(format!("{key}/jobs")),
             });
             prepared.tasks.push(Box::pin(runtime.run()));
         }
