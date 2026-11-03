@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -31,6 +32,9 @@ pub struct Server {
 impl Server {
     pub async fn run(self: Arc<Self>) -> io::Result<()> {
         let listener = TcpListener::bind(self.address).await?;
+        let accept = || listener.accept();
+        let pending_accept = accept_retry(accept, self.address);
+        tokio::pin!(pending_accept);
         let mut children = JoinSet::new();
         let result = loop {
             tokio::select! {
@@ -39,8 +43,8 @@ impl Server {
                 result = children.join_next(), if !children.is_empty() => {
                     if let Some(Err(error)) = result { log::warn!("Tunnel connection task failed: {error}"); }
                 }
-                accepted = listener.accept() => {
-                    let (stream, _) = match accepted { Ok(value) => value, Err(error) => break Err(error) };
+                (stream, _) = &mut pending_accept => {
+                    pending_accept.set(accept_retry(accept, self.address));
                     let Ok(permit) = self.endpoint.accept() else { continue; };
                     let Ok(handshake) = self.handshakes.acquire(self.max_handshakes) else { continue; };
                     let server = self.clone();
@@ -52,7 +56,6 @@ impl Server {
                 }
             }
         };
-        drop(listener);
         children.abort_all();
         while children.join_next().await.is_some() {}
         result
@@ -177,9 +180,79 @@ impl Server {
     }
 }
 
+async fn accept_retry<T, F: Future<Output = io::Result<T>>>(
+    mut accept: impl FnMut() -> F,
+    address: SocketAddr,
+) -> T {
+    let mut failed = false;
+    loop {
+        match accept().await {
+            Ok(accepted) => {
+                if failed {
+                    log::info!("Tunnel accept recovered on {address}");
+                }
+                return accepted;
+            }
+            Err(error) => {
+                if !failed {
+                    log::warn!("Tunnel accept failed on {address}: {error}; retrying");
+                    failed = true;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
+}
+
 struct SessionCleanup {
     peer: Arc<Peer>,
     session: Arc<Session>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn accept_errors_retry_with_backoff_until_recovery() {
+        let start = Instant::now();
+        let mut attempts = 0;
+        let accepted = accept_retry(
+            || {
+                attempts += 1;
+                std::future::ready(match attempts {
+                    1 => Err(io::Error::from_raw_os_error(24)),
+                    2 => Err(io::Error::from(io::ErrorKind::ConnectionAborted)),
+                    _ => Ok(42),
+                })
+            },
+            "0.0.0.0:7443".parse().unwrap(),
+        )
+        .await;
+        assert_eq!(accepted, 42);
+        assert_eq!(attempts, 3);
+        assert_eq!(start.elapsed(), Duration::from_secs(2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retirement_interrupts_accept_backoff() {
+        let gate = Gate::default();
+        gate.activate();
+        let start = Instant::now();
+        let accept = accept_retry(
+            || {
+                gate.retire();
+                std::future::ready(Err::<(), _>(io::Error::from_raw_os_error(24)))
+            },
+            "0.0.0.0:7443".parse().unwrap(),
+        );
+        tokio::select! {
+            biased;
+            _ = accept => panic!("failed accept cannot succeed"),
+            _ = gate.stop.wait() => {},
+        }
+        assert_eq!(start.elapsed(), Duration::ZERO);
+    }
 }
 impl Drop for SessionCleanup {
     fn drop(&mut self) {
