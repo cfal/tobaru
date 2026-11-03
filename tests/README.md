@@ -104,9 +104,10 @@ ownership using a real blocking wrapper.
 
 The reverse-tunnel smoke also runs a separate hub with a child-local 64-FD limit.
 Incomplete ordinary HTTP requests exhaust its descriptors before a connection to
-the tunnel listener triggers a real `EMFILE`. Two exhaustion/recovery cycles must
-preserve an established tunnel stream and the same ordinary HTTP keep-alive
-connection. After release, both listeners must recover and accept fresh traffic;
+the tunnel listener triggers a real `EMFILE`. Two exhaustion/recovery cycles hold
+pressure beyond the one-second accept retry and must preserve an established
+tunnel stream and the same ordinary HTTP keep-alive connection, both during
+pressure and after release. Both listeners must recover and accept fresh traffic;
 the tunnel peer has zero warm spares, so recovery requires a new authenticated
 data channel. Only the child process's resource limit is changed.
 

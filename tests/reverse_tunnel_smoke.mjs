@@ -214,6 +214,8 @@ async function assertAcceptRecovery(hubIdentity, agentIdentity, originPort, webP
       await logged(/TCP accept failed.*\(os error 24\)/);
       fillers.push(track(net.connect(hubPort, '127.0.0.1')));
       await logged(/Tunnel accept failed.*\(os error 24\)/);
+      // Keep descriptors held across the one-second accept retry.
+      await delay(1500, undefined, { signal });
       await echo(active, `under-pressure-${cycle}`);
       assert.equal(JSON.parse((await request(ordinaryPort, '/during', httpAgent)).body).path, '/during');
       assert.equal(Object.values(httpAgent.freeSockets).flat()[0], ordinary);
@@ -225,7 +227,9 @@ async function assertAcceptRecovery(hubIdentity, agentIdentity, originPort, webP
       await echo(fresh, `recovered-${cycle}`);
       fresh.destroy();
       await echo(active, `survived-${cycle}`);
-      assert.equal(JSON.parse((await request(ordinaryPort, '/after')).body).path, '/after');
+      await eventually(async () => assert.equal(JSON.parse((await request(ordinaryPort, '/after')).body).path, '/after'));
+      assert.equal(JSON.parse((await request(ordinaryPort, '/survived', httpAgent)).body).path, '/survived');
+      assert.equal(Object.values(httpAgent.freeSockets).flat()[0], ordinary);
       await logged(/Tunnel accept recovered/);
       await logged(/TCP accept recovered/);
       assert.equal(hub.exitCode, null, hub.logs);
