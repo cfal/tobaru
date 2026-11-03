@@ -45,10 +45,10 @@ impl Server {
         let pending_accept = accept_retry(accept, self.address);
         tokio::pin!(pending_accept);
         let mut children = JoinSet::new();
-        let result = loop {
+        loop {
             tokio::select! {
                 biased;
-                _ = self.gate.stop.wait() => break Ok(()),
+                _ = self.gate.stop.wait() => break,
                 result = children.join_next(), if !children.is_empty() => {
                     if let Some(Err(error)) = result { log::warn!("Tunnel connection task failed: {error}"); }
                 }
@@ -64,10 +64,10 @@ impl Server {
                     });
                 }
             }
-        };
+        }
         children.abort_all();
         while children.join_next().await.is_some() {}
-        result
+        Ok(())
     }
 
     async fn connection(
@@ -178,12 +178,12 @@ impl Server {
             pumps.outgoing.clone(),
         ));
         peer.install(session.clone())?;
-        let _cleanup = SessionCleanup {
+        let cleanup = SessionCleanup {
             peer: peer.clone(),
             session: session.clone(),
         };
         let result = run_control(&peer, &session, &mut pumps).await;
-        peer.remove(&session);
+        drop(cleanup);
         pumps.stop().await;
         result
     }

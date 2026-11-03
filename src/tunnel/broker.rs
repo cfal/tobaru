@@ -297,14 +297,14 @@ impl SessionState {
 
 pub struct Idle {
     pub session: Arc<Session>,
-    assigned: bool,
+    counted_as_idle: bool,
 }
 
 impl Idle {
     pub fn new(session: Arc<Session>) -> Self {
         Self {
             session,
-            assigned: false,
+            counted_as_idle: true,
         }
     }
 
@@ -317,13 +317,13 @@ impl Idle {
                 continue;
             }
             state.idle -= 1;
-            self.assigned = true;
+            self.counted_as_idle = false;
             self.session.wake.notify_waiters();
             return Ok(Some(open));
         }
         if state.idle > peer.config.idle_connections {
             state.idle -= 1;
-            self.assigned = true;
+            self.counted_as_idle = false;
             return Err(unavailable());
         }
         Ok(None)
@@ -332,7 +332,7 @@ impl Idle {
 
 impl Drop for Idle {
     fn drop(&mut self) {
-        if !self.assigned {
+        if self.counted_as_idle {
             if let Some(state) = self.session.state.lock().as_mut() {
                 state.idle -= 1;
             }

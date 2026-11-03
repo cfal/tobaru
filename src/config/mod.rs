@@ -1389,7 +1389,6 @@ pub async fn load_runtime_config(
     // add the default 'all' ip group.
     groups.insert(String::from("all"), vec![IpMask::all()]);
 
-    let mut server_configs = vec![];
     let mut runtime = RuntimeConfig::default();
 
     for config_path in config_paths {
@@ -1403,7 +1402,7 @@ pub async fn load_runtime_config(
                 Config::TunnelServer(server) => runtime.tunnel_servers.push(server),
                 Config::TunnelClient(client) => runtime.tunnel_clients.push(client),
                 Config::ServerConfig(server_config) => {
-                    server_configs.push(server_config);
+                    runtime.servers.push(server_config);
                 }
                 Config::IpMaskGroup(IpMaskGroupConfig {
                     group,
@@ -1433,7 +1432,7 @@ pub async fn load_runtime_config(
 
     // Expand targets with optional: true into two separate targets
     // and replace IP groups
-    for server_config in server_configs.iter_mut() {
+    for server_config in runtime.servers.iter_mut() {
         match server_config.target_configs {
             TargetConfigs::Tcp {
                 ref mut targets, ..
@@ -1486,10 +1485,9 @@ pub async fn load_runtime_config(
     }
 
     for config_url in config_urls {
-        server_configs.push(load_url(&config_url).await?);
+        runtime.servers.push(load_url(&config_url).await?);
     }
 
-    runtime.servers = server_configs;
     Ok(runtime)
 }
 

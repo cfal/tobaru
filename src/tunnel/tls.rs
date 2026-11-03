@@ -16,7 +16,6 @@ pub fn socket_options(stream: &TcpStream) -> io::Result<()> {
 }
 
 pub fn server(config: &TunnelServerConfig) -> io::Result<Arc<rustls::ServerConfig>> {
-    config.validate()?;
     let pins: Vec<_> = config
         .peers
         .values()
@@ -32,7 +31,6 @@ pub fn server(config: &TunnelServerConfig) -> io::Result<Arc<rustls::ServerConfi
 }
 
 pub fn client(config: &TunnelClientConfig) -> io::Result<tokio_rustls::TlsConnector> {
-    config.validate()?;
     Ok(create_client_config_with_cert(
         config.client_tls.verify,
         Some((

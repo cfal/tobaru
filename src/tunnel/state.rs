@@ -45,16 +45,18 @@ impl Stop {
 }
 
 #[derive(Default)]
-pub struct Counter(AtomicUsize);
+pub struct Counter {
+    used: AtomicUsize,
+}
 
 impl Counter {
     pub fn count(&self) -> usize {
-        self.0.load(Ordering::Relaxed)
+        self.used.load(Ordering::Relaxed)
     }
 
-    #[allow(deprecated)]
+    #[allow(deprecated)] // fetch_update supports the Rust 1.88 MSRV.
     pub fn acquire(self: &Arc<Self>, limit: usize) -> io::Result<Permit> {
-        self.0
+        self.used
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                 (n < limit).then_some(n + 1)
             })
@@ -66,7 +68,7 @@ impl Counter {
 pub struct Permit(Arc<Counter>);
 impl Drop for Permit {
     fn drop(&mut self) {
-        self.0 .0.fetch_sub(1, Ordering::Relaxed);
+        self.0.used.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
