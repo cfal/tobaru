@@ -18,6 +18,9 @@ use super::state::{timed_out, unavailable, Counter, Gate, Permit};
 use super::stream::{Channel, DataStream, ServerIo};
 use super::tls;
 
+#[cfg(test)]
+mod tests;
+
 pub struct Server {
     pub address: SocketAddr,
     pub tls: Arc<rustls::ServerConfig>,
@@ -209,8 +212,6 @@ struct SessionCleanup {
     session: Arc<Session>,
 }
 
-#[cfg(test)]
-mod tests;
 impl Drop for SessionCleanup {
     fn drop(&mut self) {
         self.peer.remove(&self.session);
@@ -223,18 +224,15 @@ async fn run_control(peer: &Peer, session: &Session, pumps: &mut Pumps) -> io::R
     let mut last_ping = Instant::now();
     let mut ping = None;
     loop {
+        let wake = session.wake.notified();
+        tokio::pin!(wake);
+        wake.as_mut().enable();
         session.refill(peer)?;
         tokio::select! {
             biased;
             _ = peer.gate.stop.wait() => return Ok(()),
             _ = session.stop.wait() => return Ok(()),
             _ = pumps.tasks.join_next() => return Err(unavailable()),
-            message = pumps.incoming.recv() => match message.ok_or_else(unavailable)? {
-                Message::Pong { nonce } if ping.is_some_and(|(expected, _)| nonce == expected) => { ping = None; }
-                Message::CreateFailed { channel_id, .. } => session.failed(&channel_id, peer),
-                _ => return Err(invalid()),
-            },
-            _ = session.wake.notified() => {},
             _ = tick.tick() => {
                 if ping.is_some_and(|(_, deadline)| Instant::now() >= deadline) { return Err(timed_out()); }
                 if ping.is_none() && last_ping.elapsed() >= Duration::from_secs(20) {
@@ -243,7 +241,13 @@ async fn run_control(peer: &Peer, session: &Session, pumps: &mut Pumps) -> io::R
                     ping = Some((nonce, Instant::now() + Duration::from_secs(60)));
                     last_ping = Instant::now();
                 }
-            }
+            },
+            message = pumps.incoming.recv() => match message.ok_or_else(unavailable)? {
+                Message::Pong { nonce } if ping.is_some_and(|(expected, _)| nonce == expected) => { ping = None; }
+                Message::CreateFailed { channel_id, .. } => session.failed(&channel_id, peer),
+                _ => return Err(invalid()),
+            },
+            _ = &mut wake => {},
         }
     }
 }

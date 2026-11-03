@@ -14,6 +14,11 @@ impl Default for Resolver {
 }
 
 impl Resolver {
+    #[cfg(test)]
+    pub(super) fn with_capacity(capacity: usize) -> Self {
+        Self(Arc::new(Semaphore::new(capacity)))
+    }
+
     pub async fn resolve(&self, host: &str, port: u16) -> io::Result<SocketAddr> {
         if let Ok(ip) = host.parse::<IpAddr>() {
             return Ok(SocketAddr::new(ip, port));

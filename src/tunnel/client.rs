@@ -60,7 +60,7 @@ impl Client {
                 _ = self.gate.stop.wait() => break,
                 result = timeout(Duration::from_secs(10), self.connect_control()) => result.map_err(|_| timed_out()).and_then(|r| r),
             };
-            match result {
+            let connected_for = match result {
                 Ok(control) => {
                     let connected_at = Instant::now();
                     log::info!("Tunnel client {} registered", self.config.tunnel_client);
@@ -70,20 +70,17 @@ impl Client {
                             self.config.tunnel_client
                         );
                     }
-                    if connected_at.elapsed() >= Duration::from_secs(60) {
-                        failures = 0;
-                    }
+                    Some(connected_at.elapsed())
                 }
-                Err(error) => log::warn!(
-                    "Tunnel client {} connection failed: {error}",
-                    self.config.tunnel_client
-                ),
-            }
-            let cap = (1u64 << failures.min(6)).min(60);
-            failures = failures.saturating_add(1);
-            let delay = Duration::from_millis(rand::random_range(
-                (cap * 500).max(1000)..=(cap * 1000).max(1000),
-            ));
+                Err(error) => {
+                    log::warn!(
+                        "Tunnel client {} connection failed: {error}",
+                        self.config.tunnel_client
+                    );
+                    None
+                }
+            };
+            let delay = reconnect_delay(&mut failures, connected_for);
             tokio::select! {
                 _ = self.gate.stop.wait() => break,
                 _ = tokio::time::sleep(delay) => {},
@@ -351,6 +348,17 @@ impl Client {
     }
 }
 
+fn reconnect_delay(failures: &mut u32, connected_for: Option<Duration>) -> Duration {
+    if connected_for.is_some_and(|duration| duration >= Duration::from_secs(60)) {
+        *failures = 0;
+    }
+    let cap = (1u64 << (*failures).min(6)).min(60);
+    *failures = failures.saturating_add(1);
+    Duration::from_millis(rand::random_range(
+        (cap * 500).max(1000)..=(cap * 1000).max(1000),
+    ))
+}
+
 fn report_child(result: Result<(), tokio::task::JoinError>) {
     if let Err(error) = result {
         log::warn!("Tunnel client task failed: {error}");
@@ -525,5 +533,131 @@ mod tests {
             drop(stream);
         }
         assert_eq!(client.sockets.count(), 0);
+    }
+
+    #[test]
+    fn reconnect_backoff_is_bounded_and_resets_only_after_a_stable_session() {
+        let mut failures = 0;
+        for exponent in 0..100 {
+            let cap = (1u64 << exponent.min(6)).min(60);
+            let delay = reconnect_delay(&mut failures, Some(Duration::from_secs(59)));
+            assert!(delay >= Duration::from_millis((cap * 500).max(1000)));
+            assert!(delay <= Duration::from_secs(cap));
+        }
+        assert_eq!(
+            reconnect_delay(&mut failures, Some(Duration::from_secs(60))),
+            Duration::from_secs(1)
+        );
+        assert_eq!(failures, 1);
+        failures = u32::MAX;
+        assert!(reconnect_delay(&mut failures, None) <= Duration::from_secs(60));
+        assert_eq!(failures, u32::MAX);
+    }
+
+    #[tokio::test]
+    async fn idle_data_receive_deadline_closes_without_eof_or_control_failure() {
+        let (client, listener, tls) = harness().await;
+        let (task, mut stream, stop, mut messages) =
+            start_data(&client, &listener, &tls, false).await;
+        protocol::write(&mut stream, &Message::DataReady {})
+            .await
+            .unwrap();
+        protocol::write(&mut stream, &Message::Ping { nonce: 5 })
+            .await
+            .unwrap();
+        assert!(matches!(
+            protocol::read(&mut stream).await.unwrap(),
+            Message::Pong { nonce: 5 }
+        ));
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(39)).await;
+        assert!(!task.is_finished());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        task.await.unwrap();
+        assert!(!stop.is_cancelled());
+        assert!(messages.try_recv().is_err());
+        assert_eq!(client.sockets.count(), 0);
+    }
+
+    #[tokio::test]
+    async fn silent_control_expires_after_sixty_seconds() {
+        let (client, listener, tls) = harness().await;
+        let (mut hub, agent) = tls.pair().await;
+        let control = Control {
+            io: agent,
+            address: listener.local_addr().unwrap(),
+            session: Id::new(),
+            services: HashSet::new(),
+        };
+        let task = tokio::spawn(async move { client.session(control, &mut JoinSet::new()).await });
+        protocol::write(&mut hub, &Message::Ping { nonce: 5 })
+            .await
+            .unwrap();
+        assert!(matches!(
+            protocol::read(&mut hub).await.unwrap(),
+            Message::Pong { nonce: 5 }
+        ));
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(59)).await;
+        assert!(!task.is_finished());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(task.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn local_dial_observes_hub_closure_and_clamps_valid_long_budgets() {
+        for close_hub in [true, false] {
+            let (mut client, listener, tls) = harness().await;
+            Arc::get_mut(&mut client).unwrap().resolver = Resolver::with_capacity(0);
+            let (task, mut stream, stop, mut messages) =
+                start_data(&client, &listener, &tls, false).await;
+            protocol::write(&mut stream, &Message::DataReady {})
+                .await
+                .unwrap();
+            protocol::write(
+                &mut stream,
+                &Message::Open {
+                    service: "web".into(),
+                    budget_ms: 30_000,
+                },
+            )
+            .await
+            .unwrap();
+            timeout(Duration::from_secs(1), async {
+                while client.local_dials.count() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(client.active.count(), 1);
+            if close_hub {
+                drop(stream);
+            } else {
+                tokio::time::pause();
+                tokio::time::advance(Duration::from_secs(9)).await;
+                assert!(!task.is_finished());
+                tokio::time::advance(Duration::from_secs(1)).await;
+                tokio::time::resume();
+                assert!(matches!(
+                    timeout(Duration::from_secs(1), protocol::read(&mut stream))
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    Message::OpenFailed {
+                        code: Code::Timeout
+                    }
+                ));
+            }
+            timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(client.local_dials.count(), 0);
+            assert_eq!(client.active.count(), 0);
+            assert_eq!(client.sockets.count(), 0);
+            assert!(!stop.is_cancelled());
+            assert!(messages.try_recv().is_err());
+        }
     }
 }

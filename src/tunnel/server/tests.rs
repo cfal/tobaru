@@ -157,3 +157,87 @@ async fn retirement_interrupts_accept_backoff() {
     }
     assert_eq!(start.elapsed(), Duration::ZERO);
 }
+
+#[tokio::test(start_paused = true)]
+async fn control_deadline_preempts_ready_input_and_keeps_one_outstanding_ping() {
+    let (peer, session, mut messages) = harness(1, 0);
+    let (input, incoming) = tokio::sync::mpsc::channel(64);
+    let mut pumps = Pumps {
+        incoming,
+        outgoing: session.writer.clone(),
+        tasks: JoinSet::new(),
+    };
+    pumps.tasks.spawn(std::future::pending());
+    {
+        let control = run_control(&peer, &session, &mut pumps);
+        tokio::pin!(control);
+        assert!(futures::poll!(&mut control).is_pending());
+        tokio::time::advance(Duration::from_secs(20)).await;
+        assert!(futures::poll!(&mut control).is_pending());
+        assert!(matches!(messages.try_recv().unwrap(), Message::Ping { .. }));
+        for _ in 0..59 {
+            while input
+                .try_send(Message::CreateFailed {
+                    channel_id: Id::new(),
+                    code: Code::ConnectFailed,
+                })
+                .is_ok()
+            {}
+            tokio::time::advance(Duration::from_secs(1)).await;
+            assert!(futures::poll!(&mut control).is_pending());
+            assert!(
+                messages.try_recv().is_err(),
+                "a second ping preceded the first pong"
+            );
+        }
+        while input
+            .try_send(Message::CreateFailed {
+                channel_id: Id::new(),
+                code: Code::ConnectFailed,
+            })
+            .is_ok()
+        {}
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let Poll::Ready(Err(error)) = futures::poll!(&mut control) else {
+            panic!("pong deadline postponed by control input")
+        };
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(
+            input.capacity(),
+            0,
+            "input was processed past the pong deadline"
+        );
+    }
+    pumps.stop().await;
+}
+
+#[tokio::test]
+async fn idle_channel_pings_at_twenty_seconds_and_closes_after_ten_without_pong() {
+    let (peer, session, mut messages) = harness(1, 1);
+    let (idle, channel, mut agent) = channel(&peer, &session, &mut messages).await;
+    let worker = tokio::spawn(serve_data(peer.clone(), idle, channel));
+    tokio::task::yield_now().await;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(19)).await;
+    assert!(!worker.is_finished());
+    assert!(futures::poll!(std::pin::pin!(agent.read(&mut [0]))).is_pending());
+    tokio::time::advance(Duration::from_secs(1)).await;
+    tokio::time::resume();
+    assert!(matches!(
+        timeout(Duration::from_secs(1), protocol::read(&mut agent))
+            .await
+            .unwrap()
+            .unwrap(),
+        Message::Ping { .. }
+    ));
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(9)).await;
+    assert!(!worker.is_finished());
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert_eq!(
+        worker.await.unwrap().unwrap_err().kind(),
+        io::ErrorKind::TimedOut
+    );
+    assert_eq!(session.state.lock().as_ref().unwrap().idle, 0);
+    assert_released(&peer);
+}
