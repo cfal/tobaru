@@ -9,7 +9,7 @@ async fn channel(
 ) -> (Open, Channel, tokio_rustls::client::TlsStream<TcpStream>) {
     let (io, client) = Tls::new().pair().await;
     session.request_data(peer).unwrap();
-    let Message::CreateData { channel_id } = messages.recv().await.unwrap() else {
+    let Message::CreateData { channel_id } = messages.try_recv().unwrap() else {
         panic!("expected creation credit")
     };
     let accepted = peer.endpoint.accept().unwrap();
@@ -44,7 +44,13 @@ async fn assigned_open_cancellation_closes_channel_without_ready_or_timeout() {
     });
     tokio::task::yield_now().await;
     let (open, channel, mut agent) = channel(&peer, &session, &mut messages).await;
-    let worker = tokio::spawn(serve_data(peer.clone(), session.clone(), channel, open));
+    let worker = tokio::spawn(serve_data(
+        peer.clone(),
+        session.clone(),
+        channel,
+        open,
+        Instant::now() + Duration::from_secs(10),
+    ));
     assert!(matches!(
         protocol::read(&mut agent).await.unwrap(),
         Message::Open { .. }
@@ -78,7 +84,13 @@ async fn cancellation_after_attachment_closes_without_sending_open() {
     let _ = caller.await;
     timeout(
         Duration::from_secs(1),
-        serve_data(peer.clone(), session.clone(), channel, open),
+        serve_data(
+            peer.clone(),
+            session.clone(),
+            channel,
+            open,
+            Instant::now() + Duration::from_secs(10),
+        ),
     )
     .await
     .expect("cancelled attachment was not closed promptly")
@@ -87,6 +99,188 @@ async fn cancellation_after_attachment_closes_without_sending_open() {
         .await
         .unwrap();
     assert!(closed.is_err() || closed.unwrap() == 0);
+    assert_released(&peer);
+}
+
+#[tokio::test]
+async fn pre_open_bytes_or_eof_requeue_the_same_demand_before_later_callers() {
+    use tokio::io::AsyncWriteExt;
+    for early_bytes in [true, false] {
+        let (peer, session, mut messages) = harness(2);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut first = Box::pin(peer.open("web", deadline));
+        assert!(futures::poll!(&mut first).is_pending());
+        let (open, mut channel, mut agent) = channel(&peer, &session, &mut messages).await;
+        let mut later = Box::pin(peer.open("web", deadline + Duration::from_secs(1)));
+        assert!(futures::poll!(&mut later).is_pending());
+        if early_bytes {
+            agent.write_all(b"xy").await.unwrap();
+            // Leave forbidden read-ahead buffered after consuming a prefix.
+            assert_eq!(channel.io.read_u8().await.unwrap(), b'x');
+        } else {
+            agent.shutdown().await.unwrap();
+            assert_eq!(channel.io.read(&mut [0]).await.unwrap(), 0);
+        }
+        assert!(timeout(
+            Duration::from_secs(1),
+            serve_data(
+                peer.clone(),
+                session.clone(),
+                channel,
+                open,
+                Instant::now() + Duration::from_secs(10)
+            ),
+        )
+        .await
+        .unwrap()
+        .is_err());
+        let closed = timeout(Duration::from_secs(1), agent.read(&mut [0]))
+            .await
+            .unwrap();
+        assert!(closed.is_err() || closed.unwrap() == 0);
+        {
+            let guard = session.state.lock();
+            let opens = &guard.as_ref().unwrap().opens;
+            assert_eq!(opens.len(), 2);
+            assert_eq!(opens[0].deadline, deadline);
+            assert_eq!(opens[1].deadline, deadline + Duration::from_secs(1));
+        }
+        assert_eq!(peer.active.count(), 2);
+        assert_eq!(peer.pending.count(), 2);
+        assert_eq!(peer.physical.count(), 0);
+        assert_eq!(peer.endpoint.accepted.count(), 0);
+        session.close();
+        assert!(first.await.is_err());
+        assert!(later.await.is_err());
+        assert_released(&peer);
+    }
+}
+
+#[tokio::test]
+async fn retirement_or_replacement_after_assignment_prevents_open() {
+    for retire_generation in [true, false] {
+        let (peer, session, mut messages) = harness(1);
+        let mut caller = Box::pin(peer.open("web", Instant::now() + Duration::from_secs(60)));
+        assert!(futures::poll!(&mut caller).is_pending());
+        let (open, channel, mut agent) = channel(&peer, &session, &mut messages).await;
+        if retire_generation {
+            peer.gate.retire();
+        } else {
+            let (writer, _rx) = tokio::sync::mpsc::channel(64);
+            peer.install(Arc::new(Session::new(
+                Id::new(),
+                vec![1],
+                HashSet::new(),
+                writer,
+            )))
+            .unwrap();
+        }
+        assert!(timeout(
+            Duration::from_secs(1),
+            serve_data(
+                peer.clone(),
+                session.clone(),
+                channel,
+                open,
+                Instant::now() + Duration::from_secs(10)
+            ),
+        )
+        .await
+        .unwrap()
+        .is_err());
+        let closed = timeout(Duration::from_secs(1), agent.read(&mut [0]))
+            .await
+            .unwrap();
+        assert!(closed.is_err() || closed.unwrap() == 0);
+        assert!(caller.await.is_err());
+        assert_released(&peer);
+    }
+}
+
+#[tokio::test]
+async fn ready_can_arrive_after_attachment_deadline_and_handoff_retains_stream_permits() {
+    let (peer, session, mut messages) = harness(1);
+    let mut caller = Box::pin(peer.open("web", Instant::now() + Duration::from_secs(60)));
+    assert!(futures::poll!(&mut caller).is_pending());
+    let (open, channel, mut agent) = channel(&peer, &session, &mut messages).await;
+    let worker = tokio::spawn(serve_data(
+        peer.clone(),
+        session.clone(),
+        channel,
+        open,
+        Instant::now() + Duration::from_secs(5),
+    ));
+    assert!(matches!(
+        protocol::read(&mut agent).await.unwrap(),
+        Message::Open { .. }
+    ));
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(6)).await;
+    assert!(!worker.is_finished());
+    tokio::time::resume();
+    protocol::write(&mut agent, &Message::Ready {})
+        .await
+        .unwrap();
+    use tokio::io::AsyncWriteExt;
+    agent.write_all(b"greeting").await.unwrap();
+    let mut stream = timeout(Duration::from_secs(1), caller)
+        .await
+        .unwrap()
+        .unwrap();
+    worker.await.unwrap().unwrap();
+    assert_eq!(peer.pending.count(), 0);
+    assert_eq!(peer.active.count(), 1);
+    assert_eq!(peer.physical.count(), 1);
+    assert_eq!(peer.endpoint.accepted.count(), 1);
+    assert_eq!(peer.endpoint.credits.count(), 0);
+    let mut bytes = [0; 8];
+    timeout(Duration::from_secs(1), stream.read_exact(&mut bytes))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&bytes, b"greeting");
+    drop(stream);
+    assert_released(&peer);
+}
+
+#[tokio::test]
+async fn first_open_write_keeps_the_connection_setup_deadline_under_backpressure() {
+    use tokio::io::AsyncWriteExt;
+    let (peer, session, mut messages) = harness(1);
+    let mut caller = Box::pin(peer.open("web", Instant::now() + Duration::from_secs(60)));
+    assert!(futures::poll!(&mut caller).is_pending());
+    let (open, mut channel, agent) = channel(&peer, &session, &mut messages).await;
+    socket2::SockRef::from(channel.io.get_ref().0)
+        .set_send_buffer_size(4096)
+        .unwrap();
+    socket2::SockRef::from(agent.get_ref().0)
+        .set_recv_buffer_size(4096)
+        .unwrap();
+    channel.io.get_mut().1.set_buffer_limit(Some(32768));
+    assert!(timeout(
+        Duration::from_millis(50),
+        channel.io.write_all(&[0; 262144])
+    )
+    .await
+    .is_err());
+    let worker = tokio::spawn(serve_data(
+        peer.clone(),
+        session.clone(),
+        channel,
+        open,
+        Instant::now() + Duration::from_secs(5),
+    ));
+    tokio::task::yield_now().await;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(4)).await;
+    assert!(!worker.is_finished());
+    tokio::time::advance(Duration::from_secs(1)).await;
+    timeout(Duration::from_millis(1), worker)
+        .await
+        .expect("first Open write exceeded its attachment deadline")
+        .unwrap()
+        .unwrap();
+    assert!(matches!(caller.await, Err(error) if error.kind() == io::ErrorKind::TimedOut));
     assert_released(&peer);
 }
 
@@ -101,7 +295,13 @@ async fn ready_after_retirement_or_session_close_cannot_handoff() {
         });
         tokio::task::yield_now().await;
         let (open, channel, mut agent) = channel(&peer, &session, &mut messages).await;
-        let worker = tokio::spawn(serve_data(peer.clone(), session.clone(), channel, open));
+        let worker = tokio::spawn(serve_data(
+            peer.clone(),
+            session.clone(),
+            channel,
+            open,
+            Instant::now() + Duration::from_secs(10),
+        ));
         assert!(matches!(
             protocol::read(&mut agent).await.unwrap(),
             Message::Open { .. }
@@ -246,7 +446,7 @@ async fn authenticated_attachment_cannot_commit_after_retirement_or_replacement(
         });
         tokio::task::yield_now().await;
         session.request_data(&peer).unwrap();
-        let Message::CreateData { channel_id } = messages.recv().await.unwrap() else {
+        let Message::CreateData { channel_id } = messages.try_recv().unwrap() else {
             panic!()
         };
         let server = Arc::new(Server {

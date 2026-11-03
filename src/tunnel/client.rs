@@ -527,27 +527,36 @@ mod tests {
     async fn preattachment_failures_still_notify_control_or_stop_on_overflow() {
         let (client, listener, tls) = harness().await;
         for full_writer in [false, true] {
-            let (task, mut stream, stop, mut messages) = start_data(
-                &client,
-                &listener,
-                &tls,
-                full_writer,
-                Instant::now() + Duration::from_secs(10),
-            )
-            .await;
-            protocol::write(&mut stream, &Message::Ready {})
-                .await
-                .unwrap();
-            timeout(Duration::from_secs(1), task)
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(stop.is_cancelled(), full_writer);
-            if !full_writer {
-                assert!(matches!(
-                    messages.try_recv().unwrap(),
-                    Message::CreateFailed { .. }
-                ));
+            for message in [
+                Some(Message::Ready {}),
+                Some(Message::Ping { nonce: 1 }),
+                Some(Message::Pong { nonce: 1 }),
+                None,
+            ] {
+                let (task, mut stream, stop, mut messages) = start_data(
+                    &client,
+                    &listener,
+                    &tls,
+                    full_writer,
+                    Instant::now() + Duration::from_secs(10),
+                )
+                .await;
+                if let Some(message) = message {
+                    protocol::write(&mut stream, &message).await.unwrap();
+                } else {
+                    drop(stream);
+                }
+                timeout(Duration::from_secs(1), task)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(stop.is_cancelled(), full_writer);
+                if !full_writer {
+                    assert!(matches!(
+                        messages.try_recv().unwrap(),
+                        Message::CreateFailed { .. }
+                    ));
+                }
             }
         }
     }
@@ -735,7 +744,7 @@ mod tests {
                 &listener,
                 &tls,
                 false,
-                Instant::now() + Duration::from_secs(10),
+                Instant::now() + Duration::from_secs(5),
             )
             .await;
             protocol::write(

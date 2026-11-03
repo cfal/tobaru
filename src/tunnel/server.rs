@@ -131,7 +131,7 @@ impl Server {
                 tokio::select! {
                     biased;
                     _ = session.stop.wait() => Err(unavailable()),
-                    result = serve_data(peer, session.clone(), channel, open) => result,
+                    result = serve_data(peer, session.clone(), channel, open, deadline) => result,
                 }
             }
             _ => Err(invalid()),
@@ -275,7 +275,14 @@ async fn serve_data(
     session: Arc<Session>,
     mut channel: Channel,
     mut open: Open,
+    attachment_deadline: Instant,
 ) -> io::Result<()> {
+    {
+        let _gate = peer.gate.enter()?;
+        if session.state.lock().is_none() {
+            return Err(unavailable());
+        }
+    }
     if !transport_is_idle(&mut channel.io).await {
         let _gate = peer.gate.enter()?;
         if let Some(state) = session.state.lock().as_mut() {
@@ -292,14 +299,18 @@ async fn serve_data(
         if remaining == 0 {
             return Err(timed_out());
         }
-        protocol::write(
-            &mut channel.io,
-            &Message::Open {
-                service: open.service.clone(),
-                budget_ms: remaining.min(protocol::MAX_BUDGET_MS as u128) as u32,
-            },
+        timeout_at(
+            attachment_deadline.min(open.deadline),
+            protocol::write(
+                &mut channel.io,
+                &Message::Open {
+                    service: open.service.clone(),
+                    budget_ms: remaining.min(protocol::MAX_BUDGET_MS as u128) as u32,
+                },
+            ),
         )
-        .await?;
+        .await
+        .map_err(|_| timed_out())??;
         match protocol::read(&mut channel.io).await? {
             Message::Ready {} => Ok(()),
             Message::OpenFailed { code } => Err(io::Error::new(

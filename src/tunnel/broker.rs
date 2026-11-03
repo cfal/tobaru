@@ -305,7 +305,7 @@ mod tests {
         assert_eq!(peer.active.count(), 1);
         assert_eq!(peer.physical.count(), 0);
         session.request_data(&peer).unwrap();
-        let Message::CreateData { channel_id } = messages.recv().await.unwrap() else {
+        let Message::CreateData { channel_id } = messages.try_recv().unwrap() else {
             panic!()
         };
         assert_eq!(peer.physical.count(), 1);
@@ -380,7 +380,7 @@ mod tests {
         });
         tokio::task::yield_now().await;
         session.request_data(&peer).unwrap();
-        let Message::CreateData { channel_id } = messages.recv().await.unwrap() else {
+        let Message::CreateData { channel_id } = messages.try_recv().unwrap() else {
             panic!()
         };
         caller.abort();
@@ -397,6 +397,106 @@ mod tests {
         assert_eq!(peer.endpoint.accepted.count(), 0);
         assert_eq!(peer.endpoint.credits.count(), 0);
         assert!(!session.stop.is_cancelled());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn outstanding_credits_are_bounded_and_assignment_wakes_more_demand() {
+        let (peer, session, mut messages) = harness(6);
+        let mut callers: Vec<_> = (0..6)
+            .map(|_| Box::pin(peer.open("web", Instant::now() + Duration::from_secs(60))))
+            .collect();
+        for caller in &mut callers {
+            assert!(futures::poll!(caller).is_pending());
+        }
+        session.request_data(&peer).unwrap();
+        session.request_data(&peer).unwrap();
+        let mut ids = Vec::new();
+        for _ in 0..4 {
+            let Message::CreateData { channel_id } = messages.try_recv().unwrap() else {
+                panic!("expected creation credit")
+            };
+            ids.push(channel_id);
+        }
+        assert!(messages.try_recv().is_err());
+        let wake = session.wake.notified();
+        tokio::pin!(wake);
+        wake.as_mut().enable();
+        let assigned = session.attach(&ids[0], &[1]).unwrap();
+        assert!(futures::poll!(&mut wake).is_ready());
+        session.request_data(&peer).unwrap();
+        assert!(matches!(
+            messages.try_recv().unwrap(),
+            Message::CreateData { .. }
+        ));
+        assert!(messages.try_recv().is_err());
+        assert_eq!(session.state.lock().as_ref().unwrap().credits.len(), 4);
+        drop((callers, assigned));
+        session.close();
+        assert_eq!(peer.active.count(), 0);
+        assert_eq!(peer.pending.count(), 0);
+        assert_eq!(peer.physical.count(), 0);
+        assert_eq!(peer.endpoint.credits.count(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_callers_credit_can_serve_new_demand_and_ignores_late_failure() {
+        let (peer, session, mut messages) = harness(1);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut cancelled = Box::pin(peer.open("web", deadline));
+        assert!(futures::poll!(&mut cancelled).is_pending());
+        session.request_data(&peer).unwrap();
+        let Message::CreateData { channel_id } = messages.try_recv().unwrap() else {
+            panic!("expected creation credit")
+        };
+        drop(cancelled);
+        session.request_data(&peer).unwrap();
+        let mut caller = Box::pin(peer.open("web", deadline));
+        assert!(futures::poll!(&mut caller).is_pending());
+        session.request_data(&peer).unwrap();
+        assert!(messages.try_recv().is_err());
+        assert!(session.attach(&channel_id, &[2]).is_err());
+        assert_eq!(session.state.lock().as_ref().unwrap().credits.len(), 1);
+        let assigned = session.attach(&channel_id, &[1]).unwrap();
+        session.failed(&channel_id, &peer);
+        assert_eq!(session.state.lock().as_ref().unwrap().failures, 0);
+        assert!(!session.stop.is_cancelled());
+        assert_eq!(peer.active.count(), 1);
+        drop(assigned);
+        assert!(caller.await.is_err());
+        assert_eq!(peer.active.count(), 0);
+        assert_eq!(peer.pending.count(), 0);
+        assert_eq!(peer.physical.count(), 0);
+        assert_eq!(peer.endpoint.credits.count(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_attachment_releases_credit_without_consuming_live_demand() {
+        let (peer, session, mut messages) = harness(1);
+        let mut caller = Box::pin(peer.open("web", Instant::now() + Duration::from_secs(60)));
+        assert!(futures::poll!(&mut caller).is_pending());
+        session.request_data(&peer).unwrap();
+        let Message::CreateData { channel_id } = messages.try_recv().unwrap() else {
+            panic!("expected creation credit")
+        };
+        tokio::time::advance(Duration::from_secs(11)).await;
+        assert!(
+            matches!(session.attach(&channel_id, &[1]), Err(error) if error.kind() == io::ErrorKind::TimedOut)
+        );
+        assert_eq!(session.state.lock().as_ref().unwrap().opens.len(), 1);
+        assert_eq!(peer.active.count(), 1);
+        assert_eq!(peer.pending.count(), 1);
+        assert_eq!(peer.physical.count(), 0);
+        assert_eq!(peer.endpoint.credits.count(), 0);
+        session.request_data(&peer).unwrap();
+        let Message::CreateData { channel_id } = messages.try_recv().unwrap() else {
+            panic!("expected replacement credit")
+        };
+        drop(session.attach(&channel_id, &[1]).unwrap());
+        assert!(caller.await.is_err());
+        assert_eq!(peer.active.count(), 0);
+        assert_eq!(peer.pending.count(), 0);
+        assert_eq!(peer.physical.count(), 0);
+        assert_eq!(peer.endpoint.credits.count(), 0);
     }
 
     #[tokio::test(start_paused = true)]
@@ -438,7 +538,7 @@ mod tests {
         });
         tokio::task::yield_now().await;
         session.request_data(&peer).unwrap();
-        let Message::CreateData { channel_id } = messages.recv().await.unwrap() else {
+        let Message::CreateData { channel_id } = messages.try_recv().unwrap() else {
             panic!()
         };
         tokio::time::advance(Duration::from_secs(11)).await;
