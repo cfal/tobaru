@@ -35,7 +35,9 @@ has a 30-second deadline and cleans up its child process and sockets. It also
 checks that invalid reloads retain the last-good configuration and repeated
 atomic file replacements remain observable.
 Listener-failure checks cover occupied ports and TCP accept failure under a
-child-local file-descriptor limit; both must exit nonzero without panicking.
+child-local file-descriptor limit. Bind failures must exit nonzero without
+panicking; accept failures must leave the process running and recover after
+file descriptors are released.
 
 The HTTP/2 test additionally requires `openssl` for ephemeral certificates. Its
 independent Node HTTP/2 peers cover default plaintext H1/H2 detection, protocol
@@ -88,6 +90,14 @@ passthrough, Upgrade/read-ahead, control-loss isolation, invalid/valid reloads, 
 intersection, agent-only startup, and process restart. Rust tests exercise framing,
 counter conservation, cancellation, stale generation fencing, and non-abortable DNS
 ownership using a real blocking wrapper.
+
+The reverse-tunnel smoke also runs a separate hub with a child-local 64-FD limit.
+Incomplete ordinary HTTP requests exhaust its descriptors before a connection to
+the tunnel listener triggers a real `EMFILE`. Two exhaustion/recovery cycles must
+preserve an established tunnel stream and the same ordinary HTTP keep-alive
+connection. After release, both listeners must recover and accept fresh traffic;
+the tunnel peer has zero warm spares, so recovery requires a new authenticated
+data channel. Only the child process's resource limit is changed.
 
 These local tests do not themselves establish NAT/firewall isolation or Internet-scale
 performance. Before deployment, run the same pair in an isolated network namespace or

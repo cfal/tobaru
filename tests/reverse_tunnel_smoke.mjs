@@ -57,8 +57,12 @@ async function certificate(name) {
   return { certPath, keyPath, cert, key: await readFile(keyPath), pin: new X509Certificate(cert).fingerprint256 };
 }
 
-function launch(config) {
-  const child = spawn(binary, ['-t', '1', config], { stdio: ['ignore', 'ignore', 'pipe'], env: { ...process.env, RUST_LOG: 'info' } });
+function launch(config, { limitedFds = false } = {}) {
+  const command = limitedFds ? '/bin/sh' : binary;
+  const args = limitedFds
+    ? ['-c', 'ulimit -n 64 || exit; exec "$@"', 'tunnel-fd-test', binary, '-t', '1', config]
+    : ['-t', '1', config];
+  const child = spawn(command, args, { stdio: ['ignore', 'ignore', 'pipe'], env: { ...process.env, RUST_LOG: 'info' } });
   child.logs = '';
   child.stderr.on('data', bytes => { child.logs = (child.logs + bytes).slice(-64_000); });
   child.closed = once(child, 'close');
@@ -159,6 +163,84 @@ async function rejectedTls(port, identity, message, alpn = 'tobaru-reverse/1') {
     socket.once('close', () => { clearTimeout(timer); resolve(); });
   });
   assert.equal(bytes, 0, 'Rejected peer received a successful protocol response');
+}
+
+async function assertAcceptRecovery(hubIdentity, agentIdentity, originPort, webPort) {
+  const hubPort = await freePort();
+  const publicPort = await freePort();
+  const ordinaryPort = await freePort();
+  const publicPath = path.join(root, 'fd-public.json');
+  const clientPath = path.join(root, 'fd-client.json');
+  await writeFile(publicPath, JSON.stringify([
+    { tunnel_server: 'edge', address: `0.0.0.0:${hubPort}`,
+      server_tls: { cert: hubIdentity.certPath, key: hubIdentity.keyPath },
+      peers: { home: { client_fingerprints: [agentIdentity.pin], services: ['raw'], idle_connections: 0 } } },
+    { address: `0.0.0.0:${publicPort}`, target: { allowlist: 'all',
+      location: { tunnel: { server: 'edge', peer: 'home', service: 'raw' } } } },
+    { address: `0.0.0.0:${ordinaryPort}`, target: { allowlist: 'all', http_protocols: ['http1'],
+      default_http_action: { type: 'forward', location: `127.0.0.1:${webPort}` } } },
+  ]));
+  await writeFile(clientPath, JSON.stringify([{ tunnel_client: 'home', server: `127.0.0.1:${hubPort}`,
+    client_tls: { verify: false, server_fingerprints: [hubIdentity.pin], sni_hostname: 'localhost',
+      cert: agentIdentity.certPath, key: agentIdentity.keyPath },
+    services: { raw: { location: `127.0.0.1:${originPort}` } },
+  }]));
+  const hub = launch(publicPath, { limitedFds: true });
+  const client = launch(clientPath);
+  const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 1 });
+  agents.push(httpAgent);
+  const fillers = [];
+  let active;
+  try {
+    await eventually(async () => assert.equal(JSON.parse((await request(ordinaryPort, '/before', httpAgent)).body).path, '/before'));
+    const ordinary = Object.values(httpAgent.freeSockets).flat()[0];
+    assert(ordinary && !ordinary.destroyed);
+    active = await eventually(() => raw(publicPort));
+    for (let cycle = 0; cycle < 2; cycle++) {
+      const logOffset = hub.logs.length;
+      async function logged(pattern) {
+        await eventually(() => {
+          assert.equal(hub.exitCode, null, hub.logs);
+          assert.equal(hub.signalCode, null, hub.logs);
+          assert.match(hub.logs.slice(logOffset), pattern);
+        }, 5000);
+      }
+      // Incomplete ordinary requests hold FDs without the tunnel handshake timeout.
+      for (let i = 0; i < 96; i++) {
+        const socket = track(net.connect(ordinaryPort, '127.0.0.1'));
+        socket.once('connect', () => socket.write('GET /held HTTP/1.1\r\nHost: localhost\r\n'));
+        fillers.push(socket);
+      }
+      await logged(/TCP accept failed.*\(os error 24\)/);
+      fillers.push(track(net.connect(hubPort, '127.0.0.1')));
+      await logged(/Tunnel accept failed.*\(os error 24\)/);
+      await echo(active, `under-pressure-${cycle}`);
+      assert.equal(JSON.parse((await request(ordinaryPort, '/during', httpAgent)).body).path, '/during');
+      assert.equal(Object.values(httpAgent.freeSockets).flat()[0], ordinary);
+      assert(!ordinary.destroyed);
+      assert.doesNotMatch(hub.logs.slice(logOffset), /Tunnel accept recovered/);
+
+      for (const socket of fillers.splice(0)) socket.destroy();
+      const fresh = await eventually(() => raw(publicPort));
+      await echo(fresh, `recovered-${cycle}`);
+      fresh.destroy();
+      await echo(active, `survived-${cycle}`);
+      assert.equal(JSON.parse((await request(ordinaryPort, '/after')).body).path, '/after');
+      await logged(/Tunnel accept recovered/);
+      await logged(/TCP accept recovered/);
+      assert.equal(hub.exitCode, null, hub.logs);
+      assert.equal(hub.signalCode, null, hub.logs);
+      assert.doesNotMatch(hub.logs, /panicked/);
+    }
+  } finally {
+    for (const socket of fillers) socket.destroy();
+    active?.destroy();
+    httpAgent.destroy();
+    for (const child of [client, hub]) {
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    }
+    await Promise.all([client.closed, hub.closed]);
+  }
 }
 
 try {
@@ -398,7 +480,8 @@ try {
   launch(clientPath);
   await eventually(async () => assert.equal((await request(publicHttp, '/home/restarted')).status, 200));
   assert.equal(publicChild.exitCode, null);
-  console.log('reverse tunnel smoke passed: mTLS, pool growth, TCP/Unix, half-close, H1/H2, origin TLS, control loss, reload, reconnect');
+  await assertAcceptRecovery(hubIdentity, agentIdentity, rawPort, webPort);
+  console.log('reverse tunnel smoke passed: mTLS, pool growth, TCP/Unix, half-close, H1/H2, origin TLS, control loss, reload, reconnect, FD exhaustion recovery');
 } catch (error) {
   for (const child of children) console.error(child.logs);
   throw error;
