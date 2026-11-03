@@ -44,31 +44,33 @@ Tunnel limits are finite and independent of ordinary frontend limits:
 | `tunnel_server.max_handshakes` | 32 | Concurrent TLS handshakes |
 | `peers.NAME.max_active_connections` | 128 | Queued/Opening backend leases plus returned streams, including cached H1/H2 backends |
 | `peers.NAME.max_pending_opens` | 32 | Opens waiting for a channel or carrier Ready |
-| `peers.NAME.idle_connections` | 4 | Desired spare data sockets; zero means demand-only creation |
-| `peers.NAME.open_timeout_secs` | 10 | Pool wait, origin setup, and optional origin TLS; the agent's local dial is independently capped at 10 seconds |
+| `peers.NAME.open_timeout_secs` | 10 | Queue wait, data-channel creation, origin setup, and optional origin TLS; the agent's local dial is independently capped at 10 seconds |
 | `tunnel_client.max_active_connections` | 128 | Agent-local dials and active origin connections |
 | `tunnel_client.max_data_connections` | 256 | Agent data sockets/reservations across control reconnections |
 | `tunnel_client.max_concurrent_local_dials` | 16 | Concurrent agent-origin connection setup |
 
-Connection counts are at most 65,536, pending/local-dial counts at most 4,096, idle
-spares at most 256, and setup time at most 86,400 seconds. All counts/times are
-positive except idle spares. Pending/local-dial limits cannot exceed their active
+Connection counts are at most 65,536, pending/local-dial counts at most 4,096,
+and setup time at most 86,400 seconds. All counts/times are positive.
+Pending/local-dial limits cannot exceed their active
 limits; handshake limits cannot exceed the endpoint connection limit. `null` is not
 an unlimited opt-out. Configure the client's data cap at least as high as the hub's
-peer active plus idle budgets, unless smaller local capacity is intentional.
+peer active budget, unless smaller local capacity is intentional.
 
-Four creation credits and four concurrent agent data dials bound pool refill. A
-burst larger than the spare pool can wait for newly requested outbound channels;
-it cannot create an unbounded pending queue. Credit expiry and failed creation use
+Only the control connection is maintained without demand. Four creation credits and
+four concurrent agent data dials bound on-demand channel creation. Larger bursts
+wait for creation capacity; they cannot create an unbounded pending queue. Each
+authenticated attachment claims the oldest live queued open; an attachment with no
+remaining demand is closed. Credit expiry and failed creation use
 bounded backoff. Cached HTTP connections retain active leases between requests.
 The peer's active limit is not an HTTP-request rate or stream count.
 
 Outer setup, including DNS, has a ten-second deadline; ingress additionally requires
 ClientHello within three seconds. Control pings occur every 20 seconds with a
 60-second matching-pong deadline. The agent closes control after 60 seconds without
-a valid frame. Idle channels have their own 20-second ping/10-second pong exchange;
-agent idle receive expiry is 40 seconds. No tunnel heartbeat bytes are injected into
-active payloads. The outer TCP carrier enables nodelay and keepalive (20-second idle,
+a valid frame. Data attachment, including receipt of the first Open, shares a single
+ten-second deadline starting when the agent receives CreateData. Data channels have
+no idle wait or heartbeat; no tunnel heartbeat bytes are injected into active
+payloads. The outer TCP carrier enables nodelay and keepalive (20-second idle,
 10-second interval). OS probe counts still affect TCP failure detection.
 
 Sixteen process-wide tunnel DNS permits remain held by OS resolver jobs until the
@@ -77,12 +79,12 @@ lookups can therefore delay hostname-based hub reconnects. IP literals and cache
 addresses for data dials bypass that pool. There is no unbounded resolver retry queue.
 The 32 KiB rustls write-buffer setting does not bound total TLS or socket memory.
 
-Accepted sockets, spare channels, origin sockets, visitor sockets, and one additional
+Accepted sockets, in-flight data connections, origin sockets, visitor sockets, and one additional
 shutdown-handle FD per active public tunnel all consume resources. Size process/host
 limits accordingly. The handshake cap is not denial-of-service protection: unauthorized
 traffic can occupy it. Restrict the dedicated ingress port at the firewall where possible.
 
-Transient control loss closes idle channels and fails unfinished opens, but established
+Transient control loss closes unassigned data connections and fails unfinished opens, but established
 independent data streams can continue, including existing H1/H2 backend reuse. New
 physical opens fail promptly until a client registers again. No application request or
 failed TCP stream is replayed. Client reconnect uses exponential backoff with jitter,

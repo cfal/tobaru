@@ -43,8 +43,6 @@ pub struct TunnelPeerConfig {
     pub max_active_connections: usize,
     #[serde(default = "default_pending_limit")]
     pub max_pending_opens: usize,
-    #[serde(default = "default_idle")]
-    pub idle_connections: usize,
     #[serde(default = "default_timeout")]
     pub open_timeout_secs: u64,
 }
@@ -97,9 +95,6 @@ fn default_data_limit() -> usize {
 }
 fn default_local_dials() -> usize {
     16
-}
-fn default_idle() -> usize {
-    4
 }
 fn default_timeout() -> u64 {
     10
@@ -163,10 +158,6 @@ impl TunnelServerConfig {
                 peer.max_pending_opens,
                 peer.max_active_connections.min(4096),
                 "max_pending_opens",
-            )?;
-            require(
-                peer.idle_connections <= 256,
-                "Tunnel idle_connections exceeds 256",
             )?;
             require(
                 (1..=86400).contains(&peer.open_timeout_secs),
@@ -262,6 +253,11 @@ mod tests {
             .unwrap()
             .validate()
             .unwrap();
+        for idle in [json!(0), json!(4), json!(null)] {
+            let mut bad = value.clone();
+            bad["peers"]["home"]["idle_connections"] = idle;
+            assert!(serde_json::from_value::<TunnelServerConfig>(bad).is_err());
+        }
         for (key, bad_value) in [
             ("max_connections", json!(0)),
             ("max_handshakes", json!(1025)),

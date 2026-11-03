@@ -3,9 +3,17 @@
 ## Native Reverse Tunnels
 
 `tunnel_server`, `tunnel_client`, and object-form `location.tunnel` are opt-in additions.
-Existing configurations need no migration. See the [configuration reference](CONFIG.md#reverse-tunnels)
+Existing non-tunnel configurations need no migration. See the [configuration reference](CONFIG.md#reverse-tunnels)
 and public/client examples for certificate provisioning and named service authorization.
 Client-only processes are supported; `--dry-run` performs no binds or outbound dials.
+
+Earlier experimental tunnel builds used warm data connections and ALPN
+`tobaru-reverse/1`. Data channels are now demand-only, using `tobaru-reverse/2`.
+Update hub and agent together; there is no legacy protocol fallback. Remove
+`peers.NAME.idle_connections`, including explicit zero values, before upgrading.
+The removed field is rejected rather than silently ignored. Without traffic only
+the control connection remains; every fresh backend requires outbound TCP/mTLS setup.
+Existing HTTP backend reuse is unchanged.
 
 Valid local reloads close all tunnel connections, including active streams, even when
 the edit is unrelated to tunnels. Invalid reloads retain the running configuration.

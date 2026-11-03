@@ -3,7 +3,8 @@ use std::io;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const ALPN: &[u8] = b"tobaru-reverse/1";
+pub const ALPN: &[u8] = b"tobaru-reverse/2";
+pub const VERSION: u32 = 2;
 pub const MAX_FRAME: usize = 4096;
 pub const MAX_BUDGET_MS: u32 = 86_400_000;
 
@@ -67,7 +68,6 @@ pub enum Message {
         session_id: Id,
         channel_id: Id,
     },
-    DataReady {},
     Open {
         service: String,
         budget_ms: u32,
@@ -99,8 +99,8 @@ impl Message {
                 version,
                 peer,
                 services,
-            } => *version == 1 && valid_name(peer) && valid_services(services),
-            Self::DataHello { version, peer, .. } => *version == 1 && valid_name(peer),
+            } => *version == VERSION && valid_name(peer) && valid_services(services),
+            Self::DataHello { version, peer, .. } => *version == VERSION && valid_name(peer),
             Self::ControlReady { services, .. } => valid_services(services),
             Self::Open { service, budget_ms } => {
                 valid_name(service) && (1..=MAX_BUDGET_MS).contains(budget_ms)
@@ -196,6 +196,22 @@ mod tests {
     #[test]
     fn messages_reject_unknown_fields_ids_and_invalid_budgets() {
         assert!(serde_json::from_str::<Message>(r#"{"type":"ready","extra":true}"#).is_err());
+        assert!(serde_json::from_str::<Message>(r#"{"type":"data_ready"}"#).is_err());
+        for version in [1, VERSION, VERSION + 1] {
+            let hello = Message::ControlHello {
+                version,
+                peer: "home".into(),
+                services: vec!["web".into()],
+            };
+            assert_eq!(hello.validate().is_ok(), version == VERSION);
+            let hello = Message::DataHello {
+                version,
+                peer: "home".into(),
+                session_id: Id::new(),
+                channel_id: Id::new(),
+            };
+            assert_eq!(hello.validate().is_ok(), version == VERSION);
+        }
         assert!(serde_json::from_str::<Id>(r#""ABC""#).is_err());
         for budget_ms in [0, MAX_BUDGET_MS + 1] {
             assert!(Message::Open {

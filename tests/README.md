@@ -95,11 +95,13 @@ The reverse-tunnel smoke starts separate public and NAT-side processes, physical
 TCP/Unix/HTTP origins, and a half-close-preserving TCP relay used to drop only the
 control connection. It requires Node 22+ and OpenSSL, has a 120-second overall budget,
 and removes its certificates/configs beneath `$HOME/tmp`. It checks mTLS identity and
-ALPN rejection, strict config validation, pool growth above warm-spare size, raw
+ALPN/version rejection, strict config validation, no speculative or replenished data
+channels, demand bursts above the creation concurrency limit, raw
 server-first data and half-close, H1/H2 forwarding and reuse, origin TLS/pin failures,
 passthrough, Upgrade/read-ahead, control-loss isolation, invalid/valid reloads, service
 intersection, agent-only startup, and process restart. Rust tests exercise framing,
-counter conservation, cancellation, stale generation fencing, and non-abortable DNS
+FIFO attachment assignment, counter conservation, cancellation, the first-Open
+deadline, stale generation fencing, and non-abortable DNS
 ownership using a real blocking wrapper.
 
 The reverse-tunnel smoke also runs a separate hub with a child-local 64-FD limit.
@@ -108,7 +110,7 @@ the tunnel listener triggers a real `EMFILE`. Two exhaustion/recovery cycles hol
 pressure beyond the one-second accept retry and must preserve an established
 tunnel stream and the same ordinary HTTP keep-alive connection, both during
 pressure and after release. Both listeners must recover and accept fresh traffic;
-the tunnel peer has zero warm spares, so recovery requires a new authenticated
+data channels are demand-only, so recovery requires a new authenticated
 data channel. Only the child process's resource limit is changed.
 
 These local tests do not themselves establish NAT/firewall isolation or Internet-scale

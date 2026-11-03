@@ -969,11 +969,11 @@ reloads retain the running configuration. See [tunnel operating limits](OPERATIN
 ## Reverse Tunnels
 
 A NAT-side `tunnel_client` opens an mTLS control connection to a public
-`tunnel_server`. The server requests additional outbound data connections as demand
-grows. `idle_connections` is a warm-spare target, not the active connection limit.
-One data socket serves one physical backend connection; HTTP keep-alive and H2 reuse
-do not allocate another data socket for every request. Consumed sockets are never
-returned to the idle pool.
+`tunnel_server`. Only the control connection is maintained without traffic. The server
+requests outbound data connections only for queued backend opens; no spare connections
+are prewarmed or retained. Each fresh physical backend pays the outbound TCP/mTLS setup
+cost. One data socket serves one physical backend connection and closes with it;
+HTTP keep-alive and H2 reuse do not allocate another data socket for every request.
 
 Public configuration:
 
@@ -1030,8 +1030,10 @@ permit key rotation; a pin cannot identify two peers on one hub. Control and dat
 sockets must use the same leaf certificate within a session. Public-server pinning
 uses `client_tls.server_fingerprints`; `verify: false` requires nonempty valid pins.
 With `verify: true` and pins, both normal certificate verification and pinning apply.
-Both roles require certificates and keys. ALPN is fixed to `tobaru-reverse/1`; neither
-plaintext nor user-supplied tunnel ALPN is supported.
+Both roles require certificates and keys. ALPN is fixed to `tobaru-reverse/2`; neither
+plaintext nor user-supplied tunnel ALPN is supported. Earlier experimental pooled
+peers using `/1` are incompatible: update hub and agent together and remove
+`idle_connections` from configuration, including explicit zero values.
 
 Names are case-sensitive ASCII letters, digits, `_`, or `-`, 1 to 64 bytes. The
 hub allows at most 128 peers and 32 services per peer; a client exports at most 32

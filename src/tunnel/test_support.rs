@@ -12,11 +12,10 @@ use crate::rustls_util::{
     create_client_config_with_cert, create_server_config, load_certs, load_private_key,
 };
 
-pub fn harness(active: usize, idle: usize) -> (Arc<Peer>, Arc<Session>, mpsc::Receiver<Message>) {
+pub fn harness(active: usize) -> (Arc<Peer>, Arc<Session>, mpsc::Receiver<Message>) {
     let config = serde_json::from_value(serde_json::json!({
         "client_fingerprints":["ab".repeat(32)], "services":["web"],
         "max_active_connections":active, "max_pending_opens":active,
-        "idle_connections":idle,
     }))
     .unwrap();
     let gate = Arc::new(Gate::default());

@@ -123,7 +123,7 @@ impl Client {
         protocol::write(
             &mut io,
             &Message::ControlHello {
-                version: 1,
+                version: protocol::VERSION,
                 peer: self.config.tunnel_client.clone(),
                 services,
             },
@@ -225,7 +225,7 @@ impl Client {
         session: Id,
         channel: &Id,
         job: Permit,
-    ) -> io::Result<ClientIo> {
+    ) -> io::Result<(ClientIo, String, u32)> {
         let dial = self
             .data_dial_slots
             .clone()
@@ -236,7 +236,7 @@ impl Client {
         protocol::write(
             &mut stream,
             &Message::DataHello {
-                version: 1,
+                version: protocol::VERSION,
                 peer: self.config.tunnel_client.clone(),
                 session_id: session,
                 channel_id: channel.clone(),
@@ -245,10 +245,10 @@ impl Client {
         .await?;
         drop(dial);
         drop(job);
-        if !matches!(protocol::read(&mut stream).await?, Message::DataReady {}) {
-            return Err(invalid());
+        match protocol::read(&mut stream).await? {
+            Message::Open { service, budget_ms } => Ok((stream, service, budget_ms)),
+            _ => Err(invalid()),
         }
-        Ok(stream)
     }
 
     async fn connect_export(
@@ -299,30 +299,13 @@ impl Client {
         let _socket = socket;
         let mut attached = false;
         let setup = async {
-            let mut stream = timeout_at(
+            let (mut stream, service, budget_ms) = timeout_at(
                 attach_deadline,
                 self.attach_data(address, session, &channel, job),
             )
             .await
             .map_err(|_| timed_out())??;
             attached = true;
-            let (service, budget_ms) = loop {
-                match timeout(Duration::from_secs(40), protocol::read(&mut stream))
-                    .await
-                    .map_err(|_| timed_out())??
-                {
-                    Message::Ping { nonce } => {
-                        timeout(
-                            Duration::from_secs(10),
-                            protocol::write(&mut stream, &Message::Pong { nonce }),
-                        )
-                        .await
-                        .map_err(|_| timed_out())??;
-                    }
-                    Message::Open { service, budget_ms } => break (service, budget_ms),
-                    _ => return Err(invalid()),
-                }
-            };
             let local = self.connect_export(&service, &accepted_services);
             let open_deadline =
                 Instant::now() + Duration::from_millis(u64::from(budget_ms.min(10_000)));
@@ -451,6 +434,7 @@ mod tests {
         listener: &TcpListener,
         tls: &Tls,
         full_writer: bool,
+        deadline: Instant,
     ) -> (
         tokio::task::JoinHandle<()>,
         super::super::stream::ServerIo,
@@ -475,7 +459,7 @@ mod tests {
             writer,
             socket: client.sockets.acquire(256).unwrap(),
             job: client.data_setup_jobs.acquire(8).unwrap(),
-            deadline: Instant::now() + Duration::from_secs(10),
+            deadline,
         };
         let c = client.clone();
         let task = tokio::spawn(async move {
@@ -499,11 +483,14 @@ mod tests {
     async fn attached_failures_do_not_send_create_failed_or_stop_control() {
         let (client, listener, tls) = harness().await;
         for full_writer in [false, true] {
-            let (task, mut stream, stop, mut messages) =
-                start_data(&client, &listener, &tls, full_writer).await;
-            protocol::write(&mut stream, &Message::DataReady {})
-                .await
-                .unwrap();
+            let (task, mut stream, stop, mut messages) = start_data(
+                &client,
+                &listener,
+                &tls,
+                full_writer,
+                Instant::now() + Duration::from_secs(10),
+            )
+            .await;
             protocol::write(
                 &mut stream,
                 &Message::Open {
@@ -540,8 +527,14 @@ mod tests {
     async fn preattachment_failures_still_notify_control_or_stop_on_overflow() {
         let (client, listener, tls) = harness().await;
         for full_writer in [false, true] {
-            let (task, mut stream, stop, mut messages) =
-                start_data(&client, &listener, &tls, full_writer).await;
+            let (task, mut stream, stop, mut messages) = start_data(
+                &client,
+                &listener,
+                &tls,
+                full_writer,
+                Instant::now() + Duration::from_secs(10),
+            )
+            .await;
             protocol::write(&mut stream, &Message::Ready {})
                 .await
                 .unwrap();
@@ -560,11 +553,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn flushed_data_hello_releases_dial_slots_before_data_ready() {
+    async fn flushed_data_hello_releases_dial_slots_before_open() {
         let (client, listener, tls) = harness().await;
         let mut pending = Vec::new();
         for _ in 0..5 {
-            pending.push(start_data(&client, &listener, &tls, false).await);
+            pending.push(
+                start_data(
+                    &client,
+                    &listener,
+                    &tls,
+                    false,
+                    Instant::now() + Duration::from_secs(10),
+                )
+                .await,
+            );
             assert_eq!(client.data_dial_slots.available_permits(), 4);
             assert_eq!(client.data_setup_jobs.count(), 0);
         }
@@ -600,31 +602,98 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn idle_data_receive_deadline_closes_without_eof_or_control_failure() {
+    async fn missing_open_expires_within_the_original_attachment_deadline() {
         let (client, listener, tls) = harness().await;
-        let (task, mut stream, stop, mut messages) =
-            start_data(&client, &listener, &tls, false).await;
-        protocol::write(&mut stream, &Message::DataReady {})
-            .await
-            .unwrap();
-        protocol::write(&mut stream, &Message::Ping { nonce: 5 })
-            .await
-            .unwrap();
-        assert!(matches!(
-            protocol::read(&mut stream).await.unwrap(),
-            Message::Pong { nonce: 5 }
-        ));
+        let (task, _stream, stop, mut messages) = start_data(
+            &client,
+            &listener,
+            &tls,
+            false,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await;
         tokio::time::pause();
-        tokio::time::advance(Duration::from_secs(39)).await;
+        tokio::time::advance(Duration::from_secs(4)).await;
         assert!(!task.is_finished());
         tokio::time::advance(Duration::from_secs(1)).await;
         timeout(Duration::from_millis(1), task)
             .await
-            .expect("idle data exceeded its forty-second receive deadline")
+            .expect("attachment restarted its deadline while waiting for Open")
             .unwrap();
         assert!(!stop.is_cancelled());
-        assert!(messages.try_recv().is_err());
+        assert!(matches!(
+            messages.try_recv().unwrap(),
+            Message::CreateFailed { .. }
+        ));
         assert_eq!(client.sockets.count(), 0);
+        assert_eq!(client.active.count(), 0);
+        assert_eq!(client.local_dials.count(), 0);
+    }
+
+    #[tokio::test]
+    async fn origin_is_not_dialed_until_open_and_control_loss_preserves_copying() {
+        let (mut client, listener, tls) = harness().await;
+        let origin = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        Arc::get_mut(&mut client)
+            .unwrap()
+            .config
+            .services
+            .get_mut("web")
+            .unwrap()
+            .location = serde_json::from_value(serde_json::json!(format!(
+            "127.0.0.1:{}",
+            origin.local_addr().unwrap().port()
+        )))
+        .unwrap();
+        let (task, mut stream, stop, mut messages) = start_data(
+            &client,
+            &listener,
+            &tls,
+            false,
+            Instant::now() + Duration::from_secs(10),
+        )
+        .await;
+        assert!(timeout(Duration::from_millis(50), origin.accept())
+            .await
+            .is_err());
+        assert_eq!(client.active.count(), 0);
+        protocol::write(
+            &mut stream,
+            &Message::Open {
+                service: "web".into(),
+                budget_ms: 10_000,
+            },
+        )
+        .await
+        .unwrap();
+        let (mut local, _) = timeout(Duration::from_secs(1), origin.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            protocol::read(&mut stream).await.unwrap(),
+            Message::Ready {}
+        ));
+        stop.cancel();
+        use tokio::io::AsyncWriteExt;
+        local.write_all(b"greeting").await.unwrap();
+        let mut bytes = [0; 8];
+        timeout(Duration::from_secs(1), stream.read_exact(&mut bytes))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&bytes, b"greeting");
+        assert_eq!(client.active.count(), 1);
+        assert_eq!(client.sockets.count(), 1);
+        assert_eq!(client.local_dials.count(), 0);
+        drop((stream, local));
+        timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(client.active.count(), 0);
+        assert_eq!(client.sockets.count(), 0);
+        assert!(messages.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -661,11 +730,14 @@ mod tests {
         for close_hub in [true, false] {
             let (mut client, listener, tls) = harness().await;
             Arc::get_mut(&mut client).unwrap().resolver = Resolver::with_capacity(0);
-            let (task, mut stream, stop, mut messages) =
-                start_data(&client, &listener, &tls, false).await;
-            protocol::write(&mut stream, &Message::DataReady {})
-                .await
-                .unwrap();
+            let (task, mut stream, stop, mut messages) = start_data(
+                &client,
+                &listener,
+                &tls,
+                false,
+                Instant::now() + Duration::from_secs(10),
+            )
+            .await;
             protocol::write(
                 &mut stream,
                 &Message::Open {

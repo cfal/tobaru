@@ -7,7 +7,6 @@
     home:
       client_fingerprints: ["<home-agent certificate SHA-256>"]
       services: [web]
-      idle_connections: 4
       max_active_connections: 128
 
 - address: 0.0.0.0:443

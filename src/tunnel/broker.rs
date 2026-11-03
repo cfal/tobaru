@@ -163,7 +163,6 @@ pub struct Session {
 pub struct SessionState {
     pub opens: VecDeque<Open>,
     pub credits: HashMap<Id, Credit>,
-    pub idle: usize,
     failures: u32,
     retry_at: Instant,
 }
@@ -185,7 +184,6 @@ impl Session {
             state: Mutex::new(Some(SessionState {
                 opens: VecDeque::new(),
                 credits: HashMap::new(),
-                idle: 0,
                 failures: 0,
                 retry_at: Instant::now(),
             })),
@@ -211,7 +209,7 @@ impl Session {
         self.wake.notify_waiters();
     }
 
-    pub fn attach(&self, id: &Id, fingerprint: &[u8], peer: &Peer) -> io::Result<Credit> {
+    pub fn attach(&self, id: &Id, fingerprint: &[u8]) -> io::Result<(Credit, Open)> {
         if self.fingerprint != fingerprint {
             return Err(unavailable());
         }
@@ -224,15 +222,12 @@ impl Session {
         state.failures = 0;
         state.retry_at = Instant::now();
         state.prune_opens();
-        if state.idle >= peer.config.idle_connections + state.opens.len() {
-            return Err(unavailable());
-        }
-        state.idle += 1;
+        let open = state.opens.pop_front().ok_or_else(unavailable)?;
         self.wake.notify_waiters();
-        Ok(credit)
+        Ok((credit, open))
     }
 
-    pub fn refill(&self, peer: &Peer) -> io::Result<()> {
+    pub fn request_data(&self, peer: &Peer) -> io::Result<()> {
         let _gate = peer.gate.enter()?;
         let mut guard = self.state.lock();
         let state = guard.as_mut().ok_or_else(unavailable)?;
@@ -251,13 +246,9 @@ impl Session {
         if state.retry_at > Instant::now() || self.services.is_empty() {
             return Ok(());
         }
-        let wanted = (peer.config.idle_connections + state.opens.len())
-            .saturating_sub(state.idle + state.credits.len());
+        let wanted = state.opens.len().saturating_sub(state.credits.len());
         for _ in 0..wanted.min(4usize.saturating_sub(state.credits.len())) {
-            let Ok(physical) = peer
-                .physical
-                .acquire(peer.config.max_active_connections + peer.config.idle_connections)
-            else {
+            let Ok(physical) = peer.physical.acquire(peer.config.max_active_connections) else {
                 break;
             };
             let Ok(endpoint) = peer.endpoint.reserve() else {
@@ -295,60 +286,16 @@ impl SessionState {
     }
 }
 
-pub struct Idle {
-    pub session: Arc<Session>,
-    counted_as_idle: bool,
-}
-
-impl Idle {
-    pub fn new(session: Arc<Session>) -> Self {
-        Self {
-            session,
-            counted_as_idle: true,
-        }
-    }
-
-    pub fn claim(&mut self, peer: &Peer) -> io::Result<Option<Open>> {
-        let _gate = peer.gate.enter()?;
-        let mut guard = self.session.state.lock();
-        let state = guard.as_mut().ok_or_else(unavailable)?;
-        while let Some(open) = state.opens.pop_front() {
-            if open.reply.is_closed() || open.deadline <= Instant::now() {
-                continue;
-            }
-            state.idle -= 1;
-            self.counted_as_idle = false;
-            self.session.wake.notify_waiters();
-            return Ok(Some(open));
-        }
-        if state.idle > peer.config.idle_connections {
-            state.idle -= 1;
-            self.counted_as_idle = false;
-            return Err(unavailable());
-        }
-        Ok(None)
-    }
-}
-
-impl Drop for Idle {
-    fn drop(&mut self) {
-        if self.counted_as_idle {
-            if let Some(state) = self.session.state.lock().as_mut() {
-                state.idle -= 1;
-            }
-        }
-        self.session.wake.notify_waiters();
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::test_support::harness;
     use super::*;
 
     #[tokio::test(start_paused = true)]
-    async fn zero_idle_at_active_limit_can_create_its_first_channel() {
-        let (peer, session, mut messages) = harness(1, 0);
+    async fn demand_at_active_limit_can_create_its_first_channel() {
+        let (peer, session, mut messages) = harness(1);
+        session.request_data(&peer).unwrap();
+        assert!(messages.try_recv().is_err());
         let p = peer.clone();
         let pending = tokio::spawn(async move {
             p.open("web", Instant::now() + Duration::from_secs(10))
@@ -357,17 +304,15 @@ mod tests {
         tokio::task::yield_now().await;
         assert_eq!(peer.active.count(), 1);
         assert_eq!(peer.physical.count(), 0);
-        session.refill(&peer).unwrap();
+        session.request_data(&peer).unwrap();
         let Message::CreateData { channel_id } = messages.recv().await.unwrap() else {
             panic!()
         };
         assert_eq!(peer.physical.count(), 1);
         let _accepted = peer.endpoint.accept().unwrap();
-        let credit = session.attach(&channel_id, &[1], &peer).unwrap();
-        let mut idle = Idle::new(session.clone());
-        let opening = idle.claim(&peer).unwrap().unwrap();
+        let (credit, opening) = session.attach(&channel_id, &[1]).unwrap();
         drop(credit._endpoint);
-        session.refill(&peer).unwrap();
+        session.request_data(&peer).unwrap();
         assert!(
             messages.try_recv().is_err(),
             "Opening is not additional unassigned demand"
@@ -379,27 +324,73 @@ mod tests {
         assert_eq!(peer.active.count(), 0);
         assert_eq!(peer.pending.count(), 0);
         assert_eq!(peer.physical.count(), 0);
+        session.request_data(&peer).unwrap();
+        assert!(messages.try_recv().is_err());
     }
 
     #[tokio::test(start_paused = true)]
-    async fn cancelled_demand_rejects_late_attachment_without_retaining_spares() {
-        let (peer, session, mut messages) = harness(1, 0);
+    async fn attachments_claim_live_demand_in_fifo_order_not_credit_order() {
+        let (peer, session, mut messages) = harness(3);
+        let first_deadline = Instant::now() + Duration::from_secs(60);
+        let last_deadline = first_deadline + Duration::from_secs(2);
+        let mut first = Box::pin(peer.open("web", first_deadline));
+        let mut cancelled = Box::pin(peer.open("web", first_deadline + Duration::from_secs(1)));
+        let mut last = Box::pin(peer.open("web", last_deadline));
+        assert!(futures::poll!(&mut first).is_pending());
+        assert!(futures::poll!(&mut cancelled).is_pending());
+        assert!(futures::poll!(&mut last).is_pending());
+        session.request_data(&peer).unwrap();
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            let Message::CreateData { channel_id } = messages.try_recv().unwrap() else {
+                panic!("expected creation credit")
+            };
+            ids.push(channel_id);
+        }
+        drop(cancelled);
+        let (first_credit, first_open) = session.attach(&ids[2], &[1]).unwrap();
+        assert_eq!(first_open.deadline, first_deadline);
+        assert!(session.attach(&ids[2], &[1]).is_err());
+        let (last_credit, last_open) = session.attach(&ids[0], &[1]).unwrap();
+        assert_eq!(last_open.deadline, last_deadline);
+        assert!(session.attach(&ids[1], &[1]).is_err());
+        session.request_data(&peer).unwrap();
+        assert!(messages.try_recv().is_err());
+        assert_eq!(peer.active.count(), 2);
+        assert_eq!(peer.pending.count(), 2);
+        assert_eq!(peer.physical.count(), 2);
+        drop((first_open, last_open, first_credit, last_credit));
+        assert!(first.await.is_err());
+        assert!(last.await.is_err());
+        session.request_data(&peer).unwrap();
+        assert!(messages.try_recv().is_err());
+        assert_eq!(peer.active.count(), 0);
+        assert_eq!(peer.pending.count(), 0);
+        assert_eq!(peer.physical.count(), 0);
+        assert_eq!(peer.endpoint.credits.count(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_demand_rejects_late_attachment_and_releases_capacity() {
+        let (peer, session, mut messages) = harness(1);
         let p = peer.clone();
         let caller = tokio::spawn(async move {
             p.open("web", Instant::now() + Duration::from_secs(60))
                 .await
         });
         tokio::task::yield_now().await;
-        session.refill(&peer).unwrap();
+        session.request_data(&peer).unwrap();
         let Message::CreateData { channel_id } = messages.recv().await.unwrap() else {
             panic!()
         };
         caller.abort();
         let _ = caller.await;
         let accepted = peer.endpoint.accept().unwrap();
-        assert!(session.attach(&channel_id, &[1], &peer).is_err());
+        assert!(session.attach(&channel_id, &[1]).is_err());
         drop(accepted);
-        assert_eq!(session.state.lock().as_ref().unwrap().idle, 0);
+        session.request_data(&peer).unwrap();
+        assert!(messages.try_recv().is_err());
+        assert!(session.state.lock().as_ref().unwrap().opens.is_empty());
         assert_eq!(peer.active.count(), 0);
         assert_eq!(peer.pending.count(), 0);
         assert_eq!(peer.physical.count(), 0);
@@ -410,7 +401,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn visitor_burst_rejects_only_excess_opens_and_cancellation_restores_capacity() {
-        let (peer, session, _messages) = harness(2, 0);
+        let (peer, session, _messages) = harness(2);
         let mut tasks = tokio::task::JoinSet::new();
         for _ in 0..2 {
             let peer = peer.clone();
@@ -431,7 +422,7 @@ mod tests {
         assert!(!session.stop.is_cancelled());
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
-        session.refill(&peer).unwrap();
+        session.request_data(&peer).unwrap();
         assert_eq!(peer.active.count(), 0);
         assert_eq!(peer.pending.count(), 0);
         assert!(!session.stop.is_cancelled());
@@ -439,13 +430,19 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn expired_credits_and_late_failures_do_not_flap_control() {
-        let (peer, session, mut messages) = harness(2, 1);
-        session.refill(&peer).unwrap();
+        let (peer, session, mut messages) = harness(2);
+        let p = peer.clone();
+        let caller = tokio::spawn(async move {
+            p.open("web", Instant::now() + Duration::from_secs(60))
+                .await
+        });
+        tokio::task::yield_now().await;
+        session.request_data(&peer).unwrap();
         let Message::CreateData { channel_id } = messages.recv().await.unwrap() else {
             panic!()
         };
         tokio::time::advance(Duration::from_secs(11)).await;
-        session.refill(&peer).unwrap();
+        session.request_data(&peer).unwrap();
         let failures = session.state.lock().as_ref().unwrap().failures;
         session.failed(&channel_id, &peer);
         session.failed(&Id::new(), &peer);
@@ -453,11 +450,16 @@ mod tests {
         assert!(!session.stop.is_cancelled());
         assert_eq!(peer.physical.count(), 0);
         assert_eq!(peer.endpoint.credits.count(), 0);
+        caller.abort();
+        let _ = caller.await;
+        session.request_data(&peer).unwrap();
+        assert_eq!(peer.active.count(), 0);
+        assert_eq!(peer.pending.count(), 0);
     }
 
     #[tokio::test]
     async fn replacement_fences_old_cleanup_and_retirement_rejects_late_commits() {
-        let (peer, old, _messages) = harness(2, 1);
+        let (peer, old, _messages) = harness(2);
         let (writer, _rx) = mpsc::channel(64);
         let new = Arc::new(Session::new(
             Id::new(),
@@ -471,7 +473,7 @@ mod tests {
         assert!(old.stop.is_cancelled());
         peer.gate.retire();
         assert!(peer.install(old).is_err());
-        assert!(new.refill(&peer).is_err());
+        assert!(new.request_data(&peer).is_err());
         assert!(peer
             .open("web", Instant::now() + Duration::from_secs(1))
             .await

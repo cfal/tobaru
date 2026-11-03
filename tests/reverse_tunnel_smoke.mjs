@@ -152,7 +152,7 @@ function frame(message) {
   return Buffer.concat([prefix, body]);
 }
 
-async function rejectedTls(port, identity, message, alpn = 'tobaru-reverse/1') {
+async function rejectedTls(port, identity, message, alpn = 'tobaru-reverse/2') {
   const socket = track(tls.connect({ host: '127.0.0.1', port, rejectUnauthorized: false,
     cert: identity?.cert, key: identity?.key, ALPNProtocols: [alpn] }));
   let bytes = 0;
@@ -174,7 +174,7 @@ async function assertAcceptRecovery(hubIdentity, agentIdentity, originPort, webP
   await writeFile(publicPath, JSON.stringify([
     { tunnel_server: 'edge', address: `0.0.0.0:${hubPort}`,
       server_tls: { cert: hubIdentity.certPath, key: hubIdentity.keyPath },
-      peers: { home: { client_fingerprints: [agentIdentity.pin], services: ['raw'], idle_connections: 0 } } },
+      peers: { home: { client_fingerprints: [agentIdentity.pin], services: ['raw'] } } },
     { address: `0.0.0.0:${publicPort}`, target: { allowlist: 'all',
       location: { tunnel: { server: 'edge', peer: 'home', service: 'raw' } } } },
     { address: `0.0.0.0:${ordinaryPort}`, target: { allowlist: 'all', http_protocols: ['http1'],
@@ -319,7 +319,7 @@ try {
   } } };
   const publicConfig = [
     { tunnel_server: 'edge', address: `0.0.0.0:${hubPort}`, server_tls: { cert: hubIdentity.certPath, key: hubIdentity.keyPath },
-      peers: { home: { client_fingerprints: [agentIdentity.pin], services, idle_connections: 2 } } },
+      peers: { home: { client_fingerprints: [agentIdentity.pin], services } } },
     { address: `0.0.0.0:${publicRaw}`, target: { allowlist: 'all', location: destination('raw') } },
     { address: `0.0.0.0:${publicUnix}`, target: { allowlist: 'all', location: destination('unix') } },
     { address: `0.0.0.0:${publicPass}`, target: { allowlist: 'all', location: destination('secure'), server_tls: { mode: 'passthrough' } } },
@@ -363,6 +363,8 @@ try {
     config => { config[0].peers.other = structuredClone(config[0].peers.home); },
     config => { config[0].peers.home.services.push('web'); },
     config => { config[0].max_handshakes = 1025; },
+    config => { config[0].peers.home.idle_connections = 0; },
+    config => { config[0].peers.home.idle_connections = 4; },
     config => { config[1].target.location.tunnel.service = 'missing'; },
     config => { config[1].target.location.client_tls = { verify: true }; },
     config => { config[1].target.location.client_tls = { verify: true, sni_hostname: null }; },
@@ -374,16 +376,33 @@ try {
   }
   const publicChild = launch(publicPath);
   const clientChild = launch(clientPath);
-  await eventually(async () => assert.equal((await request(publicHttp, '/home/start')).status, 200));
-  const controlCarrier = carriers.find(carrier => !carrier.incoming.destroyed && !carrier.outgoing.destroyed);
+  const liveCarriers = () => carriers.filter(carrier => !carrier.incoming.destroyed && !carrier.outgoing.destroyed);
+  await eventually(() => assert.match(clientChild.logs, /Tunnel client home registered/));
+  const registeredCarriers = carriers.length;
+  await delay(500, undefined, { signal });
+  assert.equal(liveCarriers().length, 1, 'Registration must create only the control connection');
+  assert.equal(carriers.length, registeredCarriers, 'Data channels must not be created without demand');
+  assert.equal(rawAccepts, 0);
+  assert.equal(httpAccepts, 0);
+  const controlCarrier = liveCarriers()[0];
   assert(controlCarrier);
+  const first = await raw(publicRaw);
+  await echo(first, 'first-demand');
+  first.destroy();
+  await eventually(() => assert.equal(liveCarriers().length, 1));
+  await delay(500, undefined, { signal });
+  assert.equal(carriers.length, registeredCarriers + 1, 'Completed demand must not replenish a spare');
+  assert.equal(liveCarriers().length, 1);
+  await eventually(async () => assert.equal((await request(publicHttp, '/home/start')).status, 200));
 
-  const hello = { type: 'control_hello', version: 1, peer: 'home', services: ['web'] };
+  const hello = { type: 'control_hello', version: 2, peer: 'home', services: ['web'] };
   await rejectedTls(hubPort, undefined, hello);
   await rejectedTls(hubPort, stranger, hello);
   await rejectedTls(hubPort, agentIdentity, { ...hello, peer: 'impostor' });
   await rejectedTls(hubPort, agentIdentity, hello, 'h2');
-  await rejectedTls(hubPort, agentIdentity, { type: 'data_hello', version: 1, peer: 'home', session_id: '0'.repeat(32), channel_id: '1'.repeat(32) });
+  await rejectedTls(hubPort, agentIdentity, { ...hello, version: 1 }, 'tobaru-reverse/1');
+  await rejectedTls(hubPort, agentIdentity, { ...hello, version: 1 });
+  await rejectedTls(hubPort, agentIdentity, { type: 'data_hello', version: 2, peer: 'home', session_id: '0'.repeat(32), channel_id: '1'.repeat(32) });
 
   const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 1 });
   agents.push(httpAgent);
@@ -425,9 +444,10 @@ try {
   await echo(unix, 'unix');
   unix.destroy();
 
+  const beforeBurst = rawAccepts;
   const burst = await Promise.all(Array.from({ length: 12 }, () => raw(publicRaw)));
   await Promise.all(burst.map((socket, i) => echo(socket, `burst-${i}`)));
-  assert(rawAccepts >= 12, 'Warm pool was incorrectly treated as the active connection limit');
+  assert.equal(rawAccepts - beforeBurst, 12, 'Demand must drain beyond the four in-flight creation credits');
   const active = burst.pop();
   for (const socket of burst) socket.destroy();
   const half = await raw(publicRaw);
@@ -454,7 +474,7 @@ try {
   await eventually(() => assert.match(publicChild.logs, /Config reload rejected/));
   await echo(active, 'invalid-reload-preserved');
   const stale = track(tls.connect({ host: '127.0.0.1', port: hubPort, rejectUnauthorized: false,
-    cert: agentIdentity.cert, key: agentIdentity.key, ALPNProtocols: ['tobaru-reverse/1'] }));
+    cert: agentIdentity.cert, key: agentIdentity.key, ALPNProtocols: ['tobaru-reverse/2'] }));
   await once(stale, 'secureConnect', { signal });
   const activeClosed = once(active, 'close', { signal });
   const staleClosed = once(stale, 'close', { signal });
@@ -485,7 +505,7 @@ try {
   await eventually(async () => assert.equal((await request(publicHttp, '/home/restarted')).status, 200));
   assert.equal(publicChild.exitCode, null);
   await assertAcceptRecovery(hubIdentity, agentIdentity, rawPort, webPort);
-  console.log('reverse tunnel smoke passed: mTLS, pool growth, TCP/Unix, half-close, H1/H2, origin TLS, control loss, reload, reconnect, FD exhaustion recovery');
+  console.log('reverse tunnel smoke passed: mTLS, demand-only channels, TCP/Unix, half-close, H1/H2, origin TLS, control loss, reload, reconnect, FD exhaustion recovery');
 } catch (error) {
   for (const child of children) console.error(child.logs);
   throw error;
