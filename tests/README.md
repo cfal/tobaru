@@ -24,6 +24,7 @@ CARGO_BUILD_JOBS=1 cargo build --release --locked
 node tests/http_smoke.mjs target/release/tobaru
 node tests/http2_smoke.mjs target/release/tobaru
 node tests/tcp_routing_smoke.mjs target/release/tobaru
+node tests/reverse_tunnel_smoke.mjs target/release/tobaru
 ```
 
 Omitting the argument selects `target/release/tobaru` relative to the repository.
@@ -76,3 +77,20 @@ mapped IPv4 coverage without requiring privileges or changing real firewall rule
 ```sh
 node tests/config_cli.mjs target/release/tobaru
 ```
+
+The reverse-tunnel smoke starts separate public and NAT-side processes, physical
+TCP/Unix/HTTP origins, and a half-close-preserving TCP relay used to drop only the
+control connection. It requires Node 22+ and OpenSSL, has a 120-second overall budget,
+and removes its certificates/configs beneath `$HOME/tmp`. It checks mTLS identity and
+ALPN rejection, strict config validation, pool growth above warm-spare size, raw
+server-first data and half-close, H1/H2 forwarding and reuse, origin TLS/pin failures,
+passthrough, Upgrade/read-ahead, control-loss isolation, invalid/valid reloads, service
+intersection, agent-only startup, and process restart. Rust tests exercise framing,
+counter conservation, cancellation, stale generation fencing, and non-abortable DNS
+ownership using a real blocking wrapper.
+
+These local tests do not themselves establish NAT/firewall isolation or Internet-scale
+performance. Before deployment, run the same pair in an isolated network namespace or
+container with agent inbound traffic blocked and only outbound hub access allowed.
+Do not change the host firewall to simulate this on a shared VM. Namespace creation
+may be unavailable in restricted environments; report that verification gap explicitly.

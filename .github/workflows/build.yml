@@ -63,6 +63,10 @@ jobs:
         if: matrix.toolchain == 'stable'
         run: node tests/tcp_routing_smoke.mjs target/debug/tobaru
 
+      - name: Run reverse tunnel smoke
+        if: matrix.toolchain == 'stable'
+        run: node tests/reverse_tunnel_smoke.mjs target/debug/tobaru
+
       - name: Check shortcut exposure diagnostics
         if: matrix.toolchain == 'stable'
         run: node tests/config_cli.mjs target/debug/tobaru
