@@ -117,6 +117,7 @@ pub enum Location {
     // the system's DNS settings.
     Address(NetLocation),
     Path(PathBuf),
+    Tunnel(Box<super::tunnel::TunnelReference>),
 }
 
 impl std::fmt::Display for Location {
@@ -124,6 +125,7 @@ impl std::fmt::Display for Location {
         match self {
             Location::Address(net_location) => write!(f, "{}", net_location),
             Location::Path(p) => write!(f, "{}", p.display()),
+            Location::Tunnel(t) => write!(f, "tunnel {}/{}/{}", t.server, t.peer, t.service),
         }
     }
 }

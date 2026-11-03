@@ -12,6 +12,7 @@ mod tcp;
 mod tls_parser;
 mod tls_reader;
 mod tokio_util;
+mod tunnel;
 mod udp;
 mod util;
 

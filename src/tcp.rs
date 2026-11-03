@@ -42,9 +42,25 @@ pub struct TargetLocationData {
     pub location: Location,
     pub tls_connector: Option<tokio_rustls::TlsConnector>,
     pub sni_hostname: NoneOrOne<String>,
+    pub tunnel: Option<crate::tunnel::Binding>,
 }
 
 impl TargetLocationData {
+    fn prepare(
+        location: TcpTargetLocation,
+        tunnels: &crate::tunnel::Registry,
+    ) -> std::io::Result<Self> {
+        let mut target = Self::try_from(location)?;
+        target.bind(tunnels)?;
+        Ok(target)
+    }
+
+    fn bind(&mut self, tunnels: &crate::tunnel::Registry) -> std::io::Result<()> {
+        if let Location::Tunnel(reference) = &self.location {
+            self.tunnel = Some(tunnels.bind(reference)?);
+        }
+        Ok(())
+    }
     fn for_http(
         location: TcpTargetLocation,
         protocol: crate::config::HttpProtocol,
@@ -76,6 +92,18 @@ impl TryFrom<TcpTargetLocation> for TargetLocationData {
 
     fn try_from(tcp_target_location: TcpTargetLocation) -> std::io::Result<Self> {
         let (location, client_tls) = tcp_target_location.into_components();
+        if matches!(location, Location::Tunnel(_)) && client_tls.is_enabled() {
+            match client_tls.sni_hostname() {
+                NoneOrOne::One(name)
+                    if rustls::pki_types::ServerName::try_from(name.as_str()).is_ok() => {}
+                _ => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "Tunnel origin TLS requires an explicit valid sni_hostname",
+                    ))
+                }
+            }
+        }
 
         // Load client certificate if specified
         let client_cert = if client_tls.has_client_cert() {
@@ -113,6 +141,7 @@ impl TryFrom<TcpTargetLocation> for TargetLocationData {
 
         Ok(Self {
             location,
+            tunnel: None,
             tls_connector: if client_tls.is_enabled() {
                 Some(
                     crate::rustls_util::create_client_config_with_cert(
@@ -189,6 +218,18 @@ pub enum TargetHttpActionData {
         request_id_header_name: Option<String>,
         response_id_header_name: Option<String>,
     },
+}
+
+impl TargetHttpActionData {
+    fn prepare(action: HttpPathAction, tunnels: &crate::tunnel::Registry) -> std::io::Result<Self> {
+        let mut prepared = Self::try_from(action)?;
+        if let Self::Forward { location_data, .. } = &mut prepared {
+            for location in location_data {
+                location.bind(tunnels)?;
+            }
+        }
+        Ok(prepared)
+    }
 }
 
 impl TryFrom<HttpPathAction> for TargetHttpActionData {
@@ -334,6 +375,7 @@ fn build_rustls_configs(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn prepare_tcp_server(
     server_address: SocketAddr,
     use_iptables: bool,
@@ -342,6 +384,7 @@ pub async fn prepare_tcp_server(
     target_configs: Vec<TcpTargetConfig>,
     max_connections: Option<std::num::NonZeroUsize>,
     admission: Arc<Admission>,
+    tunnels: &crate::tunnel::Registry,
 ) -> std::io::Result<impl std::future::Future<Output = std::io::Result<()>> + Send> {
     let (generation, retired) = tokio::sync::watch::channel(());
     let mut routes = RoutingTable::default();
@@ -374,7 +417,7 @@ pub async fn prepare_tcp_server(
             TcpAction::Raw(RawTcpActionConfig { locations }) => TargetActionData::Raw {
                 location_data: locations
                     .into_iter()
-                    .map(TargetLocationData::try_from)
+                    .map(|location| TargetLocationData::prepare(location, tunnels))
                     .collect::<std::io::Result<_>>()?,
                 next_address_index: AtomicUsize::new(0),
             },
@@ -426,7 +469,10 @@ pub async fn prepare_tcp_server(
                         .map(|path_config| {
                             Ok(TargetHttpPathData {
                                 required_request_headers: path_config.required_request_headers,
-                                http_action: path_config.http_action.try_into()?,
+                                http_action: TargetHttpActionData::prepare(
+                                    path_config.http_action,
+                                    tunnels,
+                                )?,
                             })
                         })
                         .collect::<std::io::Result<_>>()?;
@@ -437,7 +483,10 @@ pub async fn prepare_tcp_server(
                     http2,
                     h2_admission: crate::http::h2::Admission::new(http2, Some(retired.clone())),
                     path_configs,
-                    default_http_action: default_http_action.try_into()?,
+                    default_http_action: TargetHttpActionData::prepare(
+                        default_http_action,
+                        tunnels,
+                    )?,
                     http_timeouts,
                 }))
             }
@@ -1108,6 +1157,24 @@ pub async fn setup_http_target_stream(
     tcp_keepalive: Option<TcpKeepaliveConfig>,
 ) -> std::io::Result<EstablishedStream> {
     match target_location.location {
+        Location::Tunnel(_) => {
+            let binding = target_location
+                .tunnel
+                .as_ref()
+                .ok_or_else(|| std::io::Error::other("Unprepared tunnel destination"))?;
+            let deadline = tokio::time::Instant::now() + binding.setup_timeout();
+            tokio::time::timeout_at(deadline, async {
+                let stream = binding.open(deadline).await?;
+                maybe_wrap_tls(stream, target_location, None).await
+            })
+            .await
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "Reverse tunnel backend setup timed out",
+                )
+            })?
+        }
         Location::Address(NetLocation { ref address, port }) => {
             let target_addr = resolve_host((address.as_str(), port)).await?;
             let tcp_stream = TcpStream::connect(target_addr).await?;
