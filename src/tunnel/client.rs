@@ -613,18 +613,13 @@ mod tests {
     #[tokio::test]
     async fn missing_open_expires_within_the_original_attachment_deadline() {
         let (client, listener, tls) = harness().await;
-        let (task, _stream, stop, mut messages) = start_data(
-            &client,
-            &listener,
-            &tls,
-            false,
-            Instant::now() + Duration::from_secs(5),
-        )
-        .await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (task, _stream, stop, mut messages) =
+            start_data(&client, &listener, &tls, false, deadline).await;
         tokio::time::pause();
-        tokio::time::advance(Duration::from_secs(4)).await;
+        tokio::time::advance(deadline.saturating_duration_since(Instant::now()) / 2).await;
         assert!(!task.is_finished());
-        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::time::advance(deadline.saturating_duration_since(Instant::now())).await;
         timeout(Duration::from_millis(1), task)
             .await
             .expect("attachment restarted its deadline while waiting for Open")

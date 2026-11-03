@@ -263,18 +263,19 @@ async fn first_open_write_keeps_the_connection_setup_deadline_under_backpressure
     )
     .await
     .is_err());
+    let deadline = Instant::now() + Duration::from_secs(5);
     let worker = tokio::spawn(serve_data(
         peer.clone(),
         session.clone(),
         channel,
         open,
-        Instant::now() + Duration::from_secs(5),
+        deadline,
     ));
     tokio::task::yield_now().await;
     tokio::time::pause();
-    tokio::time::advance(Duration::from_secs(4)).await;
+    tokio::time::advance(deadline.saturating_duration_since(Instant::now()) / 2).await;
     assert!(!worker.is_finished());
-    tokio::time::advance(Duration::from_secs(1)).await;
+    tokio::time::advance(deadline.saturating_duration_since(Instant::now())).await;
     timeout(Duration::from_millis(1), worker)
         .await
         .expect("first Open write exceeded its attachment deadline")

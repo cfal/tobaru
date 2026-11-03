@@ -284,6 +284,7 @@ async fn serve_data(
         }
     }
     if !transport_is_idle(&mut channel.io).await {
+        drop(channel);
         let _gate = peer.gate.enter()?;
         if let Some(state) = session.state.lock().as_mut() {
             state.opens.push_front(open);
