@@ -7,6 +7,17 @@ TLS session tests:
 CARGO_BUILD_JOBS=1 cargo test --locked
 ```
 
+The minimum supported Rust version is 1.88. CI tests both stable and 1.88; the
+same check can be run locally without changing the default toolchain:
+
+```sh
+rustup toolchain install 1.88.0 --profile minimal
+CARGO_BUILD_JOBS=1 cargo +1.88.0 test --locked
+CARGO_BUILD_JOBS=1 cargo +1.88.0 build --locked
+```
+
+Pass `target/debug/tobaru` to the CLI suites below to exercise that build.
+
 Configuration watcher tests cover atomic replacement, symlink retargeting, and
 reusing recreated target directories. CI also runs these tests on native macOS
 to exercise the FSEvents backend:
