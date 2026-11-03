@@ -1,8 +1,207 @@
 # Operating Limits and Deployment Contracts
 
-The maintained reference is now [Limits and deployment](https://tobaru-rs.github.io/operations/limits/),
-authored in [`docs/src/content/docs/operations/limits.md`](docs/src/content/docs/operations/limits.md).
+Tobaru limits admitted work and protocol metadata independently of upstream application
+latency. Upstream response-header and body-progress deadlines are disabled by default.
+Enable them only when an application needs a deadline enforced by the proxy.
 
-It covers listener admission, UDP queue sizing, HTTP/TLS timeouts, upstream-owned
-latency, metadata bounds, logging, and deployment contracts. Update that page
-alongside changes to runtime limits and defaults.
+## Listener Resources
+
+TCP listeners default to no connection cap (`tcp_max_connections: null`). Set a positive
+integer to enable the cap. A permit covers the entire accepted connection, including
+protocol detection and TLS. At capacity, new connections are closed
+without starting a forwarding task. Existing connections count across reloads of the same
+bind address, including removal and re-addition while connections survive. Lowering a cap
+does not evict existing connections; admission resumes when their count falls below it.
+Explicit `null` disables the cap. Unlimited generations are still counted for later reloads.
+
+UDP listeners default to no association cap (`udp_max_associations: null`) and
+`udp_queue_capacity: 1024` packets per association. Set a positive association cap to limit
+the number of source IP/port pairs. New associations are dropped at that cap; existing
+associations continue. Packets are dropped when an association's queue is full. Queue depth
+must be between 1 and 65,535. Both settings are listener fields, alongside `address` and
+`transport`.
+
+These defaults preserve legacy capacity but do not protect against total FD or memory
+exhaustion. Configure limits to suit the deployment. For example, an explicit cap of 128
+UDP associations with an eight-packet queue allows at most approximately 64 MiB of queued
+maximum-size payload per listener (128 times 8 times 64 KiB). This is a sizing example,
+not a throughput guarantee. In-flight payloads, sockets, tasks, and kernel buffers are
+additional. Multiple listeners multiply the budget. Raising both settings can grow memory
+consumption dramatically. TCP limits likewise exclude backend sockets and other listeners;
+size them against the process FD and memory limits.
+
+TCP and UDP URL shortcuts use these same defaults. They still allow all peers and disable
+built-in firewall handling. Non-loopback shortcut binds produce one warning per URL load;
+the bind address is never silently changed.
+
+## Reverse Tunnels
+
+Tunnel limits are finite and independent of ordinary frontend limits:
+
+| Field | Default | Counts |
+| --- | ---: | --- |
+| `tunnel_server.max_connections` | 1024 | Accepted control, data, and handshaking sockets, including retained old sockets |
+| `tunnel_server.max_handshakes` | 32 | Concurrent TLS handshakes |
+| `peers.NAME.max_active_connections` | 128 | Queued/Opening backend leases plus returned streams, including cached H1/H2 backends |
+| `peers.NAME.max_pending_opens` | 32 | Opens waiting for a channel or carrier Ready |
+| `peers.NAME.idle_connections` | 4 | Desired spare data sockets; zero means demand-only creation |
+| `peers.NAME.open_timeout_secs` | 10 | Pool wait, origin setup, and optional origin TLS; the agent's local dial is independently capped at 10 seconds |
+| `tunnel_client.max_active_connections` | 128 | Agent-local dials and active origin connections |
+| `tunnel_client.max_data_connections` | 256 | Agent data sockets/reservations across control reconnections |
+| `tunnel_client.max_concurrent_local_dials` | 16 | Concurrent agent-origin connection setup |
+
+Connection counts are at most 65,536, pending/local-dial counts at most 4,096, idle
+spares at most 256, and setup time at most 86,400 seconds. All counts/times are
+positive except idle spares. Pending/local-dial limits cannot exceed their active
+limits; handshake limits cannot exceed the endpoint connection limit. `null` is not
+an unlimited opt-out. Configure the client's data cap at least as high as the hub's
+peer active plus idle budgets, unless smaller local capacity is intentional.
+
+Four creation credits and four concurrent agent data dials bound pool refill. A
+burst larger than the spare pool can wait for newly requested outbound channels;
+it cannot create an unbounded pending queue. Credit expiry and failed creation use
+bounded backoff. Cached HTTP connections retain active leases between requests.
+The peer's active limit is not an HTTP-request rate or stream count.
+
+Outer setup, including DNS, has a ten-second deadline; ingress additionally requires
+ClientHello within three seconds. Control pings occur every 20 seconds with a
+60-second matching-pong deadline. The agent closes control after 60 seconds without
+a valid frame. Idle channels have their own 20-second ping/10-second pong exchange;
+agent idle receive expiry is 40 seconds. No tunnel heartbeat bytes are injected into
+active payloads. The outer TCP carrier enables nodelay and keepalive (20-second idle,
+10-second interval). OS probe counts still affect TCP failure detection.
+
+Sixteen process-wide tunnel DNS permits remain held by OS resolver jobs until the
+blocking calls actually finish, even after caller cancellation or reload. Stuck export
+lookups can therefore delay hostname-based hub reconnects. IP literals and cached hub
+addresses for data dials bypass that pool. There is no unbounded resolver retry queue.
+The 32 KiB rustls write-buffer setting does not bound total TLS or socket memory.
+
+Accepted sockets, spare channels, origin sockets, visitor sockets, and one additional
+shutdown-handle FD per active public tunnel all consume resources. Size process/host
+limits accordingly. The handshake cap is not denial-of-service protection: unauthorized
+traffic can occupy it. Restrict the dedicated ingress port at the firewall where possible.
+
+Transient control loss closes idle channels and fails unfinished opens, but established
+independent data streams can continue, including existing H1/H2 backend reuse. New
+physical opens fail promptly until a client registers again. No application request or
+failed TCP stream is replayed. Client reconnect uses exponential backoff with jitter,
+up to 60 seconds; only 60 seconds of stable connectivity resets it.
+
+Every successfully prepared config reload closes all tunnel transports, even for an
+unrelated listener edit, unchanged save, or `touch`. Active SSH, WebSocket, and download
+connections are interrupted. Invalid reloads leave the running generation untouched.
+Retired frontend routes cannot reopen a tunnel through new credentials. Async tunnel
+task cleanup has a five-second budget; already-running bounded DNS calls may finish
+later without authority to dial. Socket shutdown cannot undo delivered application
+effects or erase bytes already buffered by higher layers. Direct-listener reload
+behavior is unchanged. There is no added graceful signal-shutdown facility.
+
+Use `RUST_LOG=info` for agent registration/reconnect and reload diagnostics, or `debug`
+for channel failures. A connected agent is not an origin health check. Existing HTTP
+failure behavior remains: H1 paths may close a connection while H2-related paths can
+produce gateway errors. There is no automatic fallback to another destination.
+
+## HTTP and TLS Timeouts
+
+`http_timeouts` belongs to each HTTP target:
+
+```yaml
+http_timeouts:
+  # Omission uses 10 seconds for H1 and http2.header_timeout_secs for H2/detection.
+  request_header_timeout_secs: 10
+  response_header_timeout_secs: null
+  upstream_body_progress_timeout_secs: null
+  keepalive_idle_timeout_secs: 60
+  local_body_timeout_secs: 10
+```
+
+Omitting the object, using `{}`, or supplying only some fields retains the defaults for
+the remaining fields. Explicit `null` disables the applicable optional timer; positive
+integer seconds enable it. Zero, negatives, fractional values, and unknown timeout fields
+are rejected.
+
+- H1 request headers have an absolute 10-second default, not a per-byte timer. A keepalive
+  connection first waits for input under its separate idle budget, then reads headers.
+- H2 and plaintext protocol detection inherit `http2.header_timeout_secs` when the request
+  header setting is omitted. An explicit value overrides it; `null` disables that frontend
+  timer, but not framing validation, header-size accounting, or separate H2 setup limits.
+- Keepalive defaults to 60 seconds. H2 idle retirement applies only with no active stream
+  tasks. `null` disables idle retirement for both protocols, not reload draining.
+- H1 local actions drain request bodies under an absolute 10-second default, including
+  trailers. `local_body_timeout_secs: null` disables this deadline. H2 local actions keep
+  their existing protocol-specific progress and drain behavior.
+- `server_tls.handshake_timeout_secs` defaults to 10 seconds in termination mode only.
+  `null` disables it. Passthrough omission remains valid; a positive termination-handshake
+  setting is invalid for passthrough.
+
+### Upstream-Owned Latency
+
+Omitted or `null` response-header and upstream-body settings impose no application latency
+deadline in any H1/H2 forwarding combination. A stalled backend may retain an admitted
+connection or stream until cancellation or closure. Configured `tcp_max_connections` and
+HTTP/2 admission limits still apply; H1-to-H1 forwarding has no connection cap by default.
+
+An explicit `response_header_timeout_secs` is an absolute budget from submission of the
+request head through receipt of the final response head. It includes concurrent upload
+time. Informational responses, including `100` and `103`, do not extend it. It does not
+bound response-body transfer.
+
+An explicit `upstream_body_progress_timeout_secs` bounds stalled upstream body reads and
+upstream upload writes/capacity waits, including trailers and EOF. It is a progress budget,
+not a maximum transfer lifetime. Downstream backpressure and waiting for frontend upload
+bytes do not consume an upstream I/O budget. It does not change raw tunnels or upgrades.
+
+Existing H2 connection/setup limits and incomplete-frame/header-block watchdogs remain
+active independently. Backend silence between complete messages is not an incomplete
+frame. Encoded and decoded metadata limits remain active even with response timers off.
+
+For forwarding involving H2, `http2.body_progress_timeout_secs` retains its frontend
+upload-read and downstream-write protection. `Expect: 100-continue` upload timing starts
+only after Continue is forwarded or upload bytes arrive. An early final response replaces
+a pending expectation without requiring the client to upload. A successful early response
+does not otherwise cancel an active duplex upload. Long backend pauses do not consume the
+next frontend operation's initial progress budget.
+
+Legacy H1-to-H1 streaming and raw tunnels retain unlimited frontend streaming lifetimes.
+No new mandatory upstream setup, raw inactivity, or whole-connection deadline is imposed.
+
+## HTTP Metadata and Logging
+
+Legacy H1 request limits remain unchanged: less than 4 KiB per line, at most 38 fields plus
+the start line. The legacy H1-to-H1 response parser permits at most 128 fields, 16 KiB per
+line, and 64 KiB for the complete head including CRLFs. H1/H2 translation uses separate
+configurable field-list accounting rather than these legacy response-head limits.
+At most 16 informational responses precede a final response.
+
+Legacy H1 chunked trailers permit at most 128 fields and 64 KiB of field lines including
+their CRLFs, excluding the final empty line. Over-limit fields are rejected before being
+forwarded. H2 and translation paths retain their separate bounded field-list accounting.
+
+H1 access logs omit query strings and escape control characters in paths. Request-line
+and malformed-header errors do not echo raw contents. Paths may still contain sensitive
+application identifiers; use appropriate log access controls, filters, rotation, and
+deployment rate limits. Startup/configuration errors are not suppressed.
+
+## Deployment Contracts
+
+- Routing matches raw, undecoded path segments, excluding queries. Escaped separators,
+  dot segments, and repeated slashes are not normalized. Align backend interpretation and
+  authorization with routing; do not use route predicates alone as an authorization boundary.
+- Static serving roots and their ancestors must be controlled by trusted writers. Stable-tree
+  traversal checks are not a race-resistant sandbox against hostile filesystem replacement.
+- Built-in firewall commands require a trusted PATH and executable directories. Rules are
+  protocol/port-wide, not specific to the listener's bind address; earlier rules affect their
+  effect. Prefer externally managed rules for shared ports/addresses or multiple instances.
+- Reload validation failures retain the running configuration. Successful preparation stops
+  old listeners before replacement binding; subsequent bind failure is not transactional and
+  can interrupt service. Use a supervisor. H2 graceful shutdown and bounded draining remain.
+- Backend selection remains one-attempt round-robin on connection establishment, with H2
+  connection reuse. Requests are not replayed and no proactive health checks are performed.
+- UDP hostname resolution remains per association through the system resolver. Results are
+  not permanently pinned at configuration load and no proxy-managed DNS cache is introduced.
+
+YAML remains supported through the pinned `yaml_serde` continuation of `serde_yaml`, with
+the existing Rust crate name preserved. Configuration compatibility fixtures cover aliases,
+scalar typing, custom actions, duplicate keys, explicit nulls, and literal merge keys.
+The vendored H2 validation patches remain in use.
