@@ -33,7 +33,7 @@
           http_action:
             type: forward
             address: app-backend:8080
-            response_header_patch:
+            request_header_patch:
               overwrite_headers:
                 host: app.example.com
 
@@ -42,7 +42,7 @@
           http_action:
             type: forward
             address: blog-backend:8080
-            response_header_patch:
+            request_header_patch:
               overwrite_headers:
                 host: blog.example.com
 
@@ -79,9 +79,9 @@
 
 # Example 3: Virtual hosting behind TLS termination
 #
-# When multiple virtual hosts share a single wildcard certificate,
-# SNI alone cannot distinguish them. Use Host header routing after
-# TLS termination.
+# A shared wildcard certificate does not prevent SNI routing. This example
+# instead routes each HTTP request by Host after TLS termination, including
+# requests for different hosts on a reused connection.
 - address: 0.0.0.0:443
   transport: tcp
   targets:

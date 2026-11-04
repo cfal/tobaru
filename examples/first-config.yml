@@ -1,0 +1,10 @@
+- address: 127.0.0.1:8080
+  transport: tcp
+  target:
+    allowlist: 127.0.0.1/32
+    default_http_action:
+      type: serve-message
+      status_code: 200
+      content: "Hello from tobaru!\n"
+      response_headers:
+        Content-Type: text/plain

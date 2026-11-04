@@ -1,0 +1,43 @@
+---
+title: First configuration
+description: Validate and run a local HTTP listener without certificates or backends.
+---
+
+import { Code } from '@astrojs/starlight/components';
+import config from '../../../../../examples/first-config.yml?raw';
+
+The tracked `examples/first-config.yml` runs a loopback-only HTTP listener. It
+needs no certificates, upstream service, or firewall changes.
+
+<Code code={config} lang="yaml" title="examples/first-config.yml" />
+
+From the repository root, validate it before starting:
+
+```sh
+tobaru --dry-run examples/first-config.yml
+tobaru examples/first-config.yml
+```
+
+In another terminal:
+
+```sh
+curl http://127.0.0.1:8080/
+```
+
+The response is `Hello from tobaru!`. Stop the foreground process with Ctrl-C.
+`--dry-run` validates configuration and referenced TLS files without binding
+listeners. It cannot prove the port is available or a backend is reachable.
+
+## Forward a TCP port
+
+For a service already listening on port 9000:
+
+```sh
+tobaru 'tcp://127.0.0.1:8080?target=127.0.0.1:9000'
+```
+
+The URL shortcut allows all source IPs and has no resource cap by default. Keep
+the loopback bind for local access; use [YAML](/start/configuration-model/) for
+allowlists and [explicit limits](/operations/limits/) before exposing a service.
+
+Continue with [examples](/start/examples/) for TLS and hostname routing.

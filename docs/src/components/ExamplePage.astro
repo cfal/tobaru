@@ -1,0 +1,15 @@
+---
+import StarlightPage from '@astrojs/starlight/components/StarlightPage.astro';
+import { Code } from '@astrojs/starlight/components';
+import { sourceRef, sourceRefKnown } from '../../metadata.mjs';
+
+interface Props { filename: string; code: string; }
+const { filename, code } = Astro.props;
+---
+
+<StarlightPage frontmatter={{ title: filename, description: `tobaru configuration example: ${filename}`, editUrl: false }}>
+  <p><a href="/start/examples/">All examples</a></p>
+  <p>Change addresses, allowlists, certificate paths, and other deployment-specific values before use. Read the file's prerequisites, then run <code>tobaru --dry-run config.yaml</code> with the adapted file. Validation does not check backend availability, listener binding, or firewall permissions.</p>
+  <Code code={code} lang="yaml" title={`examples/${filename}`} />
+  {sourceRefKnown && <p><a href={`https://github.com/cfal/tobaru/blob/${sourceRef}/examples/${filename}`}>View source at this revision</a></p>}
+</StarlightPage>
