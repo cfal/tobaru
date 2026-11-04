@@ -5,14 +5,12 @@ TLS SNI/ALPN routing, TLS termination, and HTTP/1 and HTTP/2 forwarding.
 Targets can use TCP or UNIX sockets, round-robin backends, and optional outgoing
 TLS. Configuration files are watched for reloads.
 
+Documentation: [tobaru-rs.github.io](https://tobaru-rs.github.io/) for installation,
+configuration reference, CLI usage, and complete examples.
+
 [Native reverse tunnels](https://tobaru-rs.github.io/config/reverse-tunnels/) export
 named TCP/Unix services from behind NAT through outbound mTLS connections, using
 ordinary TCP and HTTP routes on the public hub.
-
-**[Documentation](https://tobaru-rs.github.io/)** |
-[Installation](https://tobaru-rs.github.io/start/installation/) |
-[Configuration](https://tobaru-rs.github.io/start/configuration-model/) |
-[Examples](https://tobaru-rs.github.io/start/examples/)
 
 The site currently documents **dev**, not a stable release. Its header links to
 the exact source revision. Documentation source lives in [`docs/`](docs/README.md)
@@ -31,7 +29,7 @@ This preserves the pinned HTTP/2 fork's validation fixes. The initial build need
 GitHub access. `cargo install tobaru` installs an older crates.io release, not
 this development revision. See [dependency details](https://tobaru-rs.github.io/operations/dependencies/).
 
-## Start
+## Quick start
 
 Run the self-contained loopback example from this checkout:
 
@@ -41,7 +39,11 @@ tobaru examples/first-config.yml
 ```
 
 Then request `http://127.0.0.1:8080/`. See the
-[first configuration](https://tobaru-rs.github.io/start/first-config/) for details.
+[first-configuration guide](https://tobaru-rs.github.io/start/first-config/),
+[CLI reference](https://tobaru-rs.github.io/operations/cli/), and
+[copyable example catalog](https://tobaru-rs.github.io/start/examples/). The
+[tracked YAML files](examples/) are the source of those example pages.
+
 For an existing service on port 9000:
 
 ```sh
@@ -56,6 +58,7 @@ another target does not deny that fallback access.
 
 ## Reference
 
+- [Configuration model](https://tobaru-rs.github.io/start/configuration-model/) and [IP groups](https://tobaru-rs.github.io/config/ip-groups/)
 - [Listeners](https://tobaru-rs.github.io/config/server/), [TCP](https://tobaru-rs.github.io/config/tcp/), and [UDP](https://tobaru-rs.github.io/config/udp/)
 - [Incoming TLS](https://tobaru-rs.github.io/tls/server/) and [outgoing TLS](https://tobaru-rs.github.io/tls/client/)
 - [HTTP routing](https://tobaru-rs.github.io/http/routing/), [actions](https://tobaru-rs.github.io/http/actions/), and [HTTP/2](https://tobaru-rs.github.io/http/http2/)
