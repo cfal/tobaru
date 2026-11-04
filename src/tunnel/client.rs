@@ -282,6 +282,49 @@ impl Client {
         Ok((backend, active))
     }
 
+    async fn answer_open(
+        &self,
+        mut stream: ClientIo,
+        service: &str,
+        budget_ms: u32,
+        accepted_services: &HashSet<String>,
+    ) -> io::Result<(ClientIo, Box<dyn AsyncStream>, Permit)> {
+        let connecting = self.connect_export(service, accepted_services);
+        let open_deadline =
+            Instant::now() + Duration::from_millis(u64::from(budget_ms.min(10_000)));
+        let mut byte = [0];
+        let result = tokio::select! {
+            result = timeout_at(open_deadline, connecting) => {
+                result.map_err(|_| timed_out()).and_then(|result| result)
+            },
+            _ = stream.read(&mut byte) => return Err(unavailable()),
+        };
+        let (backend, active) = match result {
+            Ok(value) => value,
+            Err(error) => {
+                let code = match error.kind() {
+                    io::ErrorKind::WouldBlock => Code::Busy,
+                    io::ErrorKind::TimedOut => Code::Timeout,
+                    io::ErrorKind::PermissionDenied => Code::Unauthorized,
+                    _ => Code::ConnectFailed,
+                };
+                let _ = timeout(
+                    Duration::from_secs(1),
+                    protocol::write(&mut stream, &Message::OpenFailed { code }),
+                )
+                .await;
+                return Err(error);
+            }
+        };
+        timeout_at(
+            open_deadline,
+            protocol::write(&mut stream, &Message::Ready {}),
+        )
+        .await
+        .map_err(|_| timed_out())??;
+        Ok((stream, backend, active))
+    }
+
     async fn data(&self, work: Work) {
         let Work {
             address,
@@ -297,47 +340,15 @@ impl Client {
         let _socket = socket;
         let mut attached = false;
         let setup = async {
-            let (mut stream, service, budget_ms) = timeout_at(
+            let (stream, service, budget_ms) = timeout_at(
                 attach_deadline,
                 self.attach_data(address, session, &channel, job),
             )
             .await
             .map_err(|_| timed_out())??;
             attached = true;
-            let local = self.connect_export(&service, &accepted_services);
-            let open_deadline =
-                Instant::now() + Duration::from_millis(u64::from(budget_ms.min(10_000)));
-            let mut byte = [0];
-            let local = tokio::select! {
-                result = timeout_at(open_deadline, local) => {
-                    result.map_err(|_| timed_out()).and_then(|result| result)
-                },
-                _ = stream.read(&mut byte) => return Err(unavailable()),
-            };
-            let (backend, active) = match local {
-                Ok(value) => value,
-                Err(error) => {
-                    let code = match error.kind() {
-                        io::ErrorKind::WouldBlock => Code::Busy,
-                        io::ErrorKind::TimedOut => Code::Timeout,
-                        io::ErrorKind::PermissionDenied => Code::Unauthorized,
-                        _ => Code::ConnectFailed,
-                    };
-                    let _ = timeout(
-                        Duration::from_secs(1),
-                        protocol::write(&mut stream, &Message::OpenFailed { code }),
-                    )
-                    .await;
-                    return Err(error);
-                }
-            };
-            timeout_at(
-                open_deadline,
-                protocol::write(&mut stream, &Message::Ready {}),
-            )
-            .await
-            .map_err(|_| timed_out())??;
-            Ok::<_, io::Error>((stream, backend, active))
+            self.answer_open(stream, &service, budget_ms, &accepted_services)
+                .await
         };
         let result = tokio::select! {
             biased;

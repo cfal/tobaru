@@ -105,8 +105,7 @@ impl Server {
         match first {
             Message::ControlHello { peer, services, .. } if peer == *identity => {
                 let peer = self.peers.get(&peer).ok_or_else(unavailable)?.clone();
-                self.control(peer, fingerprint, services, stream, accepted)
-                    .await
+                Self::control(peer, fingerprint, services, stream, accepted).await
             }
             Message::DataHello {
                 peer,
@@ -138,7 +137,6 @@ impl Server {
     }
 
     async fn control(
-        &self,
         peer: Arc<Peer>,
         fingerprint: Vec<u8>,
         offered: Vec<String>,
@@ -269,6 +267,45 @@ async fn transport_is_idle(stream: &mut ServerIo) -> bool {
     .await
 }
 
+async fn exchange_open(
+    stream: &mut ServerIo,
+    service: &str,
+    open_deadline: Instant,
+    attachment_deadline: Instant,
+) -> io::Result<()> {
+    let remaining = open_deadline
+        .saturating_duration_since(Instant::now())
+        .as_millis();
+    if remaining == 0 {
+        return Err(timed_out());
+    }
+    timeout_at(
+        attachment_deadline.min(open_deadline),
+        protocol::write(
+            stream,
+            &Message::Open {
+                service: service.to_owned(),
+                budget_ms: remaining.min(protocol::MAX_BUDGET_MS as u128) as u32,
+            },
+        ),
+    )
+    .await
+    .map_err(|_| timed_out())??;
+    match protocol::read(stream).await? {
+        Message::Ready {} => Ok(()),
+        Message::OpenFailed { code } => Err(io::Error::new(
+            match code {
+                Code::Busy => io::ErrorKind::WouldBlock,
+                Code::Timeout => io::ErrorKind::TimedOut,
+                Code::ConnectFailed => io::ErrorKind::ConnectionRefused,
+                _ => io::ErrorKind::NotConnected,
+            },
+            "Tunnel origin setup failed",
+        )),
+        _ => Err(invalid()),
+    }
+}
+
 async fn serve_data(
     peer: Arc<Peer>,
     session: Arc<Session>,
@@ -291,40 +328,15 @@ async fn serve_data(
         session.wake.notify_waiters();
         return Err(unavailable());
     }
-    let exchange = timeout_at(open.deadline, async {
-        let remaining = open
-            .deadline
-            .saturating_duration_since(Instant::now())
-            .as_millis();
-        if remaining == 0 {
-            return Err(timed_out());
-        }
-        timeout_at(
-            attachment_deadline.min(open.deadline),
-            protocol::write(
-                &mut channel.io,
-                &Message::Open {
-                    service: open.service.clone(),
-                    budget_ms: remaining.min(protocol::MAX_BUDGET_MS as u128) as u32,
-                },
-            ),
-        )
-        .await
-        .map_err(|_| timed_out())??;
-        match protocol::read(&mut channel.io).await? {
-            Message::Ready {} => Ok(()),
-            Message::OpenFailed { code } => Err(io::Error::new(
-                match code {
-                    Code::Busy => io::ErrorKind::WouldBlock,
-                    Code::Timeout => io::ErrorKind::TimedOut,
-                    Code::ConnectFailed => io::ErrorKind::ConnectionRefused,
-                    _ => io::ErrorKind::NotConnected,
-                },
-                "Tunnel origin setup failed",
-            )),
-            _ => Err(invalid()),
-        }
-    });
+    let exchange = timeout_at(
+        open.deadline,
+        exchange_open(
+            &mut channel.io,
+            &open.service,
+            open.deadline,
+            attachment_deadline,
+        ),
+    );
     let result = tokio::select! {
         biased;
         _ = open.reply.closed() => return Ok(()),
