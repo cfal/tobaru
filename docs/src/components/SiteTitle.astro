@@ -1,0 +1,85 @@
+---
+import { Icon } from '@astrojs/starlight/components';
+import { docsLabel, sourceRef, sourceRefKnown } from '../../metadata.mjs';
+
+const { siteTitle, siteTitleHref } = Astro.locals.starlightRoute;
+---
+
+<div class="site-identity">
+  <div class="brand">
+    <a class="site-title" href={siteTitleHref}>
+      <span class="house-mark" aria-hidden="true"></span>
+      <span translate="no">{siteTitle}</span>
+    </a>
+    <a class="repository" href="https://github.com/cfal/tobaru" aria-label="tobaru on GitHub" title="tobaru on GitHub">
+      <Icon name="github" size="1.25rem" />
+    </a>
+  </div>
+  <div class="docs-version" role="note" aria-label="Documentation version" data-pagefind-ignore>
+    <span title={docsLabel === 'dev' ? 'Unreleased development documentation' : docsLabel}>{docsLabel}</span>
+    {sourceRefKnown
+      ? <a href={`https://github.com/cfal/tobaru/commit/${sourceRef}`}>Source {sourceRef.slice(0, 12)}</a>
+      : <span>Source revision unavailable</span>}
+  </div>
+</div>
+
+<style>
+  :global(:root) {
+    --sl-nav-height: 5rem;
+    --sl-nav-pad-y: 0.5rem;
+  }
+  .site-identity,
+  .docs-version {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    min-height: 1.75rem;
+  }
+  .site-title {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.45rem;
+    min-width: 0;
+    color: var(--sl-color-text-accent);
+    font-size: var(--sl-text-h4);
+    font-weight: 600;
+    line-height: 1.25;
+    text-decoration: none;
+    white-space: nowrap;
+  }
+  .house-mark {
+    flex: none;
+    width: 2rem;
+    height: 1.75rem;
+    background: currentColor;
+    mask: url('/tobaru-mark.svg') center / contain no-repeat;
+  }
+  .repository {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.75rem;
+    height: 1.75rem;
+    color: var(--sl-color-text);
+  }
+  .repository:hover { color: var(--sl-color-text-accent); }
+  .docs-version {
+    color: var(--sl-color-gray-2);
+    font-size: 0.75rem;
+    line-height: 1.4;
+  }
+  .docs-version a { color: inherit; }
+  @media (min-width: 50rem) {
+    :global(:root) { --sl-nav-height: 4rem; }
+    .site-identity {
+      flex-direction: row;
+      align-items: center;
+      gap: 1rem;
+    }
+  }
+</style>

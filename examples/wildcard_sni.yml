@@ -7,7 +7,7 @@
 #   "example.com"     -- exact match only
 #   "*.example.com"   -- matches any subdomain, but NOT example.com itself
 #   ".example.com"    -- matches both example.com and any subdomain
-#   "*"               -- catch-all, matches everything (same as "any")
+#   "*"               -- any present SNI (same as "any"); not absent SNI
 #
 # At equal IP specificity: exact > deepest wildcard > shallower wildcard > any.
 # IP/ALPN mismatches do not hide eligible broader patterns.
@@ -94,7 +94,7 @@
 # Example 6: Catch-all wildcard with specific overrides
 #
 # special.com -> special-backend (exact match)
-# everything else -> default-backend (catch-all)
+# any other present SNI -> default-backend; absent SNI is rejected
 - address: 0.0.0.0:12443
   transport: tcp
   targets:

@@ -1,0 +1,27 @@
+---
+title: Examples
+description: Complete YAML files from the tobaru source tree.
+---
+
+import { examples } from '../../../data/examples';
+
+These pages render the tracked YAML directly, including comments and copyable
+configuration. Adapt bind addresses, backends, allowlists, and certificate paths
+before use. Examples with public listeners are not secure deployment defaults.
+
+<ul>
+  {examples.map(({ filename, slug }) => <li><a href={`/examples/${slug}/`}>{filename}</a></li>)}
+</ul>
+
+Start with [first-config.yml](/examples/first-config/) for a self-contained local
+HTTP response. The other examples cover TLS passthrough, wildcard SNI, Host
+header routing, and path-based bookmarks; some require certificates or backends.
+
+```sh
+tobaru --dry-run config.yaml
+tobaru config.yaml
+```
+
+Validation does not bind sockets, invoke firewall commands, or contact backends.
+Review [routing precedence](/config/tcp/#target-evaluation-order) and
+[deployment contracts](/operations/limits/#deployment-contracts) as well.

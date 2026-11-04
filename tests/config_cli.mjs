@@ -5,6 +5,7 @@ import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 
 const binary = resolve(process.argv[2] ?? 'target/debug/tobaru');
+execFileSync(binary, ['-t', '1', '--dry-run', 'examples/first-config.yml'], { timeout: 5000 });
 for (const scheme of ['tcp', 'udp']) {
   for (const [host, exposed] of [
     ['127.0.0.1', false], ['127.2.3.4', false], ['[::1]', false],
