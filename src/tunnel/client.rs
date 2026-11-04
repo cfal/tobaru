@@ -423,6 +423,82 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn dial_rejects_a_hub_that_does_not_negotiate_alpn() {
+        let (client, listener, mut tls) = harness().await;
+        Arc::get_mut(&mut tls.server)
+            .unwrap()
+            .alpn_protocols
+            .clear();
+        let address = (
+            std::net::Ipv4Addr::LOCALHOST,
+            listener.local_addr().unwrap().port(),
+        )
+            .into();
+        let (server, agent) = timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                async {
+                    let (socket, _) = listener.accept().await.unwrap();
+                    tokio_rustls::TlsAcceptor::from(tls.server)
+                        .accept(socket)
+                        .await
+                },
+                client.dial(address),
+            )
+        })
+        .await
+        .unwrap();
+        assert!(server.is_ok(), "TLS itself must succeed without ALPN");
+        assert!(matches!(agent, Err(error) if error.kind() == io::ErrorKind::InvalidData));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn occupied_data_dial_slots_do_not_extend_the_work_deadline() {
+        let (client, listener, _tls) = harness().await;
+        let slots = client
+            .data_dial_slots
+            .clone()
+            .acquire_many_owned(4)
+            .await
+            .unwrap();
+        let (writer, mut messages) = mpsc::channel(1);
+        let stop = Stop::default();
+        let channel = Id::new();
+        let work = Work {
+            address: (
+                std::net::Ipv4Addr::LOCALHOST,
+                listener.local_addr().unwrap().port(),
+            )
+                .into(),
+            session: Id::new(),
+            channel: channel.clone(),
+            accepted_services: Arc::new(HashSet::from(["web".into()])),
+            stop: stop.clone(),
+            writer,
+            socket: client.sockets.acquire(256).unwrap(),
+            job: client.data_setup_jobs.acquire(8).unwrap(),
+            deadline: Instant::now() + Duration::from_secs(10),
+        };
+        let mut task = Box::pin(client.data(work));
+        assert!(futures::poll!(&mut task).is_pending());
+        tokio::time::advance(Duration::from_secs(9)).await;
+        assert!(futures::poll!(&mut task).is_pending());
+        assert_eq!(client.sockets.count(), 1);
+        assert_eq!(client.data_setup_jobs.count(), 1);
+        assert_eq!(client.local_dials.count(), 0);
+        assert_eq!(client.active.count(), 0);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        timeout(Duration::from_millis(1), task).await.unwrap();
+        assert!(matches!(messages.try_recv().unwrap(),
+            Message::CreateFailed { channel_id, .. } if channel_id == channel));
+        assert!(!stop.is_cancelled());
+        assert_eq!(client.sockets.count(), 0);
+        assert_eq!(client.data_setup_jobs.count(), 0);
+        assert_eq!(client.data_dial_slots.available_permits(), 0);
+        drop(slots);
+        assert_eq!(client.data_dial_slots.available_permits(), 4);
+    }
+
     async fn start_data(
         client: &Arc<Client>,
         listener: &TcpListener,

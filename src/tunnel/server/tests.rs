@@ -196,7 +196,7 @@ async fn retirement_or_replacement_after_assignment_prevents_open() {
 }
 
 #[tokio::test]
-async fn ready_can_arrive_after_attachment_deadline_and_handoff_retains_stream_permits() {
+async fn ready_handoff_survives_attachment_deadline_and_session_close() {
     let (peer, session, mut messages) = harness(1);
     let mut caller = Box::pin(peer.open("web", Instant::now() + Duration::from_secs(60)));
     assert!(futures::poll!(&mut caller).is_pending());
@@ -221,22 +221,28 @@ async fn ready_can_arrive_after_attachment_deadline_and_handoff_retains_stream_p
         .unwrap();
     use tokio::io::AsyncWriteExt;
     agent.write_all(b"greeting").await.unwrap();
+    timeout(Duration::from_secs(1), worker)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    session.close();
+    agent.write_all(b"!").await.unwrap();
     let mut stream = timeout(Duration::from_secs(1), caller)
         .await
         .unwrap()
         .unwrap();
-    worker.await.unwrap().unwrap();
     assert_eq!(peer.pending.count(), 0);
     assert_eq!(peer.active.count(), 1);
     assert_eq!(peer.physical.count(), 1);
     assert_eq!(peer.endpoint.accepted.count(), 1);
     assert_eq!(peer.endpoint.credits.count(), 0);
-    let mut bytes = [0; 8];
+    let mut bytes = [0; 9];
     timeout(Duration::from_secs(1), stream.read_exact(&mut bytes))
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(&bytes, b"greeting");
+    assert_eq!(&bytes, b"greeting!");
     drop(stream);
     assert_released(&peer);
 }

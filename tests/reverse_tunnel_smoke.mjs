@@ -22,6 +22,8 @@ const sessions = [];
 let root;
 let allowRelay = true;
 const carriers = [];
+const portReservations = [];
+let retryStartup = false;
 
 function track(socket) {
   sockets.add(socket);
@@ -38,13 +40,17 @@ async function listen(server, address) {
   return typeof server.address() === 'string' ? server.address() : server.address().port;
 }
 
-async function freePort() {
-  const server = net.createServer();
+async function reservePort() {
+  const server = net.createServer(socket => socket.destroy());
+  portReservations.push(server);
   server.listen(0, '0.0.0.0');
   await once(server, 'listening', { signal });
-  const port = server.address().port;
-  await new Promise(resolve => server.close(resolve));
-  return port;
+  return server.address().port;
+}
+
+async function releasePorts() {
+  await Promise.all(portReservations.splice(0).map(server =>
+    new Promise(resolve => server.close(resolve))));
 }
 
 async function certificate(name) {
@@ -64,6 +70,7 @@ function launch(config, { limitedFds = false } = {}) {
     : ['-t', '1', config];
   const child = spawn(command, args, { stdio: ['ignore', 'ignore', 'pipe'], env: { ...process.env, RUST_LOG: 'info' } });
   child.logs = '';
+  child.ready = false;
   child.stderr.on('data', bytes => { child.logs = (child.logs + bytes).slice(-64_000); });
   child.closed = once(child, 'close');
   children.push(child);
@@ -166,9 +173,9 @@ async function rejectedTls(port, identity, message, alpn = 'tobaru-reverse/2') {
 }
 
 async function assertAcceptRecovery(hubIdentity, agentIdentity, originPort, webPort) {
-  const hubPort = await freePort();
-  const publicPort = await freePort();
-  const ordinaryPort = await freePort();
+  const hubPort = await reservePort();
+  const publicPort = await reservePort();
+  const ordinaryPort = await reservePort();
   const publicPath = path.join(root, 'fd-public.json');
   const clientPath = path.join(root, 'fd-client.json');
   await writeFile(publicPath, JSON.stringify([
@@ -185,6 +192,7 @@ async function assertAcceptRecovery(hubIdentity, agentIdentity, originPort, webP
       cert: agentIdentity.certPath, key: agentIdentity.keyPath },
     services: { raw: { location: `127.0.0.1:${originPort}` } },
   }]));
+  await releasePorts();
   const hub = launch(publicPath, { limitedFds: true });
   const client = launch(clientPath);
   const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 1 });
@@ -196,6 +204,8 @@ async function assertAcceptRecovery(hubIdentity, agentIdentity, originPort, webP
     const ordinary = Object.values(httpAgent.freeSockets).flat()[0];
     assert(ordinary && !ordinary.destroyed);
     active = await eventually(() => raw(publicPort));
+    hub.ready = true;
+    client.ready = true;
     for (let cycle = 0; cycle < 2; cycle++) {
       const logOffset = hub.logs.length;
       async function logged(pattern) {
@@ -289,7 +299,7 @@ try {
   const unixPath = path.join(root, 'origin.sock');
   await listen(net.createServer(socket => socket.pipe(socket)), unixPath);
 
-  const hubPort = await freePort();
+  const hubPort = await reservePort();
   const relayPort = await listen(net.createServer({ allowHalfOpen: true }, incoming => {
     if (!allowRelay) { incoming.destroy(); return; }
     const outgoing = track(net.connect({ port: hubPort, host: '127.0.0.1', allowHalfOpen: true }));
@@ -299,10 +309,10 @@ try {
     incoming.on('close', () => outgoing.destroy());
     outgoing.on('close', () => incoming.destroy());
   }));
-  const publicRaw = await freePort();
-  const publicHttp = await freePort();
-  const publicUnix = await freePort();
-  const publicPass = await freePort();
+  const publicRaw = await reservePort();
+  const publicHttp = await reservePort();
+  const publicUnix = await reservePort();
+  const publicPass = await reservePort();
   const services = ['web', 'raw', 'unix', 'h2', 'secure', 'secure_h2', 'spare'];
   const destination = service => ({ tunnel: { server: 'edge', peer: 'home', service } });
   const paths = {};
@@ -359,7 +369,10 @@ try {
     patch(bad[0]);
     await invalidConfig(bad);
   }
+  await invalidConfig([...clientConfig, ...structuredClone(clientConfig)]);
   for (const patch of [
+    config => { config[1].address = config[0].address; },
+    config => { config.push({ ...structuredClone(config[0]), address: '127.0.0.1:1' }); },
     config => { config[0].peers.other = structuredClone(config[0].peers.home); },
     config => { config[0].peers.home.services.push('web'); },
     config => { config[0].max_handshakes = 1025; },
@@ -374,10 +387,13 @@ try {
     patch(bad);
     await invalidConfig(bad);
   }
+  await releasePorts();
   const publicChild = launch(publicPath);
   const clientChild = launch(clientPath);
   const liveCarriers = () => carriers.filter(carrier => !carrier.incoming.destroyed && !carrier.outgoing.destroyed);
   await eventually(() => assert.match(clientChild.logs, /Tunnel client home registered/));
+  publicChild.ready = true;
+  clientChild.ready = true;
   const registeredCarriers = carriers.length;
   await delay(500, undefined, { signal });
   assert.equal(liveCarriers().length, 1, 'Registration must create only the control connection');
@@ -508,7 +524,9 @@ try {
   console.log('reverse tunnel smoke passed: mTLS, demand-only channels, TCP/Unix, half-close, H1/H2, origin TLS, control loss, reload, reconnect, FD exhaustion recovery');
 } catch (error) {
   for (const child of children) console.error(child.logs);
-  throw error;
+  retryStartup = process.argv[3] !== '--startup-retry' && children.some(child =>
+    !child.ready && child.exitCode !== null && /Address already in use/i.test(child.logs));
+  if (!retryStartup) throw error;
 } finally {
   for (const agent of agents) agent.destroy();
   for (const session of sessions) session.destroy();
@@ -516,5 +534,14 @@ try {
   for (const child of children) if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
   await Promise.all(children.map(child => child.closed));
   for (const server of servers) await new Promise(resolve => server.close(resolve));
+  await releasePorts();
   if (root) await rm(root, { recursive: true, force: true });
+}
+
+if (retryStartup) {
+  console.error('Retrying reverse tunnel smoke after a startup port collision');
+  const result = spawnSync(process.execPath, [process.argv[1], binary, '--startup-retry'],
+    { stdio: 'inherit', timeout: 125_000 });
+  assert.ifError(result.error);
+  assert.equal(result.status, 0, 'Reverse tunnel smoke retry failed');
 }

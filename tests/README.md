@@ -93,8 +93,9 @@ node tests/config_cli.mjs target/release/tobaru
 
 The reverse-tunnel smoke starts separate public and NAT-side processes, physical
 TCP/Unix/HTTP origins, and a half-close-preserving TCP relay used to drop only the
-control connection. It requires Node 22+ and OpenSSL, has a 120-second overall budget,
-and removes its certificates/configs beneath `$HOME/tmp`. It checks mTLS identity and
+control connection. It requires Node 22+ and OpenSSL, has a 120-second budget per attempt,
+and removes its certificates/configs beneath `$HOME/tmp`. It retries once with fresh
+fixtures if a child loses a startup port to another listener. It checks mTLS identity and
 ALPN/version rejection, strict config validation, no speculative or replenished data
 channels, demand bursts above the creation concurrency limit, raw
 server-first data and half-close, H1/H2 forwarding and reuse, origin TLS/pin failures,
