@@ -102,6 +102,10 @@ function request(port, url, agent = false) {
   });
 }
 
+async function rejectedRequest(port, url, agent = false) {
+  await assert.rejects(request(port, url, agent), { code: 'ECONNRESET' });
+}
+
 function readBytes(socket, count) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -142,12 +146,14 @@ async function echo(socket, text) {
 
 function h2Request(session, url) {
   return new Promise((resolve, reject) => {
-    const stream = session.request({ ':path': url });
+    const stream = session.request({ ':path': url },
+      { signal: AbortSignal.any([signal, AbortSignal.timeout(3000)]) });
     let body = '';
     stream.setEncoding('utf8');
     stream.on('data', data => { body += data; });
     stream.on('end', () => resolve(body));
     stream.on('error', reject);
+    stream.on('close', () => reject(new Error(`H2 stream closed before completion: ${url}`)));
     stream.end();
   });
 }
@@ -159,17 +165,22 @@ function frame(message) {
   return Buffer.concat([prefix, body]);
 }
 
-async function rejectedTls(port, identity, message, alpn = 'tobaru-reverse/2') {
+async function rejectedTls(port, identity, message, { alpn = 'tobaru-reverse/2', requireAlpn = false } = {}) {
   const socket = track(tls.connect({ host: '127.0.0.1', port, rejectUnauthorized: false,
     cert: identity?.cert, key: identity?.key, ALPNProtocols: [alpn] }));
   let bytes = 0;
+  let negotiated;
   socket.on('data', chunk => { bytes += chunk.length; });
-  socket.once('secureConnect', () => socket.write(frame(message)));
+  socket.once('secureConnect', () => {
+    negotiated = socket.alpnProtocol;
+    socket.write(frame(message));
+  });
   await new Promise((resolve, reject) => {
     const timer = setTimeout(() => { socket.destroy(); reject(new Error('Unauthenticated connection was not rejected')); }, 3000);
     socket.once('close', () => { clearTimeout(timer); resolve(); });
   });
   assert.equal(bytes, 0, 'Rejected peer received a successful protocol response');
+  if (requireAlpn) assert.equal(negotiated, 'tobaru-reverse/2', 'Metadata rejection must follow TLS setup');
 }
 
 async function assertAcceptRecovery(hubIdentity, agentIdentity, originPort, webPort) {
@@ -313,6 +324,7 @@ try {
   const publicHttp = await reservePort();
   const publicUnix = await reservePort();
   const publicPass = await reservePort();
+  const publicRawTls = await reservePort();
   const services = ['web', 'raw', 'unix', 'h2', 'secure', 'secure_h2', 'spare'];
   const destination = service => ({ tunnel: { server: 'edge', peer: 'home', service } });
   const paths = {};
@@ -335,6 +347,8 @@ try {
     { address: `0.0.0.0:${publicPass}`, target: { allowlist: 'all', location: destination('secure'), server_tls: { mode: 'passthrough' } } },
     { address: `0.0.0.0:${publicHttp}`, target: { allowlist: 'all', http_protocols: ['http1', 'http2'], http_paths: paths,
       default_http_action: { type: 'serve-message', status_code: 404 } } },
+    { address: `0.0.0.0:${publicRawTls}`, target: { allowlist: 'all', location: destination('raw'),
+      server_tls: { cert: hubIdentity.certPath, key: hubIdentity.keyPath } } },
   ];
   const clientConfig = [{ tunnel_client: 'home', server: `127.0.0.1:${relayPort}`,
     client_tls: { verify: false, server_fingerprints: [hubIdentity.pin], sni_hostname: 'localhost', cert: agentIdentity.certPath, key: agentIdentity.keyPath },
@@ -414,11 +428,11 @@ try {
   const hello = { type: 'control_hello', version: 2, peer: 'home', services: ['web'] };
   await rejectedTls(hubPort, undefined, hello);
   await rejectedTls(hubPort, stranger, hello);
-  await rejectedTls(hubPort, agentIdentity, { ...hello, peer: 'impostor' });
-  await rejectedTls(hubPort, agentIdentity, hello, 'h2');
-  await rejectedTls(hubPort, agentIdentity, { ...hello, version: 1 }, 'tobaru-reverse/1');
-  await rejectedTls(hubPort, agentIdentity, { ...hello, version: 1 });
-  await rejectedTls(hubPort, agentIdentity, { type: 'data_hello', version: 2, peer: 'home', session_id: '0'.repeat(32), channel_id: '1'.repeat(32) });
+  await rejectedTls(hubPort, agentIdentity, { ...hello, peer: 'impostor' }, { requireAlpn: true });
+  await rejectedTls(hubPort, agentIdentity, hello, { alpn: 'h2' });
+  await rejectedTls(hubPort, agentIdentity, { ...hello, version: 1 }, { alpn: 'tobaru-reverse/1' });
+  await rejectedTls(hubPort, agentIdentity, { ...hello, version: 1 }, { requireAlpn: true });
+  await rejectedTls(hubPort, agentIdentity, { type: 'data_hello', version: 2, peer: 'home', session_id: '0'.repeat(32), channel_id: '1'.repeat(32) }, { requireAlpn: true });
 
   const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 1 });
   agents.push(httpAgent);
@@ -427,12 +441,14 @@ try {
   assert.deepEqual(response.headers['set-cookie'], ['test=yes; Path=/']);
   assert.equal(JSON.parse(response.body).host, `127.0.0.1:${publicHttp}`);
   const beforeReuse = httpAccepts;
-  await request(publicHttp, '/home/again', httpAgent);
+  const reused = await request(publicHttp, '/home/again', httpAgent);
+  assert.equal(reused.status, 200);
+  assert.equal(JSON.parse(reused.body).path, '/again');
   assert.equal(httpAccepts, beforeReuse);
   assert.equal((await request(publicHttp, '/h2/a')).body, 'h2:/a');
   assert.equal((await request(publicHttp, '/secure/b')).body, 'tls:/b');
   assert.equal((await request(publicHttp, '/secure-h2/c')).body, 'h2tls:/c');
-  await assert.rejects(request(publicHttp, '/bad-pin/'));
+  await rejectedRequest(publicHttp, '/bad-pin/');
   assert.equal((await request(publicHttp, '/secure/still-usable')).body, 'tls:/still-usable');
   const upgrade = track(net.connect(publicHttp, '127.0.0.1'));
   await once(upgrade, 'connect', { signal });
@@ -451,10 +467,17 @@ try {
 
   const passthrough = track(tls.connect({ host: '127.0.0.1', port: publicPass, servername: 'localhost', rejectUnauthorized: false }));
   await once(passthrough, 'secureConnect', { signal });
-  const passReply = readBytes(passthrough, 1);
+  const passReply = readBytes(passthrough, 13);
   passthrough.write('GET /passthrough HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n');
-  assert.match((await passReply).toString(), /HTTP\/1.1 200/);
+  assert.match((await passReply).toString(), /^HTTP\/1\.1 200 /);
   passthrough.destroy();
+  const terminated = track(tls.connect({ host: '127.0.0.1', port: publicRawTls,
+    servername: 'localhost', rejectUnauthorized: false }));
+  const terminatedGreeting = readBytes(terminated, 6);
+  await once(terminated, 'secureConnect', { signal });
+  assert.equal((await terminatedGreeting).toString(), 'ready\n');
+  await echo(terminated, 'tls-terminated-raw');
+  terminated.destroy();
   const unix = track(net.connect(publicUnix, '127.0.0.1'));
   await once(unix, 'connect', { signal });
   await echo(unix, 'unix');
@@ -473,30 +496,38 @@ try {
   half.destroy();
 
   allowRelay = false;
+  const disconnectOffset = clientChild.logs.length;
   controlCarrier.incoming.destroy();
   controlCarrier.outgoing.destroy();
-  await delay(200, undefined, { signal });
+  await eventually(() => assert.match(clientChild.logs.slice(disconnectOffset), /Tunnel client home disconnected/));
+  await eventually(() => rejectedRequest(publicHttp, '/home/new-physical'));
   await echo(active, 'control-lost');
   await echo(upgrade, 'upgrade-control-lost');
   assert.equal(JSON.parse((await request(publicHttp, '/home/reused', httpAgent)).body).path, '/reused');
   assert.equal(await h2Request(frontendH2, '/h2/reused'), 'h2:/reused');
-  await assert.rejects(request(publicHttp, '/home/new-physical'));
   allowRelay = true;
   await eventually(async () => assert.equal((await request(publicHttp, '/home/reconnected')).status, 200));
 
-  const invalid = structuredClone(publicConfig);
-  invalid[0].max_connections = 0;
-  await writeFile(publicPath, JSON.stringify(invalid));
-  await eventually(() => assert.match(publicChild.logs, /Config reload rejected/));
-  await echo(active, 'invalid-reload-preserved');
+  for (const invalidate of [
+    config => { config[0].max_connections = 0; },
+    config => { config[1].address = config[0].address; },
+  ]) {
+    const invalid = structuredClone(publicConfig);
+    invalidate(invalid);
+    const logOffset = publicChild.logs.length;
+    await writeFile(publicPath, JSON.stringify(invalid));
+    await eventually(() => assert.match(publicChild.logs.slice(logOffset), /Config reload rejected/));
+    await echo(active, 'invalid-reload-preserved');
+  }
   const stale = track(tls.connect({ host: '127.0.0.1', port: hubPort, rejectUnauthorized: false,
     cert: agentIdentity.cert, key: agentIdentity.key, ALPNProtocols: ['tobaru-reverse/2'] }));
   await once(stale, 'secureConnect', { signal });
-  const activeClosed = once(active, 'close', { signal });
-  const staleClosed = once(stale, 'close', { signal });
+  const reloadSignal = AbortSignal.any([signal, AbortSignal.timeout(5000)]);
+  const activeClosed = once(active, 'close', { signal: reloadSignal });
+  const staleClosed = once(stale, 'close', { signal: reloadSignal });
   await request(publicHttp, '/home/pre-reload-cache', httpAgent);
   assert(cachedOrigin && !cachedOrigin.destroyed);
-  const cachedOriginClosed = once(cachedOrigin, 'close', { signal });
+  const cachedOriginClosed = once(cachedOrigin, 'close', { signal: reloadSignal });
   const cachedFrontend = Object.values(httpAgent.freeSockets).flat()[0];
   assert(cachedFrontend && !cachedFrontend.destroyed);
   // Removing an unused export must not prevent the remaining intersection registering.
@@ -505,18 +536,18 @@ try {
   await Promise.all([activeClosed, staleClosed, cachedOriginClosed]);
   await eventually(async () => assert.equal((await request(publicHttp, '/home/reloaded')).status, 200));
   assert(!cachedFrontend.destroyed, 'Idle H1 frontend should survive backend revocation');
-  await assert.rejects(request(publicHttp, '/home/retired-generation', httpAgent));
+  await rejectedRequest(publicHttp, '/home/retired-generation', httpAgent);
   assert.equal((await request(publicHttp, '/home/new-generation', httpAgent)).status, 200);
   assert.match(clientChild.logs, /exports not accepted/);
 
   const clientActive = await raw(publicRaw);
-  const clientClosed = once(clientActive, 'close', { signal });
+  const clientClosed = once(clientActive, 'close', { signal: AbortSignal.any([signal, AbortSignal.timeout(5000)]) });
   await writeFile(clientPath, `${JSON.stringify(clientConfig)}\n`);
   await clientClosed;
   await eventually(async () => assert.equal((await request(publicHttp, '/home/client-reloaded')).status, 200));
   clientChild.kill('SIGKILL');
   await clientChild.closed;
-  await assert.rejects(request(publicHttp, '/home/offline'));
+  await eventually(() => rejectedRequest(publicHttp, '/home/offline'));
   launch(clientPath);
   await eventually(async () => assert.equal((await request(publicHttp, '/home/restarted')).status, 200));
   assert.equal(publicChild.exitCode, null);

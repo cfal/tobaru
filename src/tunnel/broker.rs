@@ -538,6 +538,137 @@ mod tests {
         assert_eq!(peer.pending.count(), 0);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn pending_limit_rejects_demand_with_active_capacity_remaining() {
+        let (mut peer, session, mut messages) = harness(2);
+        Arc::get_mut(&mut peer).unwrap().config.max_pending_opens = 1;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut first = Box::pin(peer.open("web", deadline));
+        assert!(futures::poll!(&mut first).is_pending());
+        let mut rejected = Box::pin(peer.open("web", deadline));
+        assert!(matches!(futures::poll!(&mut rejected),
+            std::task::Poll::Ready(Err(error)) if error.kind() == io::ErrorKind::WouldBlock));
+        drop(rejected);
+        assert_eq!(peer.active.count(), 1);
+        assert_eq!(peer.pending.count(), 1);
+        assert_eq!(session.state.lock().as_ref().unwrap().opens.len(), 1);
+        drop(first);
+        session.request_data(&peer).unwrap();
+        assert!(messages.try_recv().is_err());
+        assert_eq!(peer.active.count(), 0);
+        assert_eq!(peer.pending.count(), 0);
+        assert_eq!(peer.physical.count(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_creation_failure_releases_credit_and_backs_off_without_losing_demand() {
+        let (peer, session, mut messages) = harness(1);
+        let mut caller = Box::pin(peer.open("web", Instant::now() + Duration::from_secs(60)));
+        assert!(futures::poll!(&mut caller).is_pending());
+        session.request_data(&peer).unwrap();
+        let id = expect_create_data(&mut messages);
+        session.failed(&id, &peer);
+        assert_eq!(peer.physical.count(), 0);
+        assert_eq!(peer.endpoint.credits.count(), 0);
+        assert_eq!(peer.active.count(), 1);
+        assert_eq!(peer.pending.count(), 1);
+        assert_eq!(session.state.lock().as_ref().unwrap().opens.len(), 1);
+        session.request_data(&peer).unwrap();
+        assert!(messages.try_recv().is_err());
+        tokio::time::advance(Duration::from_millis(999)).await;
+        session.request_data(&peer).unwrap();
+        assert!(messages.try_recv().is_err());
+        tokio::time::advance(Duration::from_millis(1001)).await;
+        session.request_data(&peer).unwrap();
+        let retry = expect_create_data(&mut messages);
+        assert_ne!(id, retry);
+        drop(session.attach(&retry, &[1]).unwrap());
+        assert_eq!(session.state.lock().as_ref().unwrap().failures, 0);
+        assert!(caller.await.is_err());
+        assert_eq!(peer.active.count(), 0);
+        assert_eq!(peer.pending.count(), 0);
+        assert_eq!(peer.physical.count(), 0);
+        assert_eq!(peer.endpoint.credits.count(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn full_control_writer_releases_unsent_credit_without_losing_demand() {
+        let (peer, session, mut messages) = harness(1);
+        while session.writer.try_send(Message::Ping { nonce: 1 }).is_ok() {}
+        let mut caller = Box::pin(peer.open("web", Instant::now() + Duration::from_secs(60)));
+        assert!(futures::poll!(&mut caller).is_pending());
+        assert_eq!(
+            session.request_data(&peer).unwrap_err().kind(),
+            io::ErrorKind::NotConnected
+        );
+        assert_eq!(session.state.lock().as_ref().unwrap().credits.len(), 0);
+        assert_eq!(session.state.lock().as_ref().unwrap().opens.len(), 1);
+        assert_eq!(peer.active.count(), 1);
+        assert_eq!(peer.pending.count(), 1);
+        assert_eq!(peer.physical.count(), 0);
+        assert_eq!(peer.endpoint.credits.count(), 0);
+        while let Ok(message) = messages.try_recv() {
+            assert!(matches!(message, Message::Ping { nonce: 1 }));
+        }
+        session.request_data(&peer).unwrap();
+        let id = expect_create_data(&mut messages);
+        drop(session.attach(&id, &[1]).unwrap());
+        assert!(caller.await.is_err());
+        assert_eq!(peer.active.count(), 0);
+        assert_eq!(peer.pending.count(), 0);
+        assert_eq!(peer.physical.count(), 0);
+        assert_eq!(peer.endpoint.credits.count(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn endpoint_capacity_is_shared_and_recovers_across_peers() {
+        let (mut first, first_session, mut first_messages) = harness(1);
+        let (mut second, second_session, mut second_messages) = harness(1);
+        let endpoint = Arc::new(Endpoint::new(Arc::default(), Arc::default(), 3));
+        Arc::get_mut(&mut first).unwrap().endpoint = endpoint.clone();
+        Arc::get_mut(&mut second).unwrap().endpoint = endpoint.clone();
+        let controls = [endpoint.accept().unwrap(), endpoint.accept().unwrap()];
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut first_caller = Box::pin(first.open("web", deadline));
+        let mut second_caller = Box::pin(second.open("web", deadline));
+        assert!(futures::poll!(&mut first_caller).is_pending());
+        assert!(futures::poll!(&mut second_caller).is_pending());
+        first_session.request_data(&first).unwrap();
+        let first_id = expect_create_data(&mut first_messages);
+        second_session.request_data(&second).unwrap();
+        assert!(second_messages.try_recv().is_err());
+        assert_eq!(second.physical.count(), 0);
+        assert_eq!(endpoint.accepted.count(), 2);
+        assert_eq!(endpoint.credits.count(), 1);
+
+        drop(first_caller);
+        first_session.failed(&first_id, &first);
+        first_session.request_data(&first).unwrap();
+        assert_eq!(first_session.state.lock().as_ref().unwrap().failures, 1);
+        second_session.request_data(&second).unwrap();
+        let second_id = expect_create_data(&mut second_messages);
+        let accepted = endpoint.accept().unwrap();
+        let (credit, open) = second_session.attach(&second_id, &[1]).unwrap();
+        drop(credit._endpoint);
+        assert!(endpoint.accept().is_err());
+        assert_eq!(endpoint.credits.count(), 0);
+        assert_eq!(second.active.count(), 1);
+        assert_eq!(second.pending.count(), 1);
+        assert_eq!(second.physical.count(), 1);
+        drop((open, credit.physical, accepted));
+        assert!(second_caller.await.is_err());
+        drop(controls);
+        for peer in [&first, &second] {
+            assert_eq!(peer.active.count(), 0);
+            assert_eq!(peer.pending.count(), 0);
+            assert_eq!(peer.physical.count(), 0);
+        }
+        assert_eq!(endpoint.accepted.count(), 0);
+        assert_eq!(endpoint.credits.count(), 0);
+        assert!(!first_session.stop.is_cancelled());
+        assert!(!second_session.stop.is_cancelled());
+    }
+
     #[tokio::test]
     async fn replacement_fences_old_cleanup_and_retirement_rejects_late_commits() {
         let (peer, old, _messages) = harness(2);

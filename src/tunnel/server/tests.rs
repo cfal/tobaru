@@ -32,6 +32,39 @@ fn assert_released(peer: &Peer) {
     assert_eq!(peer.endpoint.credits.count(), 0);
 }
 
+fn hub(peer: &Arc<Peer>, tls: &Tls) -> Arc<Server> {
+    Arc::new(Server {
+        address: "0.0.0.0:0".parse().unwrap(),
+        tls: tls.server.clone(),
+        gate: peer.gate.clone(),
+        endpoint: peer.endpoint.clone(),
+        peers: HashMap::from([("home".into(), peer.clone())]),
+        identities: HashMap::from([(tls.fingerprint.clone(), "home".into())]),
+        handshakes: Arc::default(),
+        max_handshakes: 16,
+    })
+}
+
+async fn block_server_writes(
+    channel: &mut Channel,
+    agent: &tokio_rustls::client::TlsStream<TcpStream>,
+) {
+    use tokio::io::AsyncWriteExt;
+    socket2::SockRef::from(channel.io.get_ref().0)
+        .set_send_buffer_size(4096)
+        .unwrap();
+    socket2::SockRef::from(agent.get_ref().0)
+        .set_recv_buffer_size(4096)
+        .unwrap();
+    channel.io.get_mut().1.set_buffer_limit(Some(32768));
+    assert!(timeout(
+        Duration::from_millis(50),
+        channel.io.write_all(&[0; 262144])
+    )
+    .await
+    .is_err());
+}
+
 #[tokio::test]
 async fn assigned_open_cancellation_closes_channel_without_ready_or_timeout() {
     let (peer, session, mut messages) = harness(1);
@@ -249,24 +282,11 @@ async fn ready_handoff_survives_attachment_deadline_and_session_close() {
 
 #[tokio::test]
 async fn first_open_write_keeps_the_connection_setup_deadline_under_backpressure() {
-    use tokio::io::AsyncWriteExt;
     let (peer, session, mut messages) = harness(1);
     let mut caller = Box::pin(peer.open("web", Instant::now() + Duration::from_secs(60)));
     assert!(futures::poll!(&mut caller).is_pending());
     let (open, mut channel, agent) = channel(&peer, &session, &mut messages).await;
-    socket2::SockRef::from(channel.io.get_ref().0)
-        .set_send_buffer_size(4096)
-        .unwrap();
-    socket2::SockRef::from(agent.get_ref().0)
-        .set_recv_buffer_size(4096)
-        .unwrap();
-    channel.io.get_mut().1.set_buffer_limit(Some(32768));
-    assert!(timeout(
-        Duration::from_millis(50),
-        channel.io.write_all(&[0; 262144])
-    )
-    .await
-    .is_err());
+    block_server_writes(&mut channel, &agent).await;
     let deadline = Instant::now() + Duration::from_secs(5);
     let worker = tokio::spawn(serve_data(
         peer.clone(),
@@ -286,6 +306,32 @@ async fn first_open_write_keeps_the_connection_setup_deadline_under_backpressure
         .unwrap()
         .unwrap();
     assert!(matches!(caller.await, Err(error) if error.kind() == io::ErrorKind::TimedOut));
+    assert_released(&peer);
+}
+
+#[tokio::test]
+async fn cancellation_interrupts_a_backpressured_open_write() {
+    let (peer, session, mut messages) = harness(1);
+    let mut caller = Box::pin(peer.open("web", Instant::now() + Duration::from_secs(60)));
+    assert!(futures::poll!(&mut caller).is_pending());
+    let (open, mut channel, agent) = channel(&peer, &session, &mut messages).await;
+    block_server_writes(&mut channel, &agent).await;
+    tokio::time::pause();
+    let mut worker = Box::pin(serve_data(
+        peer.clone(),
+        session.clone(),
+        channel,
+        open,
+        Instant::now() + Duration::from_secs(10),
+    ));
+    assert!(futures::poll!(&mut worker).is_pending());
+    assert_eq!(peer.pending.count(), 1);
+    drop(caller);
+    timeout(Duration::from_millis(1), worker)
+        .await
+        .expect("caller cancellation waited for the blocked Open write")
+        .unwrap();
+    assert!(!session.stop.is_cancelled());
     assert_released(&peer);
 }
 
@@ -379,6 +425,45 @@ async fn retirement_interrupts_accept_backoff() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn matching_pongs_keep_control_alive_and_wrong_nonces_are_rejected() {
+    let (peer, session, mut messages) = harness(1);
+    let (input, incoming) = tokio::sync::mpsc::channel(64);
+    let mut pumps = Pumps {
+        incoming,
+        outgoing: session.writer.clone(),
+        tasks: JoinSet::new(),
+    };
+    pumps.tasks.spawn(std::future::pending());
+    {
+        let control = run_control(&peer, &session, &mut pumps);
+        tokio::pin!(control);
+        assert!(futures::poll!(&mut control).is_pending());
+        for _ in 0..5 {
+            tokio::time::advance(Duration::from_secs(20)).await;
+            assert!(futures::poll!(&mut control).is_pending());
+            let Message::Ping { nonce } = messages.try_recv().unwrap() else {
+                panic!("expected heartbeat ping")
+            };
+            input.try_send(Message::Pong { nonce }).unwrap();
+            assert!(futures::poll!(&mut control).is_pending());
+        }
+        tokio::time::advance(Duration::from_secs(20)).await;
+        assert!(futures::poll!(&mut control).is_pending());
+        let Message::Ping { nonce } = messages.try_recv().unwrap() else {
+            panic!("expected heartbeat ping")
+        };
+        input
+            .try_send(Message::Pong {
+                nonce: nonce.wrapping_add(1),
+            })
+            .unwrap();
+        assert!(matches!(futures::poll!(&mut control),
+            Poll::Ready(Err(error)) if error.kind() == io::ErrorKind::InvalidData));
+    }
+    pumps.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
 async fn control_deadline_preempts_ready_input_and_keeps_one_outstanding_ping() {
     let (peer, session, mut messages) = harness(1);
     let (input, incoming) = tokio::sync::mpsc::channel(64);
@@ -452,16 +537,7 @@ async fn authenticated_attachment_cannot_commit_after_retirement_or_replacement(
         tokio::task::yield_now().await;
         session.request_data(&peer).unwrap();
         let channel_id = expect_create_data(&mut messages);
-        let server = Arc::new(Server {
-            address: "0.0.0.0:0".parse().unwrap(),
-            tls: tls.server,
-            gate: peer.gate.clone(),
-            endpoint: peer.endpoint.clone(),
-            peers: HashMap::from([("home".into(), peer.clone())]),
-            identities: HashMap::from([(tls.fingerprint, "home".into())]),
-            handshakes: Arc::default(),
-            max_handshakes: 16,
-        });
+        let server = hub(&peer, &tls);
         let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
         let tcp = TcpStream::connect(("127.0.0.1", listener.local_addr().unwrap().port()))
             .await
@@ -470,7 +546,7 @@ async fn authenticated_attachment_cannot_commit_after_retirement_or_replacement(
         let s = server.clone();
         let worker = tokio::spawn(async move {
             let permit = s.endpoint.accept().unwrap();
-            let handshake = s.handshakes.acquire(16).unwrap();
+            let handshake = s.handshakes.acquire(s.max_handshakes).unwrap();
             s.connection(accepted, permit, handshake).await
         });
         let mut agent = tls
@@ -519,4 +595,353 @@ async fn authenticated_attachment_cannot_commit_after_retirement_or_replacement(
         assert!(caller.await.unwrap().is_err());
         assert_released(&peer);
     }
+}
+
+#[tokio::test]
+async fn authenticated_control_replacement_closes_old_demand_and_preserves_new_session() {
+    async fn register(
+        tls: &Tls,
+        address: SocketAddr,
+    ) -> (tokio_rustls::client::TlsStream<TcpStream>, Id) {
+        timeout(Duration::from_secs(5), async {
+            let tcp = TcpStream::connect(address).await.unwrap();
+            let mut agent = tls
+                .connector
+                .connect("localhost".try_into().unwrap(), tcp)
+                .await
+                .unwrap();
+            protocol::write(
+                &mut agent,
+                &Message::ControlHello {
+                    version: protocol::VERSION,
+                    peer: "home".into(),
+                    services: vec!["web".into()],
+                },
+            )
+            .await
+            .unwrap();
+            let Message::ControlReady {
+                session_id,
+                services,
+            } = protocol::read(&mut agent).await.unwrap()
+            else {
+                panic!("expected control registration");
+            };
+            assert_eq!(services, ["web"]);
+            (agent, session_id)
+        })
+        .await
+        .unwrap()
+    }
+
+    let tls = Tls::new();
+    let (peer, _, _) = harness(1);
+    let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let address = (
+        std::net::Ipv4Addr::LOCALHOST,
+        listener.local_addr().unwrap().port(),
+    )
+        .into();
+    let server = hub(&peer, &tls);
+    let worker = tokio::spawn(async move { server.accept_connections(|| listener.accept()).await });
+    let (mut old_control, old_id) = register(&tls, address).await;
+    let old_session = timeout(Duration::from_secs(1), async {
+        loop {
+            if let Ok(session) = peer.session(&old_id) {
+                break session;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut old_caller = Box::pin(peer.open("web", Instant::now() + Duration::from_secs(60)));
+    assert!(futures::poll!(&mut old_caller).is_pending());
+    assert!(matches!(
+        timeout(Duration::from_secs(1), protocol::read(&mut old_control))
+            .await
+            .unwrap()
+            .unwrap(),
+        Message::CreateData { .. }
+    ));
+    let (mut new_control, new_id) = register(&tls, address).await;
+    assert_ne!(old_id, new_id);
+    assert!(
+        timeout(Duration::from_secs(1), protocol::read(&mut old_control))
+            .await
+            .unwrap()
+            .is_err()
+    );
+    assert!(timeout(Duration::from_secs(1), old_caller)
+        .await
+        .unwrap()
+        .is_err());
+    assert!(old_session.stop.is_cancelled());
+    assert!(peer.session(&old_id).is_err());
+    assert!(!peer.session(&new_id).unwrap().stop.is_cancelled());
+    let mut new_caller = Box::pin(peer.open("web", Instant::now() + Duration::from_secs(60)));
+    assert!(futures::poll!(&mut new_caller).is_pending());
+    assert!(matches!(
+        timeout(Duration::from_secs(1), protocol::read(&mut new_control))
+            .await
+            .unwrap()
+            .unwrap(),
+        Message::CreateData { .. }
+    ));
+    drop(new_caller);
+    peer.gate.retire();
+    timeout(Duration::from_secs(1), worker)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_released(&peer);
+}
+
+#[tokio::test]
+async fn silent_ingress_expires_before_and_after_tls_and_releases_capacity() {
+    for authenticated in [false, true] {
+        let tls = Tls::new();
+        let (peer, _, _) = harness(1);
+        let server = hub(&peer, &tls);
+        let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let (tcp, accepted) = timeout(Duration::from_secs(5), async {
+            let tcp = TcpStream::connect(("127.0.0.1", listener.local_addr().unwrap().port()))
+                .await
+                .unwrap();
+            (tcp, listener.accept().await.unwrap().0)
+        })
+        .await
+        .unwrap();
+        let permit = server.endpoint.accept().unwrap();
+        let handshake = server.handshakes.acquire(server.max_handshakes).unwrap();
+        let s = server.clone();
+        let started = Instant::now();
+        let mut worker =
+            tokio::spawn(async move { s.connection(accepted, permit, handshake).await });
+        let _agent: Box<dyn crate::async_stream::AsyncStream> = if authenticated {
+            let agent = timeout(
+                Duration::from_secs(5),
+                tls.connector.connect("localhost".try_into().unwrap(), tcp),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            timeout(Duration::from_secs(1), async {
+                while server.handshakes.count() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            Box::new(agent)
+        } else {
+            Box::new(tcp)
+        };
+        tokio::time::pause();
+        let before_expiry = Duration::from_secs(if authenticated { 9 } else { 2 });
+        assert!(timeout_at(started + before_expiry, &mut worker)
+            .await
+            .is_err());
+        assert_eq!(peer.endpoint.accepted.count(), 1);
+        assert_eq!(server.handshakes.count(), usize::from(!authenticated));
+        let result = timeout_at(started + before_expiry + Duration::from_secs(2), worker)
+            .await
+            .expect("silent ingress did not expire")
+            .unwrap();
+        assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::TimedOut));
+        assert_eq!(server.handshakes.count(), 0);
+        assert_released(&peer);
+        tokio::time::resume();
+    }
+}
+
+#[tokio::test]
+async fn admission_rejection_preserves_demand_and_recovers_after_capacity_is_released() {
+    use tokio::io::AsyncWriteExt;
+    for handshake_limit in [false, true] {
+        let tls = Tls::new();
+        let (mut peer, _, _) = harness(1);
+        Arc::get_mut(&mut peer).unwrap().endpoint =
+            Arc::new(Endpoint::new(Arc::default(), Arc::default(), 2));
+        let mut server = hub(&peer, &tls);
+        Arc::get_mut(&mut server).unwrap().max_handshakes = 1;
+        let (writer, mut messages) = tokio::sync::mpsc::channel(64);
+        let session = Arc::new(Session::new(
+            Id::new(),
+            tls.fingerprint.clone(),
+            HashSet::from(["web".into()]),
+            writer,
+        ));
+        peer.install(session.clone()).unwrap();
+        let control_permit = peer.endpoint.accept().unwrap();
+        let mut caller = Box::pin(peer.open("web", Instant::now() + Duration::from_secs(60)));
+        assert!(futures::poll!(&mut caller).is_pending());
+        session.request_data(&peer).unwrap();
+        let rejected_id = expect_create_data(&mut messages);
+        let pressure = if handshake_limit {
+            server.handshakes.acquire(server.max_handshakes).unwrap()
+        } else {
+            peer.endpoint.accept().unwrap()
+        };
+        let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let address = ("127.0.0.1", listener.local_addr().unwrap().port());
+        let s = server.clone();
+        let worker = tokio::spawn(async move { s.accept_connections(|| listener.accept()).await });
+        let rejected = timeout(Duration::from_secs(2), async {
+            let tcp = TcpStream::connect(address).await.unwrap();
+            tls.connector
+                .connect("localhost".try_into().unwrap(), tcp)
+                .await
+        })
+        .await
+        .expect("capacity rejection did not close the carrier");
+        assert!(rejected.is_err());
+        assert_eq!(
+            peer.endpoint.accepted.count(),
+            if handshake_limit { 1 } else { 2 }
+        );
+        assert_eq!(server.handshakes.count(), usize::from(handshake_limit));
+        assert_eq!(peer.physical.count(), 1);
+        assert_eq!(peer.endpoint.credits.count(), 1);
+        assert!(!session.stop.is_cancelled());
+        session.failed(&rejected_id, &peer);
+        assert_eq!(peer.physical.count(), 0);
+        assert_eq!(peer.endpoint.credits.count(), 0);
+        assert_eq!(peer.active.count(), 1);
+        assert_eq!(peer.pending.count(), 1);
+        session.request_data(&peer).unwrap();
+        assert!(messages.try_recv().is_err());
+        drop(pressure);
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(2)).await;
+        session.request_data(&peer).unwrap();
+        let channel_id = expect_create_data(&mut messages);
+        assert_ne!(channel_id, rejected_id);
+        tokio::time::resume();
+        let mut agent = timeout(Duration::from_secs(5), async {
+            let tcp = TcpStream::connect(address).await.unwrap();
+            let mut agent = tls
+                .connector
+                .connect("localhost".try_into().unwrap(), tcp)
+                .await
+                .unwrap();
+            protocol::write(
+                &mut agent,
+                &Message::DataHello {
+                    version: protocol::VERSION,
+                    peer: "home".into(),
+                    session_id: session.id.clone(),
+                    channel_id,
+                },
+            )
+            .await
+            .unwrap();
+            let Message::Open { service, .. } = protocol::read(&mut agent).await.unwrap() else {
+                panic!("expected Open");
+            };
+            assert_eq!(service, "web");
+            protocol::write(&mut agent, &Message::Ready {})
+                .await
+                .unwrap();
+            agent
+        })
+        .await
+        .expect("listener did not recover after admission pressure");
+        let mut stream = timeout(Duration::from_secs(2), caller)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(peer.pending.count(), 0);
+        assert_eq!(peer.active.count(), 1);
+        assert_eq!(peer.endpoint.accepted.count(), 2);
+        assert_eq!(server.handshakes.count(), 0);
+        agent.write_all(b"recovered").await.unwrap();
+        let mut bytes = [0; 9];
+        timeout(Duration::from_secs(2), stream.read_exact(&mut bytes))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&bytes, b"recovered");
+        drop((stream, agent, control_permit));
+        assert!(!session.stop.is_cancelled());
+        peer.gate.retire();
+        timeout(Duration::from_secs(2), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        session.close();
+        assert_released(&peer);
+    }
+}
+
+#[tokio::test]
+async fn stalled_origin_tls_uses_the_remaining_tunnel_setup_budget() {
+    let (peer, session, mut messages) = harness(1);
+    let location: crate::config::TcpTargetLocation = serde_json::from_value(serde_json::json!({
+        "tunnel": {"server": "edge", "peer": "home", "service": "web"},
+        "client_tls": {"verify": false, "sni_hostname": "localhost"}
+    }))
+    .unwrap();
+    let mut target = crate::tcp::TargetLocationData::try_from(location).unwrap();
+    target.tunnel = Some(super::super::Binding {
+        peer: peer.clone(),
+        service: "web".into(),
+    });
+    let mut setup = tokio::spawn(async move {
+        crate::tcp::setup_target_stream(&"127.0.0.1:1".parse().unwrap(), &target, true, None).await
+    });
+    timeout(Duration::from_secs(2), async {
+        while peer.pending.count() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let (open, channel, mut agent) = channel(&peer, &session, &mut messages).await;
+    let deadline = open.deadline;
+    let worker = tokio::spawn(serve_data(
+        peer.clone(),
+        session.clone(),
+        channel,
+        open,
+        deadline,
+    ));
+    assert!(matches!(
+        timeout(Duration::from_secs(2), protocol::read(&mut agent))
+            .await
+            .unwrap()
+            .unwrap(),
+        Message::Open { .. }
+    ));
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(6)).await;
+    tokio::time::resume();
+    protocol::write(&mut agent, &Message::Ready {})
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(2), worker)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let mut header = [0; 5];
+    timeout(Duration::from_secs(2), agent.read_exact(&mut header))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(header[0], 22, "expected the inner TLS ClientHello");
+    assert_eq!(peer.pending.count(), 0);
+    assert_eq!(peer.active.count(), 1);
+    tokio::time::pause();
+    assert!(timeout_at(deadline - Duration::from_secs(1), &mut setup)
+        .await
+        .is_err());
+    let result = timeout_at(deadline + Duration::from_millis(1), setup)
+        .await
+        .expect("origin TLS restarted or escaped the tunnel setup deadline")
+        .unwrap();
+    assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::TimedOut));
+    assert_released(&peer);
 }

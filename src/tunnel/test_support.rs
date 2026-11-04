@@ -87,27 +87,32 @@ impl Tls {
         }
     }
 
+    // Requires a running clock; paused time can expire before socket I/O completes.
     pub async fn pair(&self) -> (ServerIo, tokio_rustls::client::TlsStream<TcpStream>) {
-        let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
-        let address = ("127.0.0.1", listener.local_addr().unwrap().port());
-        let (server, client) = tokio::join!(
-            async {
-                let (socket, _) = listener.accept().await.unwrap();
-                socket.set_nodelay(true).unwrap();
-                tokio_rustls::TlsAcceptor::from(self.server.clone())
-                    .accept(socket)
-                    .await
-                    .unwrap()
-            },
-            async {
-                let socket = TcpStream::connect(address).await.unwrap();
-                socket.set_nodelay(true).unwrap();
-                self.connector
-                    .connect("localhost".try_into().unwrap(), socket)
-                    .await
-                    .unwrap()
-            },
-        );
-        (server, client)
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
+            let address = ("127.0.0.1", listener.local_addr().unwrap().port());
+            let (server, client) = tokio::join!(
+                async {
+                    let (socket, _) = listener.accept().await.unwrap();
+                    socket.set_nodelay(true).unwrap();
+                    tokio_rustls::TlsAcceptor::from(self.server.clone())
+                        .accept(socket)
+                        .await
+                        .unwrap()
+                },
+                async {
+                    let socket = TcpStream::connect(address).await.unwrap();
+                    socket.set_nodelay(true).unwrap();
+                    self.connector
+                        .connect("localhost".try_into().unwrap(), socket)
+                        .await
+                        .unwrap()
+                },
+            );
+            (server, client)
+        })
+        .await
+        .expect("TLS pair setup timed out")
     }
 }

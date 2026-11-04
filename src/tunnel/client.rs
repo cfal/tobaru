@@ -510,6 +510,7 @@ mod tests {
         assert_eq!(client.data_dial_slots.available_permits(), 4);
     }
 
+    // Requires a running clock; paused time can expire before socket I/O completes.
     async fn start_data(
         client: &Arc<Client>,
         listener: &TcpListener,
@@ -546,17 +547,22 @@ mod tests {
         let task = tokio::spawn(async move {
             c.data(work).await;
         });
-        let (socket, _) = listener.accept().await.unwrap();
-        socket.set_nodelay(true).unwrap();
-        let mut stream = tokio_rustls::TlsAcceptor::from(tls.server.clone())
-            .accept(socket)
-            .await
-            .unwrap();
-        assert_eq!(tls::identity(stream.get_ref().1).unwrap(), tls.fingerprint);
-        assert!(matches!(
-            protocol::read(&mut stream).await.unwrap(),
-            Message::DataHello { .. }
-        ));
+        let stream = timeout(Duration::from_secs(5), async {
+            let (socket, _) = listener.accept().await.unwrap();
+            socket.set_nodelay(true).unwrap();
+            let mut stream = tokio_rustls::TlsAcceptor::from(tls.server.clone())
+                .accept(socket)
+                .await
+                .unwrap();
+            assert_eq!(tls::identity(stream.get_ref().1).unwrap(), tls.fingerprint);
+            assert!(matches!(
+                protocol::read(&mut stream).await.unwrap(),
+                Message::DataHello { .. }
+            ));
+            stream
+        })
+        .await
+        .expect("data-channel TLS and DataHello setup timed out");
         (task, stream, stop, receiver)
     }
 
@@ -856,7 +862,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn silent_control_expires_after_sixty_seconds() {
+    async fn control_receive_deadline_resets_on_frames_then_expires_after_sixty_seconds() {
         let (client, listener, tls) = harness().await;
         let (mut hub, agent) = tls.pair().await;
         let control = Control {
@@ -865,7 +871,8 @@ mod tests {
             session: Id::new(),
             accepted_services: HashSet::new(),
         };
-        let task = tokio::spawn(async move { client.session(control, &mut JoinSet::new()).await });
+        let mut task =
+            tokio::spawn(async move { client.session(control, &mut JoinSet::new()).await });
         protocol::write(&mut hub, &Message::Ping { nonce: 5 })
             .await
             .unwrap();
@@ -874,8 +881,20 @@ mod tests {
             Message::Pong { nonce: 5 }
         ));
         tokio::time::pause();
-        tokio::time::advance(Duration::from_secs(59)).await;
-        assert!(!task.is_finished());
+        assert!(timeout(Duration::from_secs(50), &mut task).await.is_err());
+        tokio::time::resume();
+        protocol::write(&mut hub, &Message::Ping { nonce: 6 })
+            .await
+            .unwrap();
+        assert!(matches!(
+            timeout(Duration::from_secs(5), protocol::read(&mut hub))
+                .await
+                .unwrap()
+                .unwrap(),
+            Message::Pong { nonce: 6 }
+        ));
+        tokio::time::pause();
+        assert!(timeout(Duration::from_secs(59), &mut task).await.is_err());
         tokio::time::advance(Duration::from_secs(1)).await;
         assert!(timeout(Duration::from_millis(1), task)
             .await
@@ -885,18 +904,138 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_dial_observes_hub_closure_and_clamps_valid_long_budgets() {
-        for close_hub in [true, false] {
-            let (mut client, listener, tls) = harness().await;
-            Arc::get_mut(&mut client).unwrap().resolver = Resolver::with_capacity(0);
+    async fn active_origin_limit_reports_busy_after_open_and_recovers_after_release() {
+        let (mut client, listener, tls) = harness().await;
+        let origin = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let config = &mut Arc::get_mut(&mut client).unwrap().config;
+        config.max_active_connections = 1;
+        config.max_concurrent_local_dials = 1;
+        config.services.get_mut("web").unwrap().location = serde_json::from_value(
+            serde_json::json!(format!("127.0.0.1:{}", origin.local_addr().unwrap().port())),
+        )
+        .unwrap();
+        let (backend, active) = timeout(
+            Duration::from_secs(2),
+            client.connect_export("web", &HashSet::from(["web".into()])),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let local = timeout(Duration::from_secs(2), origin.accept())
+            .await
+            .unwrap()
+            .unwrap()
+            .0;
+        let mut retained = Some((backend, active, local));
+        assert_eq!(client.active.count(), 1);
+        assert_eq!(client.local_dials.count(), 0);
+        for busy in [true, false] {
+            if !busy {
+                drop(retained.take());
+            }
             let (task, mut stream, stop, mut messages) = start_data(
                 &client,
                 &listener,
                 &tls,
                 false,
-                Instant::now() + Duration::from_secs(5),
+                Instant::now() + Duration::from_secs(10),
             )
             .await;
+            protocol::write(
+                &mut stream,
+                &Message::Open {
+                    service: "web".into(),
+                    budget_ms: 10_000,
+                },
+            )
+            .await
+            .unwrap();
+            let reply = timeout(Duration::from_secs(2), protocol::read(&mut stream))
+                .await
+                .unwrap()
+                .unwrap();
+            if busy {
+                assert!(matches!(reply, Message::OpenFailed { code: Code::Busy }));
+                let mut unexpected_origin = Box::pin(origin.accept());
+                assert!(futures::poll!(&mut unexpected_origin).is_pending());
+            } else {
+                assert!(matches!(reply, Message::Ready {}));
+                let (mut local, _) = timeout(Duration::from_secs(2), origin.accept())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(client.active.count(), 1);
+                use tokio::io::AsyncWriteExt;
+                local.write_all(b"restored").await.unwrap();
+                let mut bytes = [0; 8];
+                timeout(Duration::from_secs(2), stream.read_exact(&mut bytes))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(&bytes, b"restored");
+                drop(local);
+            }
+            drop(stream);
+            timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(client.active.count(), usize::from(busy));
+            assert_eq!(client.local_dials.count(), 0);
+            assert_eq!(client.sockets.count(), 0);
+            assert_eq!(client.data_setup_jobs.count(), 0);
+            assert!(!stop.is_cancelled());
+            assert!(messages.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn local_dial_limit_rejects_with_active_headroom_and_recovers_after_cancellation() {
+        let (mut client, _listener, _tls) = harness().await;
+        let settings = Arc::get_mut(&mut client).unwrap();
+        settings.config.max_active_connections = 2;
+        settings.config.max_concurrent_local_dials = 1;
+        settings.resolver = Resolver::with_capacity(0);
+        let accepted = HashSet::from(["web".into()]);
+        let mut first = Box::pin(client.connect_export("web", &accepted));
+        assert!(futures::poll!(&mut first).is_pending());
+        let mut rejected = Box::pin(client.connect_export("web", &accepted));
+        assert!(matches!(futures::poll!(&mut rejected),
+            std::task::Poll::Ready(Err(error)) if error.kind() == io::ErrorKind::WouldBlock));
+        drop(rejected);
+        assert_eq!(client.active.count(), 1);
+        assert_eq!(client.local_dials.count(), 1);
+        drop(first);
+        assert_eq!(client.active.count(), 0);
+        assert_eq!(client.local_dials.count(), 0);
+        let mut next = Box::pin(client.connect_export("web", &accepted));
+        assert!(futures::poll!(&mut next).is_pending());
+        assert_eq!(client.active.count(), 1);
+        assert_eq!(client.local_dials.count(), 1);
+        drop(next);
+        assert_eq!(client.active.count(), 0);
+        assert_eq!(client.local_dials.count(), 0);
+    }
+
+    #[tokio::test]
+    async fn local_dial_observes_hub_closure_and_clamps_valid_long_budgets() {
+        for close_hub in [true, false] {
+            let (mut client, listener, tls) = harness().await;
+            Arc::get_mut(&mut client).unwrap().resolver = Resolver::with_capacity(0);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let (mut task, mut stream, stop, mut messages) =
+                start_data(&client, &listener, &tls, false, deadline).await;
+            tokio::time::pause();
+            tokio::time::advance(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .saturating_sub(Duration::from_secs(1)),
+            )
+            .await;
+            assert!(!task.is_finished());
+            assert_eq!(client.local_dials.count(), 0);
+            assert_eq!(client.active.count(), 0);
+            tokio::time::resume();
             protocol::write(
                 &mut stream,
                 &Message::Open {
@@ -918,8 +1057,9 @@ mod tests {
                 drop(stream);
             } else {
                 tokio::time::pause();
-                tokio::time::advance(Duration::from_secs(9)).await;
-                assert!(!task.is_finished());
+                assert!(timeout(Duration::from_secs(9), &mut task).await.is_err());
+                assert_eq!(client.local_dials.count(), 1);
+                assert_eq!(client.active.count(), 1);
                 tokio::time::advance(Duration::from_secs(1)).await;
                 tokio::time::resume();
                 assert!(matches!(

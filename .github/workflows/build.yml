@@ -171,6 +171,10 @@ jobs:
             cargo test --locked lifecycle::tests::config_watches_
           done
 
+      - name: Test native macOS reverse tunnels
+        if: matrix.target == 'aarch64-apple-darwin'
+        run: cargo test --locked 'tunnel::'
+
       - name: Verify binary exists
         run: |
           if [ -f "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" ]; then

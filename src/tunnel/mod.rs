@@ -8,6 +8,8 @@ mod state;
 mod stream;
 #[cfg(test)]
 mod test_support;
+#[cfg(test)]
+mod tests;
 mod tls;
 
 use std::collections::{HashMap, HashSet};
