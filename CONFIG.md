@@ -8,6 +8,11 @@ Its source lives in [`docs/src/content/docs/`](docs/src/content/docs/).
 - [HTTP routing](https://tobaru-rs.github.io/http/routing/), [actions](https://tobaru-rs.github.io/http/actions/), and [HTTP/2](https://tobaru-rs.github.io/http/http2/)
 - [CLI and URL shortcuts](https://tobaru-rs.github.io/operations/cli/) and [limits](https://tobaru-rs.github.io/operations/limits/)
 
+## Reverse Tunnels
+
+See [reverse-tunnel configuration](https://tobaru-rs.github.io/config/reverse-tunnels/)
+for named TCP/Unix exports, mTLS identities, and public routing.
+
 ## Target Evaluation Order
 
 See [target precedence](https://tobaru-rs.github.io/config/tcp/#target-evaluation-order).

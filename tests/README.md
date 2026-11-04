@@ -7,6 +7,17 @@ TLS session tests:
 CARGO_BUILD_JOBS=1 cargo test --locked
 ```
 
+The minimum supported Rust version is 1.88. CI tests both stable and 1.88; the
+same check can be run locally without changing the default toolchain:
+
+```sh
+rustup toolchain install 1.88.0 --profile minimal
+CARGO_BUILD_JOBS=1 cargo +1.88.0 test --locked
+CARGO_BUILD_JOBS=1 cargo +1.88.0 build --locked
+```
+
+Pass `target/debug/tobaru` to the CLI suites below to exercise that build.
+
 Configuration watcher tests cover atomic replacement, symlink retargeting, and
 reusing recreated target directories. CI also runs these tests on native macOS
 to exercise the FSEvents backend:
@@ -24,9 +35,11 @@ CARGO_BUILD_JOBS=1 cargo build --release --locked
 node tests/http_smoke.mjs target/release/tobaru
 node tests/http2_smoke.mjs target/release/tobaru
 node tests/tcp_routing_smoke.mjs target/release/tobaru
+node tests/reverse_tunnel_smoke.mjs target/release/tobaru
 ```
 
-Omitting the argument selects `target/release/tobaru` relative to the repository.
+Omitting the argument selects `target/release/tobaru` relative to the repository,
+except the reverse-tunnel smoke, which defaults to `target/debug/tobaru`.
 With a custom `CARGO_TARGET_DIR`, pass that directory's binary explicitly.
 Temporary listeners use ephemeral ports and localhost-only allowlists. Fixtures
 are created beneath `$HOME/tmp` and removed on completion or failure. The test
@@ -34,7 +47,9 @@ has a 30-second deadline and cleans up its child process and sockets. It also
 checks that invalid reloads retain the last-good configuration and repeated
 atomic file replacements remain observable.
 Listener-failure checks cover occupied ports and TCP accept failure under a
-child-local file-descriptor limit; both must exit nonzero without panicking.
+child-local file-descriptor limit. Bind failures must exit nonzero without
+panicking; accept failures must leave the process running and recover after
+file descriptors are released.
 
 The HTTP/2 test additionally requires `openssl` for ephemeral certificates. Its
 independent Node HTTP/2 peers cover default plaintext H1/H2 detection, protocol
@@ -76,3 +91,55 @@ mapped IPv4 coverage without requiring privileges or changing real firewall rule
 ```sh
 node tests/config_cli.mjs target/release/tobaru
 ```
+
+The reverse-tunnel smoke starts separate public and NAT-side processes, physical
+TCP/Unix/HTTP origins, and a half-close-preserving TCP relay used to drop only the
+control connection. It requires Node 22+ and OpenSSL, has a 120-second budget per attempt,
+and removes its certificates/configs beneath `$HOME/tmp`. It retries once with fresh
+fixtures if a child loses a startup port to another listener. It checks mTLS identity and
+ALPN/version rejection, strict config validation, no speculative or replenished data
+channels, demand bursts above the creation concurrency limit, raw
+server-first data and half-close, TLS-terminated raw forwarding, H1/H2 forwarding and
+reuse, origin TLS/pin failures, passthrough, Upgrade/read-ahead, control-loss isolation,
+invalid/valid reloads, service intersection, agent-only startup, and process restart.
+Invalid reloads cover both validation failures and listener collisions rejected during
+preparation; existing streams must remain usable after each rejection.
+
+Rust tests exercise framing, FIFO attachment assignment, counter conservation,
+shared endpoint capacity across peers, full control-writer queues, authenticated
+control-session replacement, cancellation during backpressured Open writes, and stale
+generation fencing. Preparation tests retain permits across removal and re-addition
+with lower limits and verify shared endpoint wiring. Independent pending/local-dial
+limits, live-credit failure backoff, healthy heartbeats, and receive-deadline resets
+also have direct tests. Deadline cases cover occupied data-dial slots, missing first
+Open frames, backpressured first-Open writes, and the independent local-dial budget
+for a late Open. Silent ingress is checked before and after TLS authentication;
+endpoint and handshake admission pressure must preserve queued demand and recover
+after capacity is released. Active-origin exhaustion must send OpenFailed Busy,
+avoid another origin dial, and recover after the retained origin is released.
+A stalled inner origin-TLS handshake must use the setup budget left after Ready,
+not restart it. DNS ownership uses a real non-abortable blocking wrapper.
+
+Smoke request waits are bounded; expected HTTP rejection requires a connection reset,
+not the helper's timeout. Control-loss survival checks wait for disconnection before
+reusing established streams. Reload closure checks finish before natural idle or
+first-frame expiry could satisfy them.
+
+The reverse-tunnel smoke also runs a separate hub with a child-local 64-FD limit.
+Incomplete ordinary HTTP requests exhaust its descriptors before a connection to
+the tunnel listener triggers a real `EMFILE`. Two exhaustion/recovery cycles hold
+pressure beyond the one-second accept retry and must preserve an established
+tunnel stream and the same ordinary HTTP keep-alive connection, both during
+pressure and after release. Both listeners must recover and accept fresh traffic;
+data channels are demand-only, so recovery requires a new authenticated
+data channel. Only the child process's resource limit is changed.
+
+Client-side accounting across generations is not inspected directly by the preparation
+tests. CI runs the Rust tunnel tests on Linux and native ARM64 macOS; the Node smoke
+suite runs on Linux. Builds for other targets do not establish runtime portability.
+
+These local tests do not themselves establish NAT/firewall isolation or Internet-scale
+performance. Before deployment, run the same pair in an isolated network namespace or
+container with agent inbound traffic blocked and only outbound hub access allowed.
+Do not change the host firewall to simulate this on a shared VM. Namespace creation
+may be unavailable in restricted environments; report that verification gap explicitly.

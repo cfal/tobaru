@@ -2,6 +2,30 @@
 title: Upgrading
 ---
 
+## Native Reverse Tunnels
+
+`tunnel_server`, `tunnel_client`, and object-form `location.tunnel` are opt-in additions.
+Existing non-tunnel configurations need no migration. See the [configuration reference](/config/reverse-tunnels/)
+and public/client examples for certificate provisioning and named service authorization.
+Client-only processes are supported; `--dry-run` performs no binds or outbound dials.
+
+Earlier experimental tunnel builds used warm data connections and ALPN
+`tobaru-reverse/1`. Data channels are now demand-only, using `tobaru-reverse/2`.
+Update hub and agent together; there is no legacy protocol fallback. Remove
+`peers.NAME.idle_connections`, including explicit zero values, before upgrading.
+The removed field is rejected rather than silently ignored. Without traffic only
+the control connection remains; every fresh backend requires outbound TCP/mTLS setup.
+Existing HTTP backend reuse is unchanged.
+
+Valid local reloads close all tunnel connections, including active streams, even when
+the edit is unrelated to tunnels. Invalid reloads retain the running configuration.
+Transient network/control loss instead preserves already established independent data
+connections. Reconnect does not resume broken TCP streams or replay requests.
+
+Before downgrading to a binary without tunnel support, remove tunnel roles and
+references. Restore direct locations or a sidecar's loopback forward when continued
+access is required. There is no persistent tunnel state to migrate.
+
 ## TCP Target Routing
 
 TCP target selection now checks complete routing conditions before ranking

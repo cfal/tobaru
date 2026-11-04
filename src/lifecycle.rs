@@ -131,9 +131,10 @@ fn watch_configs(config_paths: &[String]) -> io::Result<(ConfigWatcher, Receiver
     Ok((watcher, rx))
 }
 
-async fn prepare(
+async fn prepare_servers(
     configs: Vec<ServerConfig>,
     admissions: &mut tcp::Admissions,
+    tunnels: &crate::tunnel::Registry,
 ) -> io::Result<Vec<PreparedServer>> {
     let mut tasks = Vec::new();
     let mut listeners = HashSet::new();
@@ -163,6 +164,7 @@ async fn prepare(
                     targets.into_vec(),
                     tcp_max_connections,
                     admissions.for_listener(address),
+                    tunnels,
                 )
                 .await?;
                 Box::pin(async move {
@@ -198,6 +200,24 @@ async fn prepare(
     Ok(tasks)
 }
 
+#[cfg(test)]
+async fn prepare(
+    configs: Vec<ServerConfig>,
+    admissions: &mut tcp::Admissions,
+) -> io::Result<Vec<PreparedServer>> {
+    prepare_servers(configs, admissions, &crate::tunnel::Registry::default()).await
+}
+
+async fn prepare_runtime(
+    config: config::RuntimeConfig,
+    admissions: &mut tcp::Admissions,
+    store: &mut crate::tunnel::Store,
+) -> io::Result<(Vec<PreparedServer>, crate::tunnel::Prepared)> {
+    let tunnels = store.prepare(&config)?;
+    let servers = prepare_servers(config.servers, admissions, &tunnels.registry).await?;
+    Ok((servers, tunnels))
+}
+
 fn firewall_addresses(configs: &[ServerConfig]) -> HashSet<SocketAddr> {
     configs
         .iter()
@@ -228,17 +248,23 @@ pub async fn run(
     } else {
         None
     };
-    let configs = config::load_server_configs(paths.clone(), urls.clone()).await?;
+    let configs = config::load_runtime_config(paths.clone(), urls.clone()).await?;
     if configs.is_empty() {
         return Err(io::Error::other("No server configs found"));
     }
     if quick == Some(QuickAction::ClearIptablesMatching) {
-        clear_rules(&configs.iter().map(|config| config.address).collect()).await?;
+        let addresses = configs
+            .servers
+            .iter()
+            .map(|config| config.address)
+            .collect();
+        clear_rules(&addresses).await?;
         return Ok(());
     }
-    let mut firewall = firewall_addresses(&configs);
+    let mut firewall = firewall_addresses(&configs.servers);
     let mut admissions = tcp::Admissions::default();
-    let tasks = prepare(configs, &mut admissions).await?;
+    let mut tunnels = crate::tunnel::Store::default();
+    let (tasks, prepared_tunnels) = prepare_runtime(configs, &mut admissions, &mut tunnels).await?;
     if quick == Some(QuickAction::DryRun) {
         info!("Dry run complete");
         return Ok(());
@@ -247,6 +273,7 @@ pub async fn run(
         watch.expect("normal startup installs config watches before loading");
     clear_rules(&firewall).await?;
     let mut servers = JoinSet::new();
+    let mut tunnel_generation = prepared_tunnels.start(&mut servers);
     let mut stops = start_servers(tasks, &mut servers);
 
     loop {
@@ -260,25 +287,30 @@ pub async fn run(
             sleep(Duration::from_secs(3)).await;
             while changes.try_recv().is_ok() {}
             watcher.refresh(&paths)?;
-            let configs = config::load_server_configs(paths.clone(), urls.clone()).await?;
+            let configs = config::load_runtime_config(paths.clone(), urls.clone()).await?;
             if configs.is_empty() {
                 return Err(io::Error::other("No server configs found"));
             }
-            let firewall = firewall_addresses(&configs);
-            Ok::<_, io::Error>((prepare(configs, &mut admissions).await?, firewall))
+            let firewall = firewall_addresses(&configs.servers);
+            Ok::<_, io::Error>((
+                prepare_runtime(configs, &mut admissions, &mut tunnels).await?,
+                firewall,
+            ))
         })
         .await?;
-        let (tasks, new_firewall) = match replacement {
+        let ((tasks, prepared_tunnels), new_firewall) = match replacement {
             Ok(replacement) => replacement,
             Err(error) => {
                 error!("Config reload rejected; keeping running listeners: {error}");
                 continue;
             }
         };
+        tunnel_generation.retire();
         stop_servers(stops, &mut servers).await?;
         let stale_rules = firewall.union(&new_firewall).copied().collect();
         clear_rules(&stale_rules).await?;
         firewall = new_firewall;
+        tunnel_generation = prepared_tunnels.start(&mut servers);
         stops = start_servers(tasks, &mut servers);
         info!("Config reload complete");
     }

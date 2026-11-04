@@ -1,0 +1,31 @@
+- tunnel_server: edge
+  address: 0.0.0.0:7443
+  server_tls:
+    cert: /etc/tobaru/public.crt
+    key: /etc/tobaru/public.key
+  peers:
+    home:
+      client_fingerprints: ["<home-agent certificate SHA-256>"]
+      services: [web]
+      max_active_connections: 128
+
+- address: 0.0.0.0:443
+  transport: tcp
+  target:
+    allowlist: all
+    server_tls:
+      cert: /etc/tobaru/public.crt
+      key: /etc/tobaru/public.key
+    http_paths:
+      /home/:
+        http_action:
+          type: forward
+          location:
+            tunnel:
+              server: edge
+              peer: home
+              service: web
+          replacement_path: /
+    default_http_action:
+      type: serve-message
+      status_code: 404

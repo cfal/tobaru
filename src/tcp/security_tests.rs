@@ -23,6 +23,7 @@ fn raw_target(address: SocketAddr) -> Arc<TargetData> {
                 location: Location::Address(address.to_string().as_str().try_into().unwrap()),
                 tls_connector: None,
                 sni_hostname: NoneOrOne::Unspecified,
+                tunnel: None,
             }],
             next_address_index: AtomicUsize::new(0),
         },

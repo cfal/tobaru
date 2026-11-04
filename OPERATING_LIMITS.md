@@ -6,3 +6,7 @@ authored in [`docs/src/content/docs/operations/limits.md`](docs/src/content/docs
 It covers listener admission, UDP queue sizing, HTTP/TLS timeouts, upstream-owned
 latency, metadata bounds, logging, and deployment contracts. Update that page
 alongside changes to runtime limits and defaults.
+
+## Reverse Tunnels
+
+See [tunnel resource limits and lifecycle](https://tobaru-rs.github.io/operations/limits/#reverse-tunnels).

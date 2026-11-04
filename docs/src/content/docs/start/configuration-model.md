@@ -6,6 +6,10 @@ A configuration file is a YAML array containing one or more entries. Each entry 
 
 - **Server Config** -- defines a listener with one or more forwarding targets
 - **IP Group** -- defines a reusable named set of IP ranges
+- **Tunnel Server** -- accepts authenticated outbound agents on a dedicated TLS port
+- **Tunnel Client** -- exports named local services without requiring a listener
+
+See [reverse tunnels](/config/reverse-tunnels/) for tunnel roles and routing.
 
 ```yaml
 # Server config (has 'address')
@@ -24,8 +28,8 @@ A configuration file is a YAML array containing one or more entries. Each entry 
 
 Multiple config files can be passed on the command line and are merged together. This is useful for separating IP group definitions from server definitions.
 
-Every listener requires `address` and `target` or `targets`. `transport` defaults
-to `tcp`; set it explicitly for clarity or use `udp` for datagrams. Each
+Ordinary **Server Config** entries require `address` and `target` or `targets`.
+Their `transport` defaults to `tcp`; set it explicitly for clarity or use `udp` for datagrams. Each
 target requires an `allowlist`. A TCP target chooses either raw forwarding through
 `location`/`locations`, or HTTP handling with a required `default_http_action`
 and optional `http_paths`. Do not combine raw and HTTP actions in one target.

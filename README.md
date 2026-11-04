@@ -5,6 +5,10 @@ TLS SNI/ALPN routing, TLS termination, and HTTP/1 and HTTP/2 forwarding.
 Targets can use TCP or UNIX sockets, round-robin backends, and optional outgoing
 TLS. Configuration files are watched for reloads.
 
+[Native reverse tunnels](https://tobaru-rs.github.io/config/reverse-tunnels/) export
+named TCP/Unix services from behind NAT through outbound mTLS connections, using
+ordinary TCP and HTTP routes on the public hub.
+
 **[Documentation](https://tobaru-rs.github.io/)** |
 [Installation](https://tobaru-rs.github.io/start/installation/) |
 [Configuration](https://tobaru-rs.github.io/start/configuration-model/) |

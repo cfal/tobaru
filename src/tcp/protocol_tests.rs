@@ -286,6 +286,7 @@ async fn h2_local_validation_applies_to_default_and_explicit_protocols() {
             vec![config],
             std::num::NonZeroUsize::new(256),
             Arc::new(Admission::default()),
+            &crate::tunnel::Registry::default(),
         )
         .await;
         assert_eq!(result.is_ok(), allowed);

@@ -4,6 +4,7 @@ mod ip_mask;
 mod location;
 mod option_util;
 mod sni_value;
+pub mod tunnel;
 mod validation;
 #[cfg(test)]
 mod yaml_tests;
@@ -192,6 +193,8 @@ impl<'de> Deserialize<'de> for TcpKeepaliveOption {
 pub enum Config {
     ServerConfig(ServerConfig),
     IpMaskGroup(IpMaskGroupConfig),
+    TunnelServer(tunnel::TunnelServerConfig),
+    TunnelClient(tunnel::TunnelClientConfig),
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -207,6 +210,29 @@ impl<'de> serde::de::Deserialize<'de> for Config {
         D: serde::de::Deserializer<'de>,
     {
         let mut map = serde_json::Map::deserialize(deserializer)?;
+
+        if ["group", "tunnel_server", "tunnel_client"]
+            .iter()
+            .filter(|key| map.contains_key(**key))
+            .count()
+            > 1
+        {
+            return Err(serde::de::Error::custom("Conflicting configuration roles"));
+        }
+        if map.contains_key("tunnel_server") {
+            let config: tunnel::TunnelServerConfig =
+                serde_json::from_value(serde_json::Value::Object(map))
+                    .map_err(serde::de::Error::custom)?;
+            config.validate().map_err(serde::de::Error::custom)?;
+            return Ok(Config::TunnelServer(config));
+        }
+        if map.contains_key("tunnel_client") {
+            let config: tunnel::TunnelClientConfig =
+                serde_json::from_value(serde_json::Value::Object(map))
+                    .map_err(serde::de::Error::custom)?;
+            config.validate().map_err(serde::de::Error::custom)?;
+            return Ok(Config::TunnelClient(config));
+        }
 
         if map.contains_key("group") {
             let config = serde_json::from_value(serde_json::Value::Object(map))
@@ -1341,16 +1367,29 @@ fn deserialize_configs(mut config_str: String, filename: &str) -> std::io::Resul
     }
 }
 
-pub async fn load_server_configs(
+#[derive(Default)]
+pub struct RuntimeConfig {
+    pub servers: Vec<ServerConfig>,
+    pub tunnel_servers: Vec<tunnel::TunnelServerConfig>,
+    pub tunnel_clients: Vec<tunnel::TunnelClientConfig>,
+}
+
+impl RuntimeConfig {
+    pub fn is_empty(&self) -> bool {
+        self.servers.is_empty() && self.tunnel_servers.is_empty() && self.tunnel_clients.is_empty()
+    }
+}
+
+pub async fn load_runtime_config(
     config_paths: Vec<String>,
     config_urls: Vec<String>,
-) -> std::io::Result<Vec<ServerConfig>> {
+) -> std::io::Result<RuntimeConfig> {
     let mut groups: HashMap<String, Vec<IpMask>> = HashMap::new();
 
     // add the default 'all' ip group.
     groups.insert(String::from("all"), vec![IpMask::all()]);
 
-    let mut server_configs = vec![];
+    let mut runtime = RuntimeConfig::default();
 
     for config_path in config_paths {
         let config_str = tokio::fs::read_to_string(&config_path).await?;
@@ -1360,8 +1399,10 @@ pub async fn load_server_configs(
                 .map_err(std::io::Error::other)??;
         for config in configs {
             match config {
+                Config::TunnelServer(server) => runtime.tunnel_servers.push(server),
+                Config::TunnelClient(client) => runtime.tunnel_clients.push(client),
                 Config::ServerConfig(server_config) => {
-                    server_configs.push(server_config);
+                    runtime.servers.push(server_config);
                 }
                 Config::IpMaskGroup(IpMaskGroupConfig {
                     group,
@@ -1391,7 +1432,7 @@ pub async fn load_server_configs(
 
     // Expand targets with optional: true into two separate targets
     // and replace IP groups
-    for server_config in server_configs.iter_mut() {
+    for server_config in runtime.servers.iter_mut() {
         match server_config.target_configs {
             TargetConfigs::Tcp {
                 ref mut targets, ..
@@ -1444,10 +1485,10 @@ pub async fn load_server_configs(
     }
 
     for config_url in config_urls {
-        server_configs.push(load_url(&config_url).await?);
+        runtime.servers.push(load_url(&config_url).await?);
     }
 
-    Ok(server_configs)
+    Ok(runtime)
 }
 
 pub async fn load_url(config_url: &str) -> std::io::Result<ServerConfig> {

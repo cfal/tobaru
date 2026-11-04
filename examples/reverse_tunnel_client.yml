@@ -1,0 +1,9 @@
+- tunnel_client: home
+  server: public.example:7443
+  client_tls:
+    verify: true
+    cert: /etc/tobaru/home.crt
+    key: /etc/tobaru/home.key
+  services:
+    web:
+      location: 127.0.0.1:8080
