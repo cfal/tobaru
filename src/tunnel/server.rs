@@ -71,8 +71,7 @@ impl Server {
                 }
             }
         }
-        children.abort_all();
-        while children.join_next().await.is_some() {}
+        children.shutdown().await;
         Ok(())
     }
 

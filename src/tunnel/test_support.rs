@@ -12,6 +12,14 @@ use crate::rustls_util::{
     create_client_config_with_cert, create_server_config, load_certs, load_private_key,
 };
 
+#[track_caller]
+pub fn expect_create_data(messages: &mut mpsc::Receiver<Message>) -> Id {
+    let Message::CreateData { channel_id } = messages.try_recv().unwrap() else {
+        panic!("expected creation credit")
+    };
+    channel_id
+}
+
 pub fn harness(active: usize) -> (Arc<Peer>, Arc<Session>, mpsc::Receiver<Message>) {
     let config = serde_json::from_value(serde_json::json!({
         "client_fingerprints":["ab".repeat(32)], "services":["web"],

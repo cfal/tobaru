@@ -253,14 +253,12 @@ pub async fn run(
         return Err(io::Error::other("No server configs found"));
     }
     if quick == Some(QuickAction::ClearIptablesMatching) {
-        clear_rules(
-            &configs
-                .servers
-                .iter()
-                .map(|config| config.address)
-                .collect(),
-        )
-        .await?;
+        let addresses = configs
+            .servers
+            .iter()
+            .map(|config| config.address)
+            .collect();
+        clear_rules(&addresses).await?;
         return Ok(());
     }
     let mut firewall = firewall_addresses(&configs.servers);

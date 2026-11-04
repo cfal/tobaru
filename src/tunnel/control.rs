@@ -58,7 +58,6 @@ impl Pumps {
 
     pub async fn stop(&mut self) {
         self.incoming.close();
-        self.tasks.abort_all();
-        while self.tasks.join_next().await.is_some() {}
+        self.tasks.shutdown().await;
     }
 }

@@ -19,7 +19,8 @@ pub fn server(config: &TunnelServerConfig) -> io::Result<Arc<rustls::ServerConfi
     let pins: Vec<_> = config
         .peers
         .values()
-        .flat_map(|p| p.client_fingerprints.clone())
+        .flat_map(|peer| &peer.client_fingerprints)
+        .cloned()
         .collect();
     Ok(Arc::new(create_server_config(
         load_certs(&std::fs::read(&config.server_tls.cert)?)?,

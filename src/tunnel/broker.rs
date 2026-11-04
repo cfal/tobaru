@@ -288,7 +288,7 @@ impl SessionState {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::harness;
+    use super::super::test_support::{expect_create_data, harness};
     use super::*;
 
     #[tokio::test(start_paused = true)]
@@ -305,9 +305,7 @@ mod tests {
         assert_eq!(peer.active.count(), 1);
         assert_eq!(peer.physical.count(), 0);
         session.request_data(&peer).unwrap();
-        let Message::CreateData { channel_id } = messages.try_recv().unwrap() else {
-            panic!()
-        };
+        let channel_id = expect_create_data(&mut messages);
         assert_eq!(peer.physical.count(), 1);
         let _accepted = peer.endpoint.accept().unwrap();
         let (credit, opening) = session.attach(&channel_id, &[1]).unwrap();
@@ -342,10 +340,7 @@ mod tests {
         session.request_data(&peer).unwrap();
         let mut ids = Vec::new();
         for _ in 0..3 {
-            let Message::CreateData { channel_id } = messages.try_recv().unwrap() else {
-                panic!("expected creation credit")
-            };
-            ids.push(channel_id);
+            ids.push(expect_create_data(&mut messages));
         }
         drop(cancelled);
         let (first_credit, first_open) = session.attach(&ids[2], &[1]).unwrap();
@@ -380,9 +375,7 @@ mod tests {
         });
         tokio::task::yield_now().await;
         session.request_data(&peer).unwrap();
-        let Message::CreateData { channel_id } = messages.try_recv().unwrap() else {
-            panic!()
-        };
+        let channel_id = expect_create_data(&mut messages);
         caller.abort();
         let _ = caller.await;
         let accepted = peer.endpoint.accept().unwrap();
@@ -412,10 +405,7 @@ mod tests {
         session.request_data(&peer).unwrap();
         let mut ids = Vec::new();
         for _ in 0..4 {
-            let Message::CreateData { channel_id } = messages.try_recv().unwrap() else {
-                panic!("expected creation credit")
-            };
-            ids.push(channel_id);
+            ids.push(expect_create_data(&mut messages));
         }
         assert!(messages.try_recv().is_err());
         let wake = session.wake.notified();
@@ -445,9 +435,7 @@ mod tests {
         let mut cancelled = Box::pin(peer.open("web", deadline));
         assert!(futures::poll!(&mut cancelled).is_pending());
         session.request_data(&peer).unwrap();
-        let Message::CreateData { channel_id } = messages.try_recv().unwrap() else {
-            panic!("expected creation credit")
-        };
+        let channel_id = expect_create_data(&mut messages);
         drop(cancelled);
         session.request_data(&peer).unwrap();
         let mut caller = Box::pin(peer.open("web", deadline));
@@ -475,9 +463,7 @@ mod tests {
         let mut caller = Box::pin(peer.open("web", Instant::now() + Duration::from_secs(60)));
         assert!(futures::poll!(&mut caller).is_pending());
         session.request_data(&peer).unwrap();
-        let Message::CreateData { channel_id } = messages.try_recv().unwrap() else {
-            panic!("expected creation credit")
-        };
+        let channel_id = expect_create_data(&mut messages);
         tokio::time::advance(Duration::from_secs(11)).await;
         assert!(
             matches!(session.attach(&channel_id, &[1]), Err(error) if error.kind() == io::ErrorKind::TimedOut)
@@ -488,9 +474,7 @@ mod tests {
         assert_eq!(peer.physical.count(), 0);
         assert_eq!(peer.endpoint.credits.count(), 0);
         session.request_data(&peer).unwrap();
-        let Message::CreateData { channel_id } = messages.try_recv().unwrap() else {
-            panic!("expected replacement credit")
-        };
+        let channel_id = expect_create_data(&mut messages);
         drop(session.attach(&channel_id, &[1]).unwrap());
         assert!(caller.await.is_err());
         assert_eq!(peer.active.count(), 0);
@@ -520,8 +504,7 @@ mod tests {
             io::ErrorKind::WouldBlock
         );
         assert!(!session.stop.is_cancelled());
-        tasks.abort_all();
-        while tasks.join_next().await.is_some() {}
+        tasks.shutdown().await;
         session.request_data(&peer).unwrap();
         assert_eq!(peer.active.count(), 0);
         assert_eq!(peer.pending.count(), 0);
@@ -538,9 +521,7 @@ mod tests {
         });
         tokio::task::yield_now().await;
         session.request_data(&peer).unwrap();
-        let Message::CreateData { channel_id } = messages.try_recv().unwrap() else {
-            panic!()
-        };
+        let channel_id = expect_create_data(&mut messages);
         tokio::time::advance(Duration::from_secs(11)).await;
         session.request_data(&peer).unwrap();
         let failures = session.state.lock().as_ref().unwrap().failures;

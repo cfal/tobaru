@@ -91,8 +91,7 @@ impl Client {
                 report_child(result);
             }
         }
-        data.abort_all();
-        while data.join_next().await.is_some() {}
+        data.shutdown().await;
         Ok(())
     }
 
@@ -129,32 +128,31 @@ impl Client {
             },
         )
         .await?;
-        match protocol::read(&mut io).await? {
-            Message::ControlReady {
-                session_id,
-                services,
-            } => {
-                if services
-                    .iter()
-                    .any(|name| !self.config.services.contains_key(name))
-                {
-                    return Err(invalid());
-                }
-                if services.len() != self.config.services.len() {
-                    log::warn!(
-                        "Tunnel client {} has exports not accepted by the hub",
-                        self.config.tunnel_client
-                    );
-                }
-                Ok(Control {
-                    io,
-                    address,
-                    session: session_id,
-                    accepted_services: services.into_iter().collect(),
-                })
-            }
-            _ => Err(invalid()),
+        let Message::ControlReady {
+            session_id,
+            services: accepted_services,
+        } = protocol::read(&mut io).await?
+        else {
+            return Err(invalid());
+        };
+        if accepted_services
+            .iter()
+            .any(|name| !self.config.services.contains_key(name))
+        {
+            return Err(invalid());
         }
+        if accepted_services.len() != self.config.services.len() {
+            log::warn!(
+                "Tunnel client {} has exports not accepted by the hub",
+                self.config.tunnel_client
+            );
+        }
+        Ok(Control {
+            io,
+            address,
+            session: session_id,
+            accepted_services: accepted_services.into_iter().collect(),
+        })
     }
 
     async fn session(self: &Arc<Self>, control: Control, data: &mut JoinSet<()>) -> io::Result<()> {
@@ -179,36 +177,30 @@ impl Client {
                         }
                     }
                     Some(Message::CreateData { channel_id }) => {
-                        let permits = self.sockets
-                            .acquire(self.config.max_data_connections)
-                            .and_then(|socket| self.data_setup_jobs.acquire(8).map(|job| (socket, job)));
-                        match permits {
-                            Ok((socket, job)) => {
-                                let client = self.clone();
-                                let work = Work {
-                                    address: control.address,
-                                    session: control.session.clone(),
-                                    channel: channel_id,
-                                    accepted_services: accepted_services.clone(),
-                                    stop: stop.clone(),
-                                    writer: pumps.outgoing.clone(),
-                                    socket,
-                                    job,
-                                    deadline: Instant::now() + Duration::from_secs(10),
-                                };
-                                data.spawn(async move {
-                                    client.data(work).await;
-                                });
+                        let Ok((socket, job)) = self.reserve_data_channel() else {
+                            if let Err(error) = pumps.send(Message::CreateFailed {
+                                channel_id,
+                                code: Code::Busy,
+                            }) {
+                                break Err(error);
                             }
-                            Err(_) => {
-                                if let Err(error) = pumps.send(Message::CreateFailed {
-                                    channel_id,
-                                    code: Code::Busy,
-                                }) {
-                                    break Err(error);
-                                }
-                            }
-                        }
+                            continue;
+                        };
+                        let client = self.clone();
+                        let work = Work {
+                            address: control.address,
+                            session: control.session.clone(),
+                            channel: channel_id,
+                            accepted_services: accepted_services.clone(),
+                            stop: stop.clone(),
+                            writer: pumps.outgoing.clone(),
+                            socket,
+                            job,
+                            deadline: Instant::now() + Duration::from_secs(10),
+                        };
+                        data.spawn(async move {
+                            client.data(work).await;
+                        });
                     }
                     _ => break Err(invalid()),
                 },
@@ -217,6 +209,12 @@ impl Client {
         stop.cancel();
         pumps.stop().await;
         result
+    }
+
+    fn reserve_data_channel(&self) -> io::Result<(Permit, Permit)> {
+        let socket = self.sockets.acquire(self.config.max_data_connections)?;
+        let job = self.data_setup_jobs.acquire(8)?;
+        Ok((socket, job))
     }
 
     async fn attach_data(
@@ -346,19 +344,8 @@ impl Client {
             _ = stop.wait() => return,
             result = setup => result,
         };
-        match result {
-            Ok((mut stream, mut backend, _active)) => {
-                if let Err(error) = crate::copy_bidirectional::copy_bidirectional(
-                    &mut stream,
-                    &mut *backend,
-                    false,
-                    false,
-                )
-                .await
-                {
-                    log::debug!("Tunnel local copy ended: {error}");
-                }
-            }
+        let (mut stream, mut backend, _active) = match result {
+            Ok(streams) => streams,
             Err(error) => {
                 log::debug!("Tunnel data setup failed: {error}");
                 if !attached
@@ -371,7 +358,14 @@ impl Client {
                 {
                     stop.cancel();
                 }
+                return;
             }
+        };
+        if let Err(error) =
+            crate::copy_bidirectional::copy_bidirectional(&mut stream, &mut *backend, false, false)
+                .await
+        {
+            log::debug!("Tunnel local copy ended: {error}");
         }
     }
 }
@@ -477,6 +471,87 @@ mod tests {
             Message::DataHello { .. }
         ));
         (task, stream, stop, receiver)
+    }
+
+    #[tokio::test]
+    async fn exhausted_data_limits_report_busy_without_leaking_permits() {
+        for sockets_full in [true, false] {
+            let (mut client, listener, tls) = harness().await;
+            Arc::get_mut(&mut client)
+                .unwrap()
+                .config
+                .max_data_connections = 1;
+            let held: Vec<_> = if sockets_full {
+                vec![client.sockets.acquire(1).unwrap()]
+            } else {
+                (0..8)
+                    .map(|_| client.data_setup_jobs.acquire(8).unwrap())
+                    .collect()
+            };
+            let (mut hub, agent) = timeout(Duration::from_secs(5), tls.pair()).await.unwrap();
+            let control = Control {
+                io: agent,
+                address: listener.local_addr().unwrap(),
+                session: Id::new(),
+                accepted_services: HashSet::from(["web".into()]),
+            };
+            let c = client.clone();
+            let task = tokio::spawn(async move {
+                let mut data = JoinSet::new();
+                let result = c.session(control, &mut data).await;
+                assert!(data.is_empty());
+                result
+            });
+            let channel_id = Id::new();
+            timeout(
+                Duration::from_secs(1),
+                protocol::write(
+                    &mut hub,
+                    &Message::CreateData {
+                        channel_id: channel_id.clone(),
+                    },
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(matches!(
+                timeout(Duration::from_secs(1), protocol::read(&mut hub))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                Message::CreateFailed { channel_id: failed, code: Code::Busy }
+                    if failed == channel_id
+            ));
+            assert_eq!(client.sockets.count(), usize::from(sockets_full));
+            assert_eq!(
+                client.data_setup_jobs.count(),
+                if sockets_full { 0 } else { 8 }
+            );
+            timeout(
+                Duration::from_secs(1),
+                protocol::write(&mut hub, &Message::Ping { nonce: 11 }),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(matches!(
+                timeout(Duration::from_secs(1), protocol::read(&mut hub))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                Message::Pong { nonce: 11 }
+            ));
+            client.gate.retire();
+            timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            drop(held);
+            assert_eq!(client.sockets.count(), 0);
+            assert_eq!(client.data_setup_jobs.count(), 0);
+        }
     }
 
     #[tokio::test]
@@ -638,17 +713,10 @@ mod tests {
     async fn origin_is_not_dialed_until_open_and_control_loss_preserves_copying() {
         let (mut client, listener, tls) = harness().await;
         let origin = TcpListener::bind("0.0.0.0:0").await.unwrap();
-        Arc::get_mut(&mut client)
-            .unwrap()
-            .config
-            .services
-            .get_mut("web")
-            .unwrap()
-            .location = serde_json::from_value(serde_json::json!(format!(
-            "127.0.0.1:{}",
-            origin.local_addr().unwrap().port()
-        )))
-        .unwrap();
+        let address = format!("127.0.0.1:{}", origin.local_addr().unwrap().port());
+        let config = &mut Arc::get_mut(&mut client).unwrap().config;
+        config.services.get_mut("web").unwrap().location =
+            serde_json::from_value(serde_json::json!(address)).unwrap();
         let (task, mut stream, stop, mut messages) = start_data(
             &client,
             &listener,

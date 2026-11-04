@@ -1,4 +1,4 @@
-use super::super::test_support::{harness, Tls};
+use super::super::test_support::{expect_create_data, harness, Tls};
 use super::*;
 use tokio::io::AsyncReadExt;
 
@@ -9,9 +9,7 @@ async fn channel(
 ) -> (Open, Channel, tokio_rustls::client::TlsStream<TcpStream>) {
     let (io, client) = Tls::new().pair().await;
     session.request_data(peer).unwrap();
-    let Message::CreateData { channel_id } = messages.try_recv().unwrap() else {
-        panic!("expected creation credit")
-    };
+    let channel_id = expect_create_data(messages);
     let accepted = peer.endpoint.accept().unwrap();
     let (credit, open) = session.attach(&channel_id, &[1]).unwrap();
     drop(credit._endpoint);
@@ -447,9 +445,7 @@ async fn authenticated_attachment_cannot_commit_after_retirement_or_replacement(
         });
         tokio::task::yield_now().await;
         session.request_data(&peer).unwrap();
-        let Message::CreateData { channel_id } = messages.try_recv().unwrap() else {
-            panic!()
-        };
+        let channel_id = expect_create_data(&mut messages);
         let server = Arc::new(Server {
             address: "0.0.0.0:0".parse().unwrap(),
             tls: tls.server,

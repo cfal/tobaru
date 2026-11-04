@@ -81,7 +81,7 @@ impl Store {
             gate: gate.clone(),
             tasks: Vec::new(),
         };
-        let mut names = HashSet::new();
+        let mut server_names = HashSet::new();
         let mut addresses: HashSet<_> = config
             .servers
             .iter()
@@ -90,7 +90,7 @@ impl Store {
             .collect();
         for server in &config.tunnel_servers {
             server.validate()?;
-            if !names.insert(&server.tunnel_server) || !addresses.insert(server.address) {
+            if !server_names.insert(&server.tunnel_server) || !addresses.insert(server.address) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "Duplicate tunnel server name or TCP listener",
@@ -138,10 +138,10 @@ impl Store {
             });
             prepared.tasks.push(Box::pin(runtime.run()));
         }
-        let mut names = HashSet::new();
+        let mut client_names = HashSet::new();
         for client in &config.tunnel_clients {
             client.validate()?;
-            if !names.insert(&client.tunnel_client) {
+            if !client_names.insert(&client.tunnel_client) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "Duplicate tunnel client name",
@@ -196,8 +196,7 @@ impl Prepared {
         .await
         .is_err()
         {
-            tasks.abort_all();
-            while tasks.join_next().await.is_some() {}
+            tasks.shutdown().await;
         }
         result
     }
