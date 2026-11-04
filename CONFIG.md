@@ -1072,8 +1072,8 @@ that trust localhost need explicit visitor authentication before exposure.
 
 Run `--dry-run` on both files before deployment. It validates references and TLS files
 without binding or dialing. Tunnel ingress uses a dedicated port and has no automatic
-iptables management. Configure host firewall restrictions separately. V1 requires one
-hub per client configuration, not multiple load-balanced hubs; UDP, multiplexing,
+iptables management. Configure host firewall restrictions separately. Each client
+configuration uses one hub, not multiple load-balanced hubs; UDP, multiplexing,
 HTTP-proxy egress, dynamic public binds, and failed-stream resumption are unsupported.
 
 ## Deprecated Fields
