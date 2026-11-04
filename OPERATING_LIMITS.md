@@ -56,12 +56,19 @@ limits; handshake limits cannot exceed the endpoint connection limit. `null` is 
 an unlimited opt-out. Configure the client's data cap at least as high as the hub's
 peer active budget, unless smaller local capacity is intentional.
 
+Defaults are fixed rather than clamped to other limits. Lowering an endpoint's
+`max_connections` below 32 also requires setting `max_handshakes`. Lowering a peer's
+`max_active_connections` below 32 requires setting `max_pending_opens`; lowering a
+client's `max_active_connections` below 16 requires setting
+`max_concurrent_local_dials`. Set each dependent limit no higher than its parent.
+
 Only the control connection is maintained without demand. Four creation credits and
 four concurrent agent data dials bound on-demand channel creation. Larger bursts
 wait for creation capacity; they cannot create an unbounded pending queue. Each
 authenticated attachment claims the oldest live queued open; an attachment with no
-remaining demand is closed. Credit expiry and failed creation use
-bounded backoff. Cached HTTP connections retain active leases between requests.
+remaining demand is closed. Expired credits pruned by the scheduler and reported
+creation failures use bounded backoff. An attachment presenting an expired credit
+is rejected without backoff. Cached HTTP connections retain active leases between requests.
 The peer's active limit is not an HTTP-request rate or stream count.
 
 Outer setup, including DNS, has a ten-second deadline; ingress additionally requires
@@ -85,8 +92,10 @@ limits accordingly. The handshake cap is not denial-of-service protection: unaut
 traffic can occupy it. Restrict the dedicated ingress port at the firewall where possible.
 
 Transient control loss closes unassigned data connections and fails unfinished opens, but established
-independent data streams can continue, including existing H1/H2 backend reuse. New
-physical opens fail promptly until a client registers again. No application request or
+independent data streams can continue, including existing H1/H2 backend reuse. An open
+becomes established when the hub accepts Ready and registers the socket under the
+current generation and session; its result may reach the caller after control loss.
+New physical opens fail promptly until a client registers again. No application request or
 failed TCP stream is replayed. Client reconnect uses exponential backoff with jitter,
 up to 60 seconds; only 60 seconds of stable connectivity resets it.
 
@@ -99,8 +108,10 @@ later without authority to dial. Socket shutdown cannot undo delivered applicati
 effects or erase bytes already buffered by higher layers. Direct-listener reload
 behavior is unchanged. There is no added graceful signal-shutdown facility.
 
-Use `RUST_LOG=info` for agent registration/reconnect and reload diagnostics, or `debug`
-for channel failures. A connected agent is not an origin health check. Existing HTTP
+Use `RUST_LOG=info` for agent registration/reconnect and reload diagnostics. Channel
+failures require `RUST_LOG=debug` and a debug-enabled build, such as `cargo build`.
+Release binaries compile out these debug messages regardless of `RUST_LOG`.
+A connected agent is not an origin health check. Existing HTTP
 failure behavior remains: H1 paths may close a connection while H2-related paths can
 produce gateway errors. There is no automatic fallback to another destination.
 

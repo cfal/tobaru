@@ -334,6 +334,7 @@ async fn serve_data(
         let _ = open.reply.send(Err(error));
         return Ok(());
     }
+    // Registration commits the open; later session closure leaves the stream alive.
     let revocation = {
         let mut gate = peer.gate.enter()?;
         let state = session.state.lock();
