@@ -15,7 +15,7 @@ export default defineConfig({
     head: [{ tag: 'meta', attrs: { name: 'tobaru-source-ref', content: sourceRef } }],
     sidebar: [
       { label: 'Start', items: ['index', 'start/installation', 'start/first-config', 'start/configuration-model', 'start/examples'] },
-      { label: 'Configuration', items: ['config/server', 'config/tcp', 'config/udp', 'config/ip-groups'] },
+      { label: 'Configuration', items: ['config/server', 'config/tcp', 'config/udp', 'config/ip-groups', 'config/reverse-tunnels'] },
       { label: 'TLS', items: ['tls/server', 'tls/client'] },
       { label: 'HTTP', items: ['http/routing', 'http/actions', 'http/http2'] },
       { label: 'Operations', items: ['operations/cli', 'operations/limits', 'operations/upgrading', 'operations/dependencies'] },

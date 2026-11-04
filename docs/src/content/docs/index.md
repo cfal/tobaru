@@ -18,6 +18,7 @@ allowlists, destinations, and reusable IP groups in one process.
 - [Install tobaru](/start/installation/) and run a [first configuration](/start/first-config/).
 - Learn the [configuration model](/start/configuration-model/) or copy a complete [example](/start/examples/).
 - Configure [TCP targets](/config/tcp/), [UDP forwarding](/config/udp/), and [IP groups](/config/ip-groups/).
+- Export named TCP/Unix services behind NAT with [reverse tunnels](/config/reverse-tunnels/).
 - Set up [incoming TLS](/tls/server/) and [outgoing TLS](/tls/client/), including certificate authentication.
 - Configure [HTTP routing](/http/routing/), [actions](/http/actions/), and [HTTP/2](/http/http2/).
 - Review [resource limits and deployment contracts](/operations/limits/) before exposing a listener.

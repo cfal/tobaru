@@ -16,11 +16,15 @@ OPTIONS:
 Configuration file changes, including atomic replacements, are debounced for
 three seconds while current listeners continue serving. Invalid replacement
 configuration retains the last-good listeners. Valid replacements stop and await
-old listener tasks before rebinding, so reload is not gapless. Existing TCP
+old listener tasks before rebinding, so reload is not gapless. Existing non-tunnel TCP
 sessions keep their old configuration until completion; UDP associations restart.
 Unexpected listener errors or panics exit the process nonzero. Bind and firewall
 failures also exit nonzero, including during reload. `--dry-run` does not verify
 that ports can be bound or firewall commands can succeed.
+
+Every successfully prepared reload closes all reverse-tunnel transports, including
+active streams, even for unrelated edits or unchanged saves. Invalid reloads leave
+them running. See [tunnel lifecycle and limits](/operations/limits/#reverse-tunnels).
 
 ## Examples
 
@@ -48,7 +52,7 @@ Configuration files are automatically watched for changes and reloaded without r
 
 Only configuration paths are watched, not TLS certificate/key files or static
 directory contents. After replacing certificate files, update a watched config
-file to prepare new TLS settings. Existing sessions retain the previous settings.
+file to prepare new TLS settings. Surviving sessions retain the previous settings.
 URL shortcuts are reconstructed on reload but have no file to watch themselves.
 
 ## Logging

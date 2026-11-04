@@ -1,0 +1,97 @@
+---
+title: Reverse tunnels
+description: Export named TCP and Unix services through outbound mutually authenticated TLS connections.
+---
+
+import { Code } from '@astrojs/starlight/components';
+import publicConfig from '../../../../../examples/reverse_tunnel_public.yml?raw';
+import clientConfig from '../../../../../examples/reverse_tunnel_client.yml?raw';
+
+A NAT-side `tunnel_client` opens an mTLS control connection to a public
+`tunnel_server`. Only the control connection is maintained without traffic. The server
+requests outbound data connections only for queued backend opens; no spare connections
+are prewarmed or retained. Each fresh physical backend pays the outbound TCP/mTLS setup
+cost. One data socket serves one physical backend connection and closes with it;
+HTTP keep-alive and H2 reuse do not allocate another data socket for every request.
+
+## Configuration
+
+Adapt the tracked examples for the public hub and NAT-side agent. Replace
+certificate paths and fingerprints, and review the visitor allowlist before exposure.
+
+<Code code={publicConfig} lang="yaml" title="examples/reverse_tunnel_public.yml" />
+
+A client-only file is valid:
+
+<Code code={clientConfig} lang="yaml" title="examples/reverse_tunnel_client.yml" />
+
+## Identity and authorization
+
+The public certificate must cover `public.example`. An explicit outer
+`client_tls.sni_hostname` overrides the address-derived identity. The agent leaf
+certificate can be self-signed: the hub pins the exact certificate and verifies
+possession of its private key. Obtain its SHA-256 fingerprint with:
+
+```sh
+openssl x509 -in /etc/tobaru/home.crt -noout -fingerprint -sha256
+```
+
+Use only the hexadecimal value after `=` in `client_fingerprints`. Compact,
+colon-separated, and space-separated forms are accepted. Multiple pins per peer
+permit key rotation; a pin cannot identify two peers on one hub. Control and data
+sockets must use the same leaf certificate within a session. Public-server pinning
+uses `client_tls.server_fingerprints`; `verify: false` requires nonempty valid pins.
+With `verify: true` and pins, both normal certificate verification and pinning apply.
+Both roles require certificates and keys. ALPN is fixed to `tobaru-reverse/2`; neither
+plaintext nor user-supplied tunnel ALPN is supported. Earlier experimental pooled
+peers using `/1` are incompatible: update hub and agent together and remove
+`idle_connections` from configuration, including explicit zero values.
+
+Names are case-sensitive ASCII letters, digits, `_`, or `-`, 1 to 64 bytes. The
+hub allows at most 128 peers and 32 services per peer; a client exports at most 32
+services. The accepted service set is the intersection of offered and authorized
+names. Extra offers produce a warning, not access. Public routes must resolve to
+authorized services during preparation; an offline client is not a config error.
+Role entries reject unknown fields. Tunnel references use object syntax only.
+
+Use the same `location.tunnel` object on a raw target to forward arbitrary TCP,
+including TLS passthrough. Exports accept physical TCP or Unix socket locations only;
+recursive tunnel locations and export-side `client_tls` are rejected. The public hub
+never supplies arbitrary origin addresses to an agent.
+
+## Origin TLS
+
+For origin TLS, set `client_tls` alongside `tunnel` inside the public location:
+
+```yaml
+location:
+  tunnel: {server: edge, peer: home, service: web}
+  client_tls:
+    verify: true
+    sni_hostname: origin.example
+```
+
+Origin TLS requires an explicit valid non-null `sni_hostname`. Its verification and
+ALPN are separate from the outer tunnel. Leave it disabled for visitor TLS passthrough.
+Target-level `tcp_nodelay`/`tcp_keepalive` do not propagate through tunnel locations;
+the carrier has fixed keepalive settings. Physical destinations and visitor sockets
+retain their existing option behavior.
+
+## Routing and deployment
+
+`replacement_path: /` retains current prefix stripping and redirect handling. No
+HTML, JavaScript, cookie, or additional URL rewriting is added. Configure the
+application's public base path, or use a dedicated hostname. H1-to-H1 Upgrade works;
+ordinary H2 CONNECT/extended CONNECT restrictions remain unchanged. mTLS authenticates
+the agent, not visitors, and the origin normally sees a local agent address. Applications
+that trust localhost need explicit visitor authentication before exposure.
+
+Run `--dry-run` on both files before deployment. It validates references and TLS files
+without binding or dialing. Tunnel ingress uses a dedicated port and has no automatic
+iptables management. Configure host firewall restrictions separately. Each client
+configuration uses one hub, not multiple load-balanced hubs; UDP, multiplexing,
+HTTP-proxy egress, dynamic public binds, and failed-stream resumption are unsupported.
+
+Valid reloads close all tunnel connections, including active streams. Invalid
+reloads retain the running configuration. Review the [tunnel limits and lifecycle
+contracts](/operations/limits/#reverse-tunnels) before deployment.
