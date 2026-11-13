@@ -78,6 +78,12 @@ http_action:
 
 Serves static files from a directory. MIME types are automatically detected.
 
+Missing files and directory indexes return 404. By default the response body is
+empty. Setting `not_found_content` supplies a plain-text body and
+`Content-Type: text/plain`; HEAD returns the same headers without a body.
+File `response_headers` do not apply to 404 responses, but the response ID header
+is retained. `tobaru static` sets `not_found_content` to `Not Found`.
+
 After route selection, the query is removed and the file path is percent-decoded.
 Decoded parent-directory segments and NUL bytes are rejected; names such as
 `report..final.txt` are allowed. Both the requested file and a directory's
@@ -89,6 +95,7 @@ replacement races.
 http_action:
   type: serve-directory
   path: /var/www/static            # Directory path (required)
+  not_found_content: "Not Found"   # Optional plain-text 404 body (default: absent)
   response_headers:                # Custom response headers
     Cache-Control: "max-age=3600"
   response_id_header_name: string  # Add a unique request ID header

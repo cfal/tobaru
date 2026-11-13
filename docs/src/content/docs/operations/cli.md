@@ -4,6 +4,7 @@ title: CLI and reload
 
 ```
 tobaru [OPTIONS] <CONFIG PATH or CONFIG URL> [CONFIG PATH or CONFIG URL] ...
+tobaru [OPTIONS] static [STATIC OPTIONS] [DIRECTORY]
 
 OPTIONS:
   -t, --threads NUM           Worker threads (default: auto-detected from CPU count)
@@ -25,6 +26,61 @@ that ports can be bound or firewall commands can succeed.
 Every successfully prepared reload closes all reverse-tunnel transports, including
 active streams, even for unrelated edits or unchanged saves. Invalid reloads leave
 them running. See [tunnel lifecycle and limits](/operations/limits/#reverse-tunnels).
+
+## Static File Server
+
+`tobaru static` serves files from the current directory at `http://127.0.0.1:8080/`,
+without a configuration file. An optional directory replaces the current directory.
+The root must exist and be a directory; invalid roots fail at startup.
+
+```sh
+tobaru static
+tobaru static -p 9000 -c 0 ./dist
+tobaru static -a 0.0.0.0 -p 8080
+tobaru -t 1 static --dry-run ./dist
+```
+
+| Option | Meaning |
+|--------|---------|
+| `-a`, `--address IP` | IPv4 or IPv6 literal; default `127.0.0.1`. Use `::1` for IPv6 loopback. Hostnames are not resolved. |
+| `-p`, `--port PORT` | Port from 0 through 65535; default 8080. Zero requests an available port. |
+| `-c`, `--cache SECONDS` | Nonnegative integer `Cache-Control` max-age in seconds; default 3600, like `static`/node-static. Zero sends `max-age=0`. |
+| `-t`, `--threads NUM` | Worker threads, as in configuration mode. |
+| `--dry-run` | Validate the directory and HTTP setup without binding a listener. |
+| `-h`, `--help` | Show static-server help. |
+| `--` | End options; useful for directory names beginning with `-`. |
+
+Options take separate values, for example `--cache 60`. Global `-t` and
+`--dry-run` may appear before or after `static`. Only one directory is accepted;
+configuration files/URLs and `--clear-iptables-*` cannot be combined with this mode.
+`static` is recognized only as the first positional argument. To load a configuration
+file literally named `static`, use `tobaru ./static`.
+
+The listener supports HTTP/1.1 and plaintext HTTP/2 prior knowledge using the
+existing [serve-directory action](/http/actions/#serve-directory). GET and HEAD
+serve files with MIME detection; directories serve `index.html`. Missing files
+and directories without an index return 404 with a `Not Found` body and
+`Content-Type: text/plain`; HEAD omits the body. There are no directory listings,
+SPA fallbacks, or trailing-slash redirects; use `/subdir/` when opening a directory
+index whose assets use relative URLs.
+
+Cache headers apply to successful file responses, including HEAD and directory
+indexes. `-c 0` makes responses immediately stale, which is useful during development;
+it does not prohibit storage. This shortcut does not add ETag, Last-Modified, or
+conditional 304 responses. Files are opened on each request, so edits need no
+restart, but browsers may retain fresh responses until the configured max-age
+expires. No configuration watcher is started.
+
+The `Listening (TCP): ADDRESS` line appears only after a successful bind and reports
+the actual port, including when `-p 0` was used. An occupied port fails with a nonzero
+exit rather than silently selecting another port. Stop the server with Ctrl-C.
+
+Non-loopback addresses warn but are honored. All source addresses are allowed,
+with no authentication, TLS, or built-in firewall rules. Every readable file
+inside the root, including `.env` and `.git` contents, may be served. Only expose
+trusted directories; the existing canonical containment checks do not eliminate
+concurrent symlink-replacement races. Use configuration files for access controls
+or TLS.
 
 ## Examples
 

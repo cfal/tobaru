@@ -2,6 +2,16 @@
 title: Upgrading
 ---
 
+## Static Server Command
+
+`tobaru static` now starts a config-free static file server. The exact first
+positional argument `static` is reserved for this command, even if a file with
+that name exists. Change `tobaru static` to `tobaru ./static` in scripts that
+previously loaded an extensionless configuration file named `static`.
+Other configuration paths and TCP/UDP URL shortcuts are unchanged.
+
+See [static server usage and exposure limits](/operations/cli/#static-file-server).
+
 ## Native Reverse Tunnels
 
 `tunnel_server`, `tunnel_client`, and object-form `location.tunnel` are opt-in additions.

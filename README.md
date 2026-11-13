@@ -31,6 +31,20 @@ this development revision. See [dependency details](https://tobaru-rs.github.io/
 
 ## Quick start
 
+Serve the current directory without a config file:
+
+```sh
+tobaru static
+# Use a different directory, port, and cache lifetime:
+tobaru static -p 9000 -c 0 ./dist
+```
+
+The default address is `127.0.0.1:8080`; `-a 0.0.0.0` exposes the directory to
+other hosts. Files, including dotfiles, are served without authentication or TLS.
+Directories use `index.html`, with no generated listings. `-c` sets the
+`Cache-Control` max-age in seconds (default: 3600). See the
+[static server reference](https://tobaru-rs.github.io/operations/cli/#static-file-server).
+
 Run the self-contained loopback example from this checkout:
 
 ```sh
