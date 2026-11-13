@@ -1514,6 +1514,15 @@ pub async fn static_http_server(
     if !address.ip().to_canonical().is_loopback() {
         warn!("Static server on {address} allows all source addresses with built-in firewall rules disabled; readable files, including dotfiles, are exposed without authentication or TLS");
     }
+    let default_http_action = HttpPathAction::ServeDirectory(HttpServeDirectoryConfig {
+        path: directory,
+        not_found_content: Some("Not Found".into()),
+        response_headers: HashMap::from([(
+            "Cache-Control".into(),
+            format!("max-age={cache_secs}"),
+        )]),
+        response_id_header_name: None,
+    });
     let target = TcpTargetConfig {
         allowlist: OneOrSome::One(IpMaskSelection::Literal(IpMask::all())),
         server_tls: None,
@@ -1524,15 +1533,7 @@ pub async fn static_http_server(
             http2: Box::default(),
             http_timeouts: HttpTimeouts::default(),
             http_paths: HashMap::new(),
-            default_http_action: HttpPathAction::ServeDirectory(HttpServeDirectoryConfig {
-                path: directory,
-                not_found_content: Some("Not Found".into()),
-                response_headers: HashMap::from([(
-                    "Cache-Control".into(),
-                    format!("max-age={cache_secs}"),
-                )]),
-                response_id_header_name: None,
-            }),
+            default_http_action,
         })),
     };
     Ok(ServerConfig {

@@ -33,7 +33,7 @@ pub struct ParseError {
     pub static_mode: bool,
 }
 
-fn value<T: FromStr>(
+fn set_option<T: FromStr>(
     args: &mut impl Iterator<Item = String>,
     slot: &mut Option<T>,
     name: &str,
@@ -65,7 +65,7 @@ fn parse_inner(
     let mut urls = Vec::new();
     let mut quick = None;
     let mut threads = None;
-    let mut iptables = false;
+    let mut saw_iptables = false;
     let mut address: Option<IpAddr> = None;
     let mut port = None;
     let mut cache_secs = None;
@@ -73,7 +73,7 @@ fn parse_inner(
     let mut positional_only = false;
 
     while let Some(arg) = args.next() {
-        if *static_mode && positional_only {
+        if *static_mode && (positional_only || !arg.starts_with('-')) {
             if directory.replace(arg).is_some() {
                 return Err("Only one static directory may be specified".into());
             }
@@ -89,14 +89,14 @@ fn parse_inner(
                 })
             }
             "-t" | "--threads" => {
-                value(&mut args, &mut threads, "thread count")?;
+                set_option(&mut args, &mut threads, "thread count")?;
                 if threads == Some(0) {
                     return Err("Cannot specify zero thread count".into());
                 }
             }
             "--dry-run" => quick = Some(QuickAction::DryRun),
             "--clear-iptables-all" | "--clear-iptables-matching" => {
-                iptables = true;
+                saw_iptables = true;
                 quick = Some(if arg == "--clear-iptables-all" {
                     QuickAction::ClearIptablesAll
                 } else {
@@ -104,25 +104,22 @@ fn parse_inner(
                 });
             }
             "static" if !*static_mode && paths.is_empty() && urls.is_empty() => *static_mode = true,
-            "-a" | "--address" if *static_mode => value(&mut args, &mut address, "IP address")?,
-            "-p" | "--port" if *static_mode => value(&mut args, &mut port, "port")?,
+            "-a" | "--address" if *static_mode => {
+                set_option(&mut args, &mut address, "IP address")?
+            }
+            "-p" | "--port" if *static_mode => set_option(&mut args, &mut port, "port")?,
             "-c" | "--cache" if *static_mode => {
-                value(&mut args, &mut cache_secs, "cache duration")?
+                set_option(&mut args, &mut cache_secs, "cache duration")?
             }
             "--" if *static_mode => positional_only = true,
             _ if arg.starts_with('-') => return Err(format!("Unknown argument: {arg}")),
-            _ if *static_mode => {
-                if directory.replace(arg).is_some() {
-                    return Err("Only one static directory may be specified".into());
-                }
-            }
             _ if arg.contains("://") => urls.push(arg),
             _ => paths.push(arg),
         }
     }
 
     let mode = if *static_mode {
-        if iptables {
+        if saw_iptables {
             return Err("Static mode cannot be combined with --clear-iptables-*".into());
         }
         Mode::Static {
@@ -206,10 +203,12 @@ mod tests {
                 }
             );
         }
-        assert!(
-            matches!(parse_args(&["static", "--", "-dist"]).unwrap().mode,
-            Mode::Static { directory, .. } if directory == "-dist")
-        );
+        for operand in ["-dist", "--help", "--", "static"] {
+            assert!(
+                matches!(parse_args(&["static", "--", operand]).unwrap().mode,
+                Mode::Static { directory, .. } if directory == operand)
+            );
+        }
         assert!(
             matches!(parse_args(&["static", "-p", "65535", "-c", "60"]).unwrap().mode,
             Mode::Static { address, cache_secs: 60, .. } if address.port() == 65535)
@@ -288,18 +287,56 @@ mod tests {
             (vec!["--help"], false),
             (vec!["static", "-h"], true),
             (vec!["-t", "1", "static", "--help"], true),
+            (vec!["static", "--clear-iptables-all", "--help"], true),
+            (vec!["--clear-iptables-matching", "static", "-h"], true),
         ] {
             assert_eq!(parse_args(&args).unwrap().mode, Mode::Help { static_mode });
         }
-        assert!(
-            parse_args(&["static", "-p", "invalid"])
-                .unwrap_err()
-                .static_mode
-        );
-        assert!(
-            !parse_args(&["config.yml", "--unknown"])
-                .unwrap_err()
-                .static_mode
-        );
+    }
+
+    #[test]
+    fn errors_preserve_argument_order_and_help_scope() {
+        for (args, message, static_mode) in [
+            (
+                vec!["static", "a", "b"],
+                "Only one static directory may be specified",
+                true,
+            ),
+            (
+                vec!["static", "--", "a", "--help"],
+                "Only one static directory may be specified",
+                true,
+            ),
+            (
+                vec!["static", "a", "--", "b"],
+                "Only one static directory may be specified",
+                true,
+            ),
+            (
+                vec!["static", "-p", "1", "--port"],
+                "port was already specified",
+                true,
+            ),
+            (
+                vec!["static", "-p", "invalid", "--help"],
+                "Invalid port: invalid",
+                true,
+            ),
+            (vec!["-t", "static"], "Invalid thread count: static", false),
+            (
+                vec!["config.yml", "--unknown", "--help"],
+                "Unknown argument: --unknown",
+                false,
+            ),
+            (
+                vec!["--clear-iptables-matching", "static", "--dry-run"],
+                "Static mode cannot be combined with --clear-iptables-*",
+                true,
+            ),
+        ] {
+            let error = parse_args(&args).unwrap_err();
+            assert_eq!(error.message, message, "{args:?}");
+            assert_eq!(error.static_mode, static_mode, "{args:?}");
+        }
     }
 }
