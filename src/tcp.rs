@@ -15,9 +15,9 @@ use tokio::time::{timeout, Duration};
 use crate::async_stream::AsyncStream;
 use crate::config::{
     AlpnValue, HttpForwardConfig, HttpHeaderPatch, HttpPathAction, HttpProtocol, HttpProtocols,
-    HttpServeDirectoryConfig, HttpServeMessageConfig, HttpTcpActionConfig, HttpTimeouts,
-    HttpValueMatch, IpMask, IpMaskSelection, Location, NetLocation, NoneOrOne, RawTcpActionConfig,
-    TcpAction, TcpKeepaliveConfig, TcpKeepaliveOption, TcpTargetConfig, TcpTargetLocation,
+    HttpServeMessageConfig, HttpTcpActionConfig, HttpTimeouts, HttpValueMatch, IpMask,
+    IpMaskSelection, Location, NetLocation, NoneOrOne, RawTcpActionConfig, TcpAction,
+    TcpKeepaliveConfig, TcpKeepaliveOption, TcpTargetConfig, TcpTargetLocation,
 };
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::iptables_util::{configure_iptables, Protocol};
@@ -252,17 +252,15 @@ impl TryFrom<HttpPathAction> for TargetHttpActionData {
                 response_headers,
                 response_id_header_name,
             },
-            HttpPathAction::ServeDirectory(HttpServeDirectoryConfig {
-                path,
-                not_found_content,
-                response_headers,
-                response_id_header_name,
-            }) => TargetHttpActionData::ServeDirectory {
-                path,
-                not_found_content,
-                response_headers,
-                response_id_header_name,
-            },
+            HttpPathAction::ServeDirectory(config) => {
+                config.validate_not_found().map_err(std::io::Error::other)?;
+                TargetHttpActionData::ServeDirectory {
+                    path: config.path,
+                    not_found_content: config.not_found_content,
+                    response_headers: config.response_headers,
+                    response_id_header_name: config.response_id_header_name,
+                }
+            }
             HttpPathAction::Forward(HttpForwardConfig {
                 upstream_protocol,
                 locations,

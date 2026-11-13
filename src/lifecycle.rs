@@ -619,6 +619,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn directory_not_found_preflight_respects_enabled_protocols() {
+        for protocols in [vec!["http1"], vec!["http2"], vec!["http1", "http2"]] {
+            for name in ["x-request-id", "keep-alive"] {
+                let config = serde_json::from_value(serde_json::json!({
+                    "address":"0.0.0.0:0", "transport":"tcp", "iptables":false,
+                    "target":{
+                        "allowlist":"127.0.0.1", "protocol":"http",
+                        "http_protocols":protocols,
+                        "default_http_action":{
+                            "type":"serve-directory", "path":".",
+                            "not_found_content":"Not Found", "response_id_header_name":name
+                        }
+                    }
+                }))
+                .unwrap();
+                let result = run_standalone(config, true).await;
+                assert_eq!(
+                    result.is_err(),
+                    name == "keep-alive" && protocols.contains(&"http2"),
+                    "{protocols:?}, {name}: {result:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn preflight_rejects_duplicate_masks_and_missing_tls_files() {
         for value in [
             serde_json::json!({"address":"127.0.0.1:1", "transport":"tcp", "target":{"allowlist":["127.0.0.1", "127.0.0.1"], "location":"127.0.0.1:2"}}),

@@ -83,6 +83,10 @@ empty. Setting `not_found_content` supplies a plain-text body and
 `Content-Type: text/plain`; HEAD returns the same headers without a body.
 File `response_headers` do not apply to 404 responses, but the response ID header
 is retained. `tobaru static` sets `not_found_content` to `Not Found`.
+When `not_found_content` is set, `response_id_header_name` cannot be `Content-Type`
+(case-insensitive). HTTP/2 preflight also checks the generated 404 headers,
+including the response ID, against HTTP/2 field restrictions and the configured
+header-list limit.
 
 After route selection, the query is removed and the file path is percent-decoded.
 Decoded parent-directory segments and NUL bytes are rejected; names such as

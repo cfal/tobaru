@@ -1,5 +1,6 @@
 use super::{
-    AlpnValue, HttpHeaderPatch, HttpPathAction, HttpProtocols, NoneOrSome, ServerTlsConfig,
+    AlpnValue, HttpHeaderPatch, HttpPathAction, HttpProtocols, HttpServeDirectoryConfig,
+    NoneOrSome, ServerTlsConfig,
 };
 
 impl HttpProtocols {
@@ -97,6 +98,20 @@ impl HttpHeaderPatch {
     }
 }
 
+impl HttpServeDirectoryConfig {
+    pub(crate) fn validate_not_found(&self) -> Result<(), String> {
+        if self.not_found_content.is_some() {
+            if let Some(name) = &self.response_id_header_name {
+                non_framing_header(name)?;
+                if name.eq_ignore_ascii_case("content-type") {
+                    return Err(format!("HTTP header is managed by the server: {name}"));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 impl HttpPathAction {
     pub(super) fn validate(&self) -> Result<(), String> {
         let id_names = match self {
@@ -115,6 +130,7 @@ impl HttpPathAction {
                 [None, config.response_id_header_name.as_deref()]
             }
             Self::ServeDirectory(config) => {
+                config.validate_not_found()?;
                 local_response_headers(&config.response_headers)?;
                 [None, config.response_id_header_name.as_deref()]
             }
@@ -304,6 +320,57 @@ mod tests {
                 "type":"serve-message", "status_code":status
             }))
             .is_err());
+        }
+    }
+
+    #[test]
+    fn directory_not_found_content_reserves_content_type_for_serde() {
+        for name in ["content-type", "Content-Type", "CONTENT-TYPE"] {
+            for content in [Some("Not Found"), Some(""), None] {
+                let result = serde_json::from_value::<HttpPathAction>(json!({
+                    "type":"serve-directory", "path":".",
+                    "not_found_content":content, "response_id_header_name":name
+                }));
+                if content.is_some() {
+                    assert!(result.is_err(), "{name}, {content:?}");
+                    assert!(result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("managed by the server"));
+                } else {
+                    assert!(result.is_ok());
+                }
+            }
+            assert!(serde_json::from_value::<HttpPathAction>(json!({
+                "type":"serve-directory", "path":".", "response_id_header_name":name
+            }))
+            .is_ok());
+        }
+    }
+
+    #[test]
+    fn directory_not_found_content_reserves_content_type_for_typed_configs() {
+        for name in [
+            "content-type",
+            "Content-Type",
+            "CONTENT-TYPE",
+            "x-request-id",
+        ] {
+            for content in [Some("Not Found"), Some(""), None] {
+                let config =
+                    HttpPathAction::ServeDirectory(super::super::HttpServeDirectoryConfig {
+                        path: ".".into(),
+                        not_found_content: content.map(str::to_owned),
+                        response_headers: Default::default(),
+                        response_id_header_name: Some(name.into()),
+                    });
+                let result = crate::tcp::TargetHttpActionData::try_from(config);
+                assert_eq!(
+                    result.is_err(),
+                    content.is_some() && name.eq_ignore_ascii_case("content-type"),
+                    "{name}, {content:?}"
+                );
+            }
         }
     }
 

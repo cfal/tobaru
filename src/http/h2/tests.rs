@@ -906,6 +906,65 @@ async fn local_bodyless_statuses_and_config_validation() {
 }
 
 #[tokio::test]
+async fn directory_not_found_preflight_validates_id_headers() {
+    for name in [
+        "keep-alive",
+        "Proxy-Connection",
+        "http2-settings",
+        "te",
+        "bad:name",
+        "",
+    ] {
+        for content in [Some("Not Found"), Some(""), None] {
+            let directory = TargetHttpActionData::ServeDirectory {
+                path: ".".into(),
+                not_found_content: content.map(str::to_owned),
+                response_headers: Default::default(),
+                response_id_header_name: Some(name.into()),
+            };
+            let http = runtime(directory, Http2Config::default(), None);
+            assert_eq!(
+                validate_config(&http).is_err(),
+                content.is_some(),
+                "{name}, {content:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn directory_not_found_preflight_counts_generated_headers() {
+    let config: Http2Config = serde_json::from_value(json!({"max_header_list_size":1024})).unwrap();
+    // 864 + (27-byte ID + 32 overhead) + (text/plain: 54) + (length: 47) = 1024.
+    for (name_len, accepted) in [(864, true), (865, false), (920, false)] {
+        for routed in [false, true] {
+            let directory = action(json!({
+                "type":"serve-directory", "path":".", "not_found_content":"Not Found",
+                "response_id_header_name":"x".repeat(name_len),
+                "response_headers":{"x-file-only":"f".repeat(950)}
+            }));
+            let mut http = runtime(TargetHttpActionData::CloseConnection, config, None);
+            if routed {
+                http.path_configs.insert(
+                    "/files".into(),
+                    vec![crate::tcp::TargetHttpPathData {
+                        required_request_headers: Default::default(),
+                        http_action: directory,
+                    }],
+                );
+            } else {
+                http.default_http_action = directory;
+            }
+            assert_eq!(
+                validate_config(&http).is_ok(),
+                accepted,
+                "{name_len}, routed: {routed}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn routing_uses_path_segments_and_ignores_queries() {
     checked(async {
         let message = |content| {

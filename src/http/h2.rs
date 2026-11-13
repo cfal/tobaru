@@ -84,8 +84,32 @@ pub(crate) fn validate_config(http: &HttpTargetData) -> std::io::Result<()> {
                 Some(response_headers)
             }
             TargetHttpActionData::ServeDirectory {
-                response_headers, ..
-            } => Some(response_headers),
+                not_found_content,
+                response_headers,
+                response_id_header_name,
+                ..
+            } => {
+                if let Some(content) = not_found_content {
+                    let longest_id = format!("{:x}#{}", u64::MAX, u32::MAX);
+                    let mut response = local_head(
+                        404,
+                        &Default::default(),
+                        response_id_header_name.as_deref(),
+                        &longest_id,
+                    )?;
+                    message::set(response.headers_mut(), "content-type", "text/plain")?;
+                    message::set(
+                        response.headers_mut(),
+                        "content-length",
+                        &content.len().to_string(),
+                    )?;
+                    message::validate_response(
+                        &mut response,
+                        http.http2.max_header_list_size.get() as usize,
+                    )?;
+                }
+                Some(response_headers)
+            }
             _ => None,
         };
         if let Some(fields) = fields {
