@@ -89,7 +89,11 @@ fn parse_inner(
                 })
             }
             "-t" | "--threads" => {
-                set_option(&mut args, &mut threads, "thread count")?;
+                if threads.is_some() {
+                    return Err("Thread count was already specified".into());
+                }
+                let value = args.next().ok_or("Missing thread count")?;
+                threads = Some(value.parse().map_err(|_| "Invalid thread count")?);
                 if threads == Some(0) {
                     return Err("Cannot specify zero thread count".into());
                 }
@@ -112,8 +116,8 @@ fn parse_inner(
                 set_option(&mut args, &mut cache_secs, "cache duration")?
             }
             "--" if *static_mode => positional_only = true,
+            _ if !*static_mode && arg.contains("://") => urls.push(arg),
             _ if arg.starts_with('-') => return Err(format!("Unknown argument: {arg}")),
-            _ if arg.contains("://") => urls.push(arg),
             _ => paths.push(arg),
         }
     }
@@ -282,6 +286,31 @@ mod tests {
     }
 
     #[test]
+    fn config_mode_preserves_legacy_thread_errors_and_url_classification() {
+        for (args, message) in [
+            (vec!["-t", "1", "-t"], "Thread count was already specified"),
+            (vec!["-t", "invalid"], "Invalid thread count"),
+            (vec!["--threads"], "Missing thread count"),
+            (vec!["--threads", "0"], "Cannot specify zero thread count"),
+        ] {
+            let error = parse_args(&args).unwrap_err();
+            assert_eq!(error.message, message);
+            assert!(!error.static_mode);
+        }
+        assert_eq!(
+            parse_args(&["--src=http://x", "static"]).unwrap().mode,
+            Mode::Config {
+                paths: vec!["static".into()],
+                urls: vec!["--src=http://x".into()],
+                quick: None,
+            }
+        );
+        let error = parse_args(&["static", "--src=http://x"]).unwrap_err();
+        assert_eq!(error.message, "Unknown argument: --src=http://x");
+        assert!(error.static_mode);
+    }
+
+    #[test]
     fn help_is_scoped_to_the_selected_mode() {
         for (args, static_mode) in [
             (vec!["--help"], false),
@@ -322,7 +351,7 @@ mod tests {
                 "Invalid port: invalid",
                 true,
             ),
-            (vec!["-t", "static"], "Invalid thread count: static", false),
+            (vec!["-t", "static"], "Invalid thread count", false),
             (
                 vec!["config.yml", "--unknown", "--help"],
                 "Unknown argument: --unknown",
