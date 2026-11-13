@@ -520,12 +520,25 @@ async fn directory_not_found_content_preserves_head_and_keepalive_framing() {
                     "response_id_header_name":"x-id"
                 }));
                 let (mut client, task) = session(default, Trie::new(), None);
-                for (method, connection) in [("HEAD", "keep-alive"), ("GET", "keep-alive"), ("GET", "close")] {
-                    client.write_all(format!("{method} {path} HTTP/1.1\r\nHost: a.test\r\nContent-Length: 3\r\nConnection: {connection}\r\n\r\nabc").as_bytes()).await.unwrap();
+                for (method, connection) in [
+                    ("HEAD", "keep-alive"),
+                    ("GET", "keep-alive"),
+                    ("GET", "close"),
+                ] {
+                    let request = format!(
+                        "{method} {path} HTTP/1.1\r\n\
+                         Host: a.test\r\n\
+                         Content-Length: 3\r\n\
+                         Connection: {connection}\r\n\r\nabc"
+                    );
+                    client.write_all(request.as_bytes()).await.unwrap();
                     let response = head(&mut client).await;
                     assert!(response.starts_with("HTTP/1.1 404\r\n"));
                     assert_eq!(values(&response, "content-type"), ["text/plain"]);
-                    assert_eq!(values(&response, "content-length"), [content.len().to_string()]);
+                    assert_eq!(
+                        values(&response, "content-length"),
+                        [content.len().to_string()]
+                    );
                     assert_eq!(values(&response, "connection"), [connection]);
                     assert!(!values(&response, "x-id").is_empty());
                     assert!(values(&response, "cache-control").is_empty());
@@ -539,7 +552,8 @@ async fn directory_not_found_content_preserves_head_and_keepalive_framing() {
                 task.finish().await;
             }
         }
-    }).await;
+    })
+    .await;
 }
 
 #[tokio::test]

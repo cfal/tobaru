@@ -76,6 +76,7 @@ function request(port, agent, method, path) {
 
 async function checkHttp2(port, cache) {
   const client = http2.connect(`http://127.0.0.1:${port}`);
+  const closed = new Promise(resolve => client.once('close', resolve));
   client.on('error', () => {});
   try {
     for (const [method, path, status, body] of [
@@ -84,12 +85,12 @@ async function checkHttp2(port, cache) {
       ['GET', '/empty/', 404, 'Not Found'], ['GET', '/not-file/', 404, 'Not Found'],
     ]) {
       const stream = client.request({ ':method': method, ':path': path }, { signal });
-      const response = once(stream, 'response', { signal });
       const chunks = [];
       stream.on('data', chunk => chunks.push(chunk));
-      const ended = once(stream, 'end', { signal });
-      const [headers] = await response;
-      await ended;
+      const [[headers]] = await Promise.all([
+        once(stream, 'response', { signal }),
+        once(stream, 'end', { signal }),
+      ]);
       assert.equal(headers[':status'], status);
       assert.equal(headers['cache-control'], status === 200 ? `max-age=${cache}` : undefined);
       assert.equal(headers['content-type'], status === 200 ? 'text/html' : 'text/plain');
@@ -97,7 +98,6 @@ async function checkHttp2(port, cache) {
       assert.equal(Buffer.concat(chunks).toString(), body);
     }
   } finally {
-    const closed = once(client, 'close');
     client.destroy();
     await closed;
   }
