@@ -177,6 +177,7 @@ try {
     });
   }
   await withServer(['-c', '0'], async (port, agent) => {
+    assert.equal((await request(port, agent, 'GET', '/')).body, 'index');
     writeFileSync(join(directory, 'index.html'), 'edited');
     assert.equal((await request(port, agent, 'GET', '/')).body, 'edited');
   });
