@@ -202,6 +202,7 @@ pub enum TargetHttpActionData {
     },
     ServeDirectory {
         path: String,
+        not_found_content: Option<String>,
         response_headers: HashMap<String, String>,
         response_id_header_name: Option<String>,
     },
@@ -253,10 +254,12 @@ impl TryFrom<HttpPathAction> for TargetHttpActionData {
             },
             HttpPathAction::ServeDirectory(HttpServeDirectoryConfig {
                 path,
+                not_found_content,
                 response_headers,
                 response_id_header_name,
             }) => TargetHttpActionData::ServeDirectory {
                 path,
+                not_found_content,
                 response_headers,
                 response_id_header_name,
             },

@@ -341,6 +341,7 @@ async fn local_response(
         ),
         TargetHttpActionData::ServeDirectory {
             path,
+            not_found_content,
             response_headers,
             response_id_header_name,
         } => {
@@ -364,51 +365,41 @@ async fn local_response(
             )?;
             let selected = local::resolve_file(path, &requested).await;
             let file = match selected {
-                Ok(path) if tokio::fs::metadata(&path).await?.is_file() => path,
-                Ok(_) => {
-                    return output
-                        .head(
-                            local_head(
-                                404,
-                                &Default::default(),
-                                response_id_header_name.as_deref(),
-                                id,
-                            )?,
-                            true,
-                        )
-                        .await
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    return output
-                        .head(
-                            local_head(
-                                404,
-                                &Default::default(),
-                                response_id_header_name.as_deref(),
-                                id,
-                            )?,
-                            true,
-                        )
-                        .await
-                }
+                Ok(path) if tokio::fs::metadata(&path).await?.is_file() => Some(path),
+                Ok(_) => None,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
                 Err(error) => return Err(error),
             };
-            let mut response = local_head(
-                200,
-                response_headers,
-                response_id_header_name.as_deref(),
-                id,
-            )?;
-            if !response.headers().contains_key("content-type") {
-                message::set(
-                    response.headers_mut(),
-                    "content-type",
-                    mime_guess::from_path(&file)
-                        .first_or_octet_stream()
-                        .essence_str(),
+            if let Some(file) = file {
+                let mut response = local_head(
+                    200,
+                    response_headers,
+                    response_id_header_name.as_deref(),
+                    id,
                 )?;
+                if !response.headers().contains_key("content-type") {
+                    message::set(
+                        response.headers_mut(),
+                        "content-type",
+                        mime_guess::from_path(&file)
+                            .first_or_octet_stream()
+                            .essence_str(),
+                    )?;
+                }
+                (response, Some(tokio::fs::File::open(file).await?), &b""[..])
+            } else {
+                let mut response = local_head(
+                    404,
+                    &Default::default(),
+                    response_id_header_name.as_deref(),
+                    id,
+                )?;
+                let Some(content) = not_found_content else {
+                    return output.head(response, true).await;
+                };
+                message::set(response.headers_mut(), "content-type", "text/plain")?;
+                (response, None, content.as_bytes())
             }
-            (response, Some(tokio::fs::File::open(file).await?), &b""[..])
         }
         _ => unreachable!(),
     };

@@ -80,6 +80,7 @@ impl Session<'_> {
         self.close_target().await;
         let TargetHttpActionData::ServeDirectory {
             path,
+            not_found_content,
             response_headers,
             response_id_header_name,
         } = request.action
@@ -124,6 +125,8 @@ impl Session<'_> {
                     close,
                     response_id_header_name.as_ref(),
                     &request.id,
+                    not_found_content.as_deref(),
+                    request.verb == "HEAD",
                 )
                 .await?;
                 info!(
@@ -152,6 +155,8 @@ impl Session<'_> {
                 close,
                 response_id_header_name.as_ref(),
                 &request.id,
+                not_found_content.as_deref(),
+                request.verb == "HEAD",
             )
             .await?;
             info!(
@@ -209,14 +214,24 @@ async fn write_not_found<W: AsyncWrite + Unpin>(
     close: bool,
     id_header: Option<&String>,
     request_id: &String,
+    content: Option<&str>,
+    head: bool,
 ) -> io::Result<()> {
-    let mut response = String::from("HTTP/1.1 404\r\ncontent-length: 0\r\n");
+    let body = content.unwrap_or_default().as_bytes();
+    let mut response = format!("HTTP/1.1 404\r\ncontent-length: {}\r\n", body.len());
+    if content.is_some() {
+        response.push_str("content-type: text/plain\r\n");
+    }
     response.push_str(connection_header(close));
     if let Some(name) = id_header {
         (name, request_id).append_header_to_string(&mut response);
     }
     response.push_str("\r\n");
-    write_all(stream, response.as_bytes()).await
+    write_all(stream, response.as_bytes()).await?;
+    if !head {
+        write_all(stream, body).await?;
+    }
+    Ok(())
 }
 
 async fn write_chunk<W: AsyncWrite + Unpin>(stream: &mut W, bytes: &[u8]) -> io::Result<()> {

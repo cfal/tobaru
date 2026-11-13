@@ -183,6 +183,59 @@ async fn local_get_head_expect_and_sibling_requests() {
 }
 
 #[tokio::test]
+async fn directory_not_found_content_is_opt_in_and_head_is_bodyless() {
+    checked(async {
+        let root = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap()
+            .join("tmp")
+            .join(format!("tobaru-missing-root-{}", std::process::id()));
+        assert!(!root.exists());
+        for content in [None, Some("Not Found"), Some(""), Some("missing \u{2603}")] {
+            let (mut client, _driver, _server) = frontend(action(json!({
+                "type":"serve-directory", "path":root,
+                "not_found_content":content,
+                "response_headers":{"cache-control":"max-age=3600"},
+                "response_id_header_name":"x-id"
+            })))
+            .await;
+            for method in ["GET", "HEAD", "GET"] {
+                let request = Request::builder()
+                    .method(method)
+                    .uri("https://example.test/missing")
+                    .body(())
+                    .unwrap();
+                let (response, _) = client.send_request(request, true).unwrap();
+                let response = response.await.unwrap();
+                assert_eq!(response.status(), 404);
+                assert!(response.headers().contains_key("x-id"));
+                assert!(!response.headers().contains_key("cache-control"));
+                if let Some(content) = content {
+                    assert_eq!(response.headers()["content-type"], "text/plain");
+                    assert_eq!(
+                        response.headers()["content-length"],
+                        content.len().to_string()
+                    );
+                } else {
+                    assert!(!response.headers().contains_key("content-type"));
+                    assert!(!response.headers().contains_key("content-length"));
+                }
+                let body = collect(response.into_body()).await.0;
+                assert_eq!(
+                    body,
+                    if method == "HEAD" {
+                        b""
+                    } else {
+                        content.unwrap_or_default().as_bytes()
+                    }
+                );
+            }
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn h2_to_h1_preserves_interim_cookies_binary_and_trailers() {
     checked(async {
     let (listener, addr) = backend().await;
