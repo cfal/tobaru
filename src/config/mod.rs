@@ -772,6 +772,8 @@ pub struct HttpServeMessageConfig {
 pub struct HttpServeDirectoryConfig {
     pub path: String,
     #[serde(default)]
+    pub not_found_content: Option<String>,
+    #[serde(default)]
     pub response_headers: HashMap<String, String>,
     #[serde(default)]
     pub response_id_header_name: Option<String>,
@@ -1489,6 +1491,61 @@ pub async fn load_runtime_config(
     }
 
     Ok(runtime)
+}
+
+pub async fn static_http_server(
+    address: SocketAddr,
+    directory: String,
+    cache_secs: u64,
+) -> std::io::Result<ServerConfig> {
+    let root = tokio::fs::canonicalize(&directory).await.map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("Cannot serve directory {directory:?}: {error}"),
+        )
+    })?;
+    if !tokio::fs::metadata(&root).await?.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("HTTP serving root is not a directory: {directory:?}"),
+        ));
+    }
+    log::info!("Serving directory: {}", root.display());
+    if !address.ip().to_canonical().is_loopback() {
+        warn!("Static server on {address} allows all source addresses with built-in firewall rules disabled; readable files, including dotfiles, are exposed without authentication or TLS");
+    }
+    let default_http_action = HttpPathAction::ServeDirectory(HttpServeDirectoryConfig {
+        path: directory,
+        not_found_content: Some("Not Found".into()),
+        response_headers: HashMap::from([(
+            "Cache-Control".into(),
+            format!("max-age={cache_secs}"),
+        )]),
+        response_id_header_name: None,
+    });
+    let target = TcpTargetConfig {
+        allowlist: OneOrSome::One(IpMaskSelection::Literal(IpMask::all())),
+        server_tls: None,
+        tcp_nodelay: true,
+        tcp_keepalive: TcpKeepaliveOption::default(),
+        action: TcpAction::Http(Box::new(HttpTcpActionConfig {
+            http_protocols: HttpProtocols::default(),
+            http2: Box::default(),
+            http_timeouts: HttpTimeouts::default(),
+            http_paths: HashMap::new(),
+            default_http_action,
+        })),
+    };
+    Ok(ServerConfig {
+        address,
+        use_iptables: false,
+        target_configs: TargetConfigs::Tcp {
+            tcp_max_connections: default_tcp_max_connections(),
+            tcp_nodelay: true,
+            tcp_keepalive: TcpKeepaliveOption::default(),
+            targets: Box::new(OneOrSome::One(target)),
+        },
+    })
 }
 
 pub async fn load_url(config_url: &str) -> std::io::Result<ServerConfig> {

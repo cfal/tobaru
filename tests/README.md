@@ -1,5 +1,21 @@
 # Protocol Tests
 
+The config-free static server has a standalone CLI suite:
+
+```sh
+CARGO_BUILD_JOBS=1 cargo build --locked
+node tests/static_cli.mjs target/debug/tobaru
+```
+
+It checks argument errors, optional roots, configuration-file name compatibility,
+GET/HEAD/index/MIME behavior and plain-text 404 bodies, cache headers (default, custom, and zero) over
+HTTP/1.1 and HTTP/2, traversal and symlink containment, file edits without reload,
+dry runs, non-loopback exposure warnings, and occupied-port failures. Listeners
+use ephemeral ports and fixtures live beneath `$HOME/tmp`; children and fixtures
+are cleaned up on success or failure. Default address and port are covered by
+the Rust parser tests. Node 22 or newer is required; no npm dependencies are needed.
+The optional binary argument defaults to `target/debug/tobaru`.
+
 The Rust suite includes deterministic protocol tests and local TCP, Unix, and
 TLS session tests:
 

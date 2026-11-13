@@ -1,4 +1,5 @@
 mod async_stream;
+mod cli;
 mod config;
 mod copy_bidirectional;
 mod domain_trie;
@@ -25,6 +26,9 @@ fn help_str(command: &str) -> String {
     const HELP_STR: &str = "USAGE:
 
     {} [OPTIONS] <CONFIG PATH or CONFIG URL> [CONFIG PATH or CONFIG URL] [..]
+    {} [OPTIONS] static [STATIC OPTIONS] [DIRECTORY]
+
+    Run '{} static --help' for config-free static file serving.
 
 OPTIONS:
 
@@ -67,12 +71,49 @@ EXAMPLES:
     HELP_STR.replace("{}", command)
 }
 
-fn print_help(command: &str, error: Option<&str>) -> ! {
+fn static_help_str(command: &str) -> String {
+    format!(
+        "USAGE:
+
+    {command} [OPTIONS] static [STATIC OPTIONS] [DIRECTORY]
+
+    Serve DIRECTORY (default: current directory) without a configuration file.
+
+STATIC OPTIONS:
+
+    -a, --address IP       Bind IP address (default: 127.0.0.1; IPv4 or IPv6).
+    -p, --port PORT        Listen port (default: 8080; 0 chooses an available port).
+    -c, --cache SECONDS    Cache-Control max-age (default: 3600; 0 is immediately stale).
+    -t, --threads NUM      Worker threads (default: auto-detected).
+    --dry-run              Validate the directory and server without binding.
+    -h, --help             Show this help screen.
+    --                     Treat remaining arguments as the directory name.
+
+    Files, including dotfiles, are served with no authentication or TLS.
+    Directories use index.html; there are no directory listings.
+    A config file named 'static' must be passed as './static'.
+
+EXAMPLES:
+
+    {command} static
+    {command} static -a 0.0.0.0 -p 9000 -c 0 ./dist
+"
+    )
+}
+
+fn print_help(command: &str, static_mode: bool, error: Option<&str>) -> ! {
     if let Some(s) = error {
         eprintln!("ERROR: {}", s);
         eprintln!();
     }
-    eprintln!("{}", help_str(command));
+    eprintln!(
+        "{}",
+        if static_mode {
+            static_help_str(command)
+        } else {
+            help_str(command)
+        }
+    );
     std::process::exit(if error.is_some() { 1 } else { 0 });
 }
 
@@ -110,64 +151,15 @@ fn main() {
         })
         .init();
 
-    let mut config_paths = vec![];
-    let mut config_urls = vec![];
-    let mut quick_action: Option<QuickAction> = None;
-    let mut num_threads: Option<usize> = None;
-
     let mut args = std::env::args();
     let command = args.next().unwrap();
-
-    while let Some(arg) = args.next() {
-        if arg == "--clear-iptables-all" {
-            quick_action = Some(QuickAction::ClearIptablesAll);
-        } else if arg == "--clear-iptables-matching" {
-            quick_action = Some(QuickAction::ClearIptablesMatching);
-        } else if arg == "--dry-run" {
-            quick_action = Some(QuickAction::DryRun);
-        } else if arg == "--threads" || arg == "-t" {
-            if num_threads.is_some() {
-                print_help(&command, Some("Thread count was already specified"))
-            }
-
-            let num_threads_str = match args.next() {
-                Some(s) => s,
-                None => {
-                    print_help(&command, Some("Missing thread count"));
-                }
-            };
-
-            let t = match num_threads_str.parse::<usize>() {
-                Ok(t) => t,
-                Err(_) => {
-                    print_help(&command, Some("Invalid thread count"));
-                }
-            };
-
-            if t == 0 {
-                print_help(&command, Some("Cannot specify zero thread count"));
-            }
-
-            num_threads = Some(t);
-        } else if arg.contains("://") {
-            config_urls.push(arg);
-        } else if arg == "--help" || arg == "-h" {
-            print_help(&command, None);
-        } else if arg.starts_with('-') {
-            print_help(&command, Some(&format!("Unknown argument: {}", arg)));
-        } else {
-            config_paths.push(arg);
-        }
+    let options = cli::parse(args)
+        .unwrap_or_else(|error| print_help(&command, error.static_mode, Some(&error.message)));
+    if let cli::Mode::Help { static_mode } = options.mode {
+        print_help(&command, static_mode, None);
     }
 
-    if config_urls.is_empty()
-        && config_paths.is_empty()
-        && quick_action != Some(QuickAction::ClearIptablesAll)
-    {
-        print_help(&command, Some("No config URLs or config paths specified"));
-    }
-
-    let num_threads = num_threads.unwrap_or_else(|| {
+    let num_threads = options.threads.unwrap_or_else(|| {
         std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(2)
@@ -189,7 +181,22 @@ fn main() {
         .build()
         .expect("Could not build tokio runtime");
 
-    if let Err(error) = runtime.block_on(lifecycle::run(config_paths, config_urls, quick_action)) {
+    let result = runtime.block_on(async {
+        match options.mode {
+            cli::Mode::Config { paths, urls, quick } => lifecycle::run(paths, urls, quick).await,
+            cli::Mode::Static {
+                address,
+                directory,
+                cache_secs,
+                dry_run,
+            } => {
+                let config = config::static_http_server(address, directory, cache_secs).await?;
+                lifecycle::run_standalone(config, dry_run).await
+            }
+            cli::Mode::Help { .. } => unreachable!(),
+        }
+    });
+    if let Err(error) = result {
         error!("{error}");
         std::process::exit(1);
     }

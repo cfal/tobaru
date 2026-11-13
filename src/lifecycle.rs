@@ -233,6 +233,26 @@ async fn clear_rules(addresses: &HashSet<SocketAddr>) -> io::Result<()> {
     Ok(())
 }
 
+pub async fn run_standalone(config: ServerConfig, dry_run: bool) -> io::Result<()> {
+    let tasks = prepare_servers(
+        vec![config],
+        &mut tcp::Admissions::default(),
+        &crate::tunnel::Registry::default(),
+    )
+    .await?;
+    if dry_run {
+        info!("Dry run complete");
+        return Ok(());
+    }
+    let mut servers = JoinSet::new();
+    // Retains the stop senders; dropping them would cancel the listeners.
+    let _stops = start_servers(tasks, &mut servers);
+    while let Some(result) = servers.join_next().await {
+        result.map_err(io::Error::other)??;
+    }
+    Ok(())
+}
+
 pub async fn run(
     paths: Vec<String>,
     urls: Vec<String>,
@@ -524,6 +544,104 @@ mod tests {
             &Event::new(EventKind::Access(notify::event::AccessKind::Any)).add_path(path),
             &paths
         ));
+    }
+
+    #[tokio::test]
+    async fn standalone_http_config_uses_validated_defaults_and_cache_headers() {
+        let files = WatchFiles::new();
+        for cache_secs in [0, 60, 3600] {
+            let config = config::static_http_server(
+                "127.0.0.1:0".parse().unwrap(),
+                files.0.to_str().unwrap().into(),
+                cache_secs,
+            )
+            .await
+            .unwrap();
+            assert!(!config.use_iptables);
+            let TargetConfigs::Tcp { targets, .. } = &config.target_configs else {
+                panic!("TCP expected")
+            };
+            let target = targets.iter().next().unwrap();
+            assert!(target.server_tls.is_none());
+            let Some(config::IpMaskSelection::Literal(mask)) = target.allowlist.iter().next()
+            else {
+                panic!("literal allowlist expected")
+            };
+            assert_eq!(mask.0, std::net::Ipv6Addr::UNSPECIFIED);
+            assert_eq!(mask.1, 0);
+            let config::TcpAction::Http(http) = &target.action else {
+                panic!("HTTP expected")
+            };
+            assert!(http.http_protocols.http1 && http.http_protocols.http2);
+            assert!(http.http_paths.is_empty());
+            let config::HttpPathAction::ServeDirectory(directory) = &http.default_http_action
+            else {
+                panic!("directory expected")
+            };
+            assert_eq!(
+                directory.response_headers["Cache-Control"],
+                format!("max-age={cache_secs}")
+            );
+            assert!(directory.response_id_header_name.is_none());
+            assert_eq!(directory.not_found_content.as_deref(), Some("Not Found"));
+            run_standalone(config, true).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn standalone_http_validates_roots_and_propagates_bind_failures() {
+        let files = WatchFiles::new();
+        let file = files.0.join("file");
+        std::fs::write(&file, "not a directory").unwrap();
+        for path in [file, files.0.join("missing")] {
+            assert!(config::static_http_server(
+                "127.0.0.1:0".parse().unwrap(),
+                path.to_str().unwrap().into(),
+                0
+            )
+            .await
+            .is_err());
+        }
+        let occupied = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let address = occupied.local_addr().unwrap();
+        let config = config::static_http_server(address, files.0.to_str().unwrap().into(), 0)
+            .await
+            .unwrap();
+        run_standalone(config.clone(), true).await.unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(5), run_standalone(config, false))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        assert!(error
+            .to_string()
+            .contains(&format!("Listener {address} failed:")));
+    }
+
+    #[tokio::test]
+    async fn directory_not_found_preflight_respects_enabled_protocols() {
+        for protocols in [vec!["http1"], vec!["http2"], vec!["http1", "http2"]] {
+            for name in ["x-request-id", "keep-alive"] {
+                let config = serde_json::from_value(serde_json::json!({
+                    "address":"0.0.0.0:0", "transport":"tcp", "iptables":false,
+                    "target":{
+                        "allowlist":"127.0.0.1", "protocol":"http",
+                        "http_protocols":protocols,
+                        "default_http_action":{
+                            "type":"serve-directory", "path":".",
+                            "not_found_content":"Not Found", "response_id_header_name":name
+                        }
+                    }
+                }))
+                .unwrap();
+                let result = run_standalone(config, true).await;
+                assert_eq!(
+                    result.is_err(),
+                    name == "keep-alive" && protocols.contains(&"http2"),
+                    "{protocols:?}, {name}: {result:?}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

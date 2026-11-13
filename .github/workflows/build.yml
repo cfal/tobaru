@@ -59,6 +59,10 @@ jobs:
         if: matrix.toolchain == 'stable'
         run: node tests/http_smoke.mjs target/debug/tobaru
 
+      - name: Run static server CLI smoke
+        if: matrix.toolchain == 'stable'
+        run: node tests/static_cli.mjs target/debug/tobaru
+
       - name: Run TCP routing smoke
         if: matrix.toolchain == 'stable'
         run: node tests/tcp_routing_smoke.mjs target/debug/tobaru
