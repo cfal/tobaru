@@ -1146,6 +1146,79 @@ async fn path_fragments_are_rejected_before_uri_normalization() {
 }
 
 #[tokio::test]
+async fn upstream_goaway_never_replays_or_discards_completed_responses() {
+    for h2_ingress in [false, true] {
+        for completed in [false, true] {
+            checked(async {
+                let (listener, addr) = backend().await;
+                let http = runtime(
+                    action(json!({"type":"forward", "upstream_protocol":"http2", "location":addr.to_string()})),
+                    Http2Config::default(),
+                    None,
+                );
+                let (reset_tx, reset_rx) = tokio::sync::oneshot::channel();
+                let mut frontend = Task(tokio::spawn(async move {
+                    if h2_ingress {
+                        let (mut client, _driver, _server) = configured_frontend(http).await;
+                        let (response, _) = client.send_request(
+                            Request::builder().uri("http://example.test/once").body(()).unwrap(),
+                            true,
+                        ).unwrap();
+                        reset_rx.await.unwrap();
+                        let response = response.await.unwrap();
+                        assert_eq!(response.status(), if completed { 200 } else { 502 });
+                        let data = collect(response.into_body()).await.0;
+                        assert_eq!(data, if completed { b"complete".as_slice() } else { b"" });
+                    } else {
+                        let (mut client, mut session) = super::forwarding::h1_frontend(http);
+                        client.write_all(b"GET /once HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n").await.unwrap();
+                        reset_rx.await.unwrap();
+                        let response = head(&mut client).await;
+                        assert!(response.starts_with(if completed { b"HTTP/1.1 200" } else { b"HTTP/1.1 502" }));
+                        if completed {
+                            assert_eq!(super::forwarding::chunked(&mut client).await.0, b"complete");
+                        }
+                        let mut rest = Vec::new();
+                        client.read_to_end(&mut rest).await.unwrap();
+                        assert!(rest.is_empty());
+                        let _ = (&mut session.0).await.unwrap();
+                    }
+                }));
+                let (mut io, _) = listener.accept().await.unwrap();
+                let mut preface = [0; 24];
+                io.read_exact(&mut preface).await.unwrap();
+                assert_eq!(preface, PREFACE);
+                let mut peer = Peer(io);
+                peer.frame(4, 0, 0, &[]).await;
+                let id = loop {
+                    let frame = peer.read().await.unwrap();
+                    if frame.kind == 1 {
+                        break frame.stream;
+                    }
+                };
+                if completed {
+                    peer.headers(id, &vec![field(b":status", b"200")], false).await;
+                    peer.frame(0, 1, id, b"complete").await;
+                }
+                let mut goaway = if completed { id } else { 0 }.to_be_bytes().to_vec();
+                goaway.extend_from_slice(&0x40u32.to_be_bytes());
+                goaway.extend_from_slice(b"backoff");
+                peer.frame(7, 0, 0, &goaway).await;
+                socket2::SockRef::from(&peer.0).set_linger(Some(Duration::ZERO)).unwrap();
+                drop(peer);
+                reset_tx.send(()).unwrap();
+                tokio::select! {
+                    biased;
+                    _ = listener.accept() => panic!("GOAWAY must not replay the request"),
+                    result = &mut frontend.0 => result.unwrap(),
+                }
+                assert!(tokio::time::timeout(Duration::from_millis(20), listener.accept()).await.is_err());
+            }).await;
+        }
+    }
+}
+
+#[tokio::test]
 async fn upstream_h2_trailers_enforce_validation_and_inclusive_limit() {
     let mut cases = vec![("oversized", vec![field(b"x-large", &vec![b'a'; 66000])])];
     for (name, over) in [("exact", 0), ("one over", 1)] {
