@@ -6,6 +6,7 @@ export default defineConfig({
   site: 'https://tobaru-rs.github.io',
   base: '/',
   trailingSlash: 'always',
+  scopedStyleStrategy: 'where',
   integrations: [starlight({
     title: 'tobaru',
     description: 'Configuration and operation of tobaru',
