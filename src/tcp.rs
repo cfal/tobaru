@@ -7,6 +7,7 @@ use futures::join;
 use ip_network_table_deps_treebitmap::IpLookupTable;
 use log::{debug, error, warn};
 use radix_trie::Trie;
+use rustls::pki_types::ServerName;
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream, UnixStream};
@@ -40,8 +41,7 @@ mod security_tests;
 
 pub struct TargetLocationData {
     pub location: Location,
-    pub tls_connector: Option<tokio_rustls::TlsConnector>,
-    pub sni_hostname: NoneOrOne<String>,
+    pub tls_connector: Option<(tokio_rustls::TlsConnector, ServerName<'static>)>,
     pub tunnel: Option<crate::tunnel::Binding>,
 }
 
@@ -67,7 +67,7 @@ impl TargetLocationData {
     ) -> std::io::Result<Self> {
         let mut target = Self::try_from(location)?;
         if protocol == crate::config::HttpProtocol::Http2 {
-            if let Some(connector) = &target.tls_connector {
+            if let Some((connector, _)) = &mut target.tls_connector {
                 let mut config = connector.config().as_ref().clone();
                 if !config.alpn_protocols.is_empty() && config.alpn_protocols != [b"h2".to_vec()] {
                     return Err(std::io::Error::other(
@@ -75,7 +75,7 @@ impl TargetLocationData {
                     ));
                 }
                 config.alpn_protocols = vec![b"h2".to_vec()];
-                target.tls_connector = Some(Arc::new(config).into());
+                *connector = Arc::new(config).into();
             }
         }
         Ok(target)
@@ -92,18 +92,6 @@ impl TryFrom<TcpTargetLocation> for TargetLocationData {
 
     fn try_from(tcp_target_location: TcpTargetLocation) -> std::io::Result<Self> {
         let (location, client_tls) = tcp_target_location.into_components();
-        if matches!(location, Location::Tunnel(_)) && client_tls.is_enabled() {
-            match client_tls.sni_hostname() {
-                NoneOrOne::One(name)
-                    if rustls::pki_types::ServerName::try_from(name.as_str()).is_ok() => {}
-                _ => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "Tunnel origin TLS requires an explicit valid sni_hostname",
-                    ))
-                }
-            }
-        }
 
         // Load client certificate if specified
         let client_cert = if client_tls.has_client_cert() {
@@ -120,9 +108,6 @@ impl TryFrom<TcpTargetLocation> for TargetLocationData {
             None
         };
 
-        // Extract SNI hostname
-        let sni_hostname = client_tls.sni_hostname().clone();
-
         // Extract and convert ALPN protocols to bytes
         let alpn_protocols: Vec<Vec<u8>> = client_tls
             .alpn_protocols()
@@ -137,13 +122,12 @@ impl TryFrom<TcpTargetLocation> for TargetLocationData {
 
         // Determine if SNI should be enabled
         // Only disable SNI when explicitly set to None (via YAML null)
-        let enable_sni = !matches!(sni_hostname, NoneOrOne::None);
+        let enable_sni = !matches!(client_tls.sni_hostname(), NoneOrOne::None);
 
         Ok(Self {
-            location,
             tunnel: None,
             tls_connector: if client_tls.is_enabled() {
-                Some(
+                Some((
                     crate::rustls_util::create_client_config_with_cert(
                         client_tls.should_verify(),
                         client_cert,
@@ -152,11 +136,12 @@ impl TryFrom<TcpTargetLocation> for TargetLocationData {
                         server_fingerprints,
                     )?
                     .into(),
-                )
+                    backend_server_name(&location, client_tls.sni_hostname())?,
+                ))
             } else {
                 None
             },
-            sni_hostname,
+            location,
         })
     }
 }
@@ -1085,43 +1070,40 @@ async fn run_stream_action_with_protocol(
     }
 }
 
-/// Resolves the TLS server name from the configured SNI hostname, falling back
-/// to parsing from `fallback_address` or using a dummy name.
-fn resolve_server_name(
+fn backend_server_name(
+    location: &Location,
     sni_hostname: &NoneOrOne<String>,
-    fallback_address: Option<&str>,
-) -> rustls::pki_types::ServerName<'static> {
-    let from_fallback = || {
-        fallback_address
-            .and_then(|addr| {
-                rustls::pki_types::ServerName::try_from(addr)
-                    .map(|s| s.to_owned())
-                    .ok()
-            })
-            .unwrap_or_else(get_dummy_server_name)
+) -> std::io::Result<ServerName<'static>> {
+    let name = match (sni_hostname, location) {
+        (NoneOrOne::One(name), _) => name,
+        (_, Location::Address(addr)) => &addr.address,
+        (_, Location::Path(_)) => return Ok(get_dummy_server_name()),
+        (_, Location::Tunnel(_)) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Tunnel origin TLS requires an explicit valid sni_hostname",
+            ));
+        }
     };
-
-    match sni_hostname {
-        NoneOrOne::One(sni) => rustls::pki_types::ServerName::try_from(sni.as_str())
-            .map(|s| s.to_owned())
-            .unwrap_or_else(|_| {
-                warn!("Invalid SNI hostname in config: {}, using fallback", sni);
-                from_fallback()
-            }),
-        NoneOrOne::None | NoneOrOne::Unspecified => from_fallback(),
-    }
+    ServerName::try_from(name.clone()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "Invalid backend TLS server name {name:?} for {:?}; configure a valid sni_hostname",
+                location.to_string()
+            ),
+        )
+    })
 }
 
 /// Wraps a stream with a TLS connector if present.
 async fn maybe_wrap_tls<S: AsyncStream + 'static>(
     stream: S,
     target_location: &TargetLocationData,
-    fallback_address: Option<&str>,
 ) -> std::io::Result<EstablishedStream> {
-    if let Some(ref connector) = target_location.tls_connector {
-        let server_name = resolve_server_name(&target_location.sni_hostname, fallback_address);
+    if let Some((connector, server_name)) = &target_location.tls_connector {
         let tls_stream = connector
-            .connect_with(server_name, stream, |server_conn| {
+            .connect_with(server_name.clone(), stream, |server_conn| {
                 server_conn.set_buffer_limit(Some(32768));
             })
             .await?;
@@ -1166,7 +1148,7 @@ pub async fn setup_http_target_stream(
             let deadline = tokio::time::Instant::now() + binding.setup_timeout();
             tokio::time::timeout_at(deadline, async {
                 let stream = binding.open(deadline).await?;
-                maybe_wrap_tls(stream, target_location, None).await
+                maybe_wrap_tls(stream, target_location).await
             })
             .await
             .map_err(|_| {
@@ -1199,7 +1181,7 @@ pub async fn setup_http_target_stream(
                 tcp_stream.local_addr()
             );
 
-            maybe_wrap_tls(tcp_stream, target_location, Some(address.as_str())).await
+            maybe_wrap_tls(tcp_stream, target_location).await
         }
         Location::Path(ref path_buf) => {
             let unix_stream = UnixStream::connect(path_buf.as_path()).await?;
@@ -1209,7 +1191,7 @@ pub async fn setup_http_target_stream(
                 unix_stream.local_addr()
             );
 
-            maybe_wrap_tls(unix_stream, target_location, None).await
+            maybe_wrap_tls(unix_stream, target_location).await
         }
     }
 }

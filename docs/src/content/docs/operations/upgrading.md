@@ -2,6 +2,27 @@
 title: Upgrading
 ---
 
+## Backend TLS and URL shortcuts
+
+The [updated bundled trust store](https://github.com/rustls/webpki-roots/releases/tag/v/1.0.12)
+removes six TLS trust anchors: Buypass Class 2 and Class 3, Certigna Root CA,
+DigiCert Trusted Root G4, and QuoVadis Root CA 1 G3 and 3 G3. A backend whose
+only valid chain ends at a removed root needs a chain to a retained root.
+Keep certificate verification enabled; a configured pin does not override it.
+
+Check backend TLS names with `--dry-run`. An invalid explicit name no longer
+falls back to the network address, and an invalid address-derived name no
+longer falls back to a placeholder. Configure a valid `client_tls.sni_hostname`
+matching the certificate when the dial address is not the TLS identity.
+The same DNS restriction applies to a reverse-tunnel agent's hub identity:
+a final hexadecimal-number label such as `backend.0xff` is rejected. On an
+incoming TLS-termination route, `--dry-run` checks the configuration but not
+the client's SNI. A client sending such a name cannot complete the handshake.
+TLS passthrough still routes the original ClientHello without terminating it.
+
+For TCP/UDP URL shortcuts, use `?` before the target query; a backslash directly
+after the bind port is no longer accepted.
+
 ## Static Server Command
 
 `tobaru static` now starts a config-free static file server. The exact first

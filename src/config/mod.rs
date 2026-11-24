@@ -1741,6 +1741,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shortcut_ports_cannot_end_with_a_backslash() {
+        for scheme in ["tcp", "udp"] {
+            let error = load_url(&format!(
+                r"{scheme}://127.0.0.1:9000\path?target=127.0.0.1:80"
+            ))
+            .await
+            .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        }
+    }
+
+    #[tokio::test]
     async fn url_queries_are_decoded_once_and_reject_invalid_utf8() {
         for scheme in ["tcp", "udp"] {
             for query in ["target=%FF", "target=%C3%28", "%FF=localhost:80"] {

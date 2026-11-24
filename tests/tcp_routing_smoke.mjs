@@ -151,6 +151,12 @@ try {
   assert.equal(await tlsResponse(mainPort, 'secure.example'), 'plain');
   assert.equal(await tlsResponse(mainPort, undefined), 'raw');
   assert.equal(await tlsResponse(catchAllPort, 'other.example'), 'plain');
+  const invalidSni = track(tls.connect({
+    host: '127.0.0.1', port: catchAllPort, servername: 'app.0xff', rejectUnauthorized: false,
+  }));
+  await assert.rejects(once(invalidSni, 'secureConnect', { signal }),
+    error => error.code === 'ECONNRESET' || /illegal parameter/i.test(error.message));
+  assert.equal(await tlsResponse(ancestorsPort, 'app.0xff', ['h2']), 'passthrough');
   assert.equal(await tlsResponse(catchAllPort, undefined), 'plain');
   assert.equal(await tlsResponse(catchAllPort, 'specific.example', ['h2']), 'passthrough');
   assert.equal(await tlsResponse(ancestorsPort, 'api.example.com', ['h2']), 'passthrough');

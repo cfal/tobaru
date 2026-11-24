@@ -22,12 +22,125 @@ fn raw_target(address: SocketAddr) -> Arc<TargetData> {
             location_data: vec![TargetLocationData {
                 location: Location::Address(address.to_string().as_str().try_into().unwrap()),
                 tls_connector: None,
-                sni_hostname: NoneOrOne::Unspecified,
                 tunnel: None,
             }],
             next_address_index: AtomicUsize::new(0),
         },
     })
+}
+
+#[test]
+fn preparation_does_not_substitute_backend_tls_identities() {
+    use serde_json::json;
+
+    let prepare = |cfg| {
+        TargetLocationData::try_from(serde_json::from_value::<TcpTargetLocation>(cfg).unwrap())
+    };
+    for cfg in [
+        json!({"address":"127.0.0.1:443","client_tls":{"sni_hostname":"backend.0xff"}}),
+        json!({"address":"backend.0xff:443","client_tls":true}),
+        json!({"address":"backend.0xff:443","client_tls":{"sni_hostname":null}}),
+        json!({"path":"/backend.sock","client_tls":{"sni_hostname":"backend.0xff"}}),
+        json!({"tunnel":{"server":"hub","peer":"peer","service":"svc"},
+               "client_tls":{"sni_hostname":"backend.0xff"}}),
+    ] {
+        assert!(matches!(prepare(cfg), Err(e) if e.kind() == std::io::ErrorKind::InvalidInput));
+    }
+    let (connector, name) = prepare(json!({
+        "address":"backend.0xff:443","client_tls":{"sni_hostname":"backend.example."}
+    }))
+    .unwrap()
+    .tls_connector
+    .unwrap();
+    assert!(connector.config().enable_sni);
+    assert_eq!(name.to_str(), "backend.example");
+
+    let (connector, name) = prepare(json!({
+        "address":"[::1]:443","client_tls":{"sni_hostname":null}
+    }))
+    .unwrap()
+    .tls_connector
+    .unwrap();
+    assert!(!connector.config().enable_sni);
+    assert_eq!(name, ServerName::from(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+
+    for (tls, sends_sni) in [(json!(true), true), (json!({"sni_hostname":null}), false)] {
+        let (connector, name) = prepare(json!({"path":"/backend.sock", "client_tls":tls}))
+            .unwrap()
+            .tls_connector
+            .unwrap();
+        assert_eq!(connector.config().enable_sni, sends_sni);
+        assert_eq!(name, get_dummy_server_name());
+    }
+}
+
+#[tokio::test]
+async fn h2_backend_verifies_the_prepared_name_even_without_wire_sni() {
+    let identity = rcgen::generate_simple_self_signed(vec!["backend.example".into()]).unwrap();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(identity.cert.der().clone()).unwrap();
+    let roots = Arc::new(roots);
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(
+        create_server_config(
+            vec![identity.cert.der().clone()],
+            &load_private_key(identity.signing_key.serialize_pem().as_bytes()).unwrap(),
+            vec![b"h2".to_vec()],
+            &[],
+            &[],
+        )
+        .unwrap(),
+    ));
+    for (address, sni, matches_cert) in [
+        ("backend.example:443", None, true),
+        ("other.example:443", None, false),
+        ("other.example:443", Some("backend.example."), true),
+    ] {
+        let location = serde_json::from_value(serde_json::json!({
+            "address": address, "client_tls": {"sni_hostname": sni}
+        }))
+        .unwrap();
+        let mut target = TargetLocationData::for_http(location, HttpProtocol::Http2).unwrap();
+        let (connector, _) = target.tls_connector.as_mut().unwrap();
+        let mut config = connector.config().as_ref().clone();
+        let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+            roots.clone(),
+            config.crypto_provider().clone(),
+        )
+        .build()
+        .unwrap();
+        config.dangerous().set_certificate_verifier(verifier);
+        *connector = Arc::new(config).into();
+
+        let (client_io, server_io) = UnixStream::pair().unwrap();
+        let (client, server) = timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                maybe_wrap_tls(client_io, &target),
+                acceptor.accept(server_io)
+            )
+        })
+        .await
+        .unwrap();
+        if matches_cert {
+            assert_eq!(client.unwrap().negotiated_alpn.as_deref(), Some(&b"h2"[..]));
+            assert_eq!(
+                server.unwrap().get_ref().1.server_name(),
+                sni.map(|s| s.trim_end_matches('.'))
+            );
+        } else {
+            let error = client.err().expect("wrong-name certificate accepted");
+            assert!(
+                matches!(
+                    error
+                        .get_ref()
+                        .and_then(|e| e.downcast_ref::<rustls::Error>()),
+                    Some(rustls::Error::InvalidCertificate(
+                        rustls::CertificateError::NotValidForNameContext { .. }
+                    ))
+                ),
+                "{error}"
+            );
+        }
+    }
 }
 
 fn tls_target(address: SocketAddr) -> TlsTargetData {
