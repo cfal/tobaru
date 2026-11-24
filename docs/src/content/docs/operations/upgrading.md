@@ -15,10 +15,10 @@ falls back to the network address, and an invalid address-derived name no
 longer falls back to a placeholder. Configure a valid `client_tls.sni_hostname`
 matching the certificate when the dial address is not the TLS identity.
 The same DNS restriction applies to a reverse-tunnel agent's hub identity:
-a final hexadecimal-number label such as `backend.0xff` is rejected. On an
-incoming TLS-termination route, `--dry-run` checks the configuration but not
-the client's SNI. A client sending such a name cannot complete the handshake.
-TLS passthrough still routes the original ClientHello without terminating it.
+a final hexadecimal-number label such as `backend.0xff` is rejected.
+`--dry-run` accepts such a name in an incoming `server_tls.sni_hostnames`
+route. A client sending that name can match the route, but cannot complete
+a TLS-termination handshake. TLS passthrough still forwards the original ClientHello.
 
 For TCP/UDP URL shortcuts, use `?` before the target query; a backslash directly
 after the bind port is no longer accepted.

@@ -46,6 +46,15 @@ fn preparation_does_not_substitute_backend_tls_identities() {
     ] {
         assert!(matches!(prepare(cfg), Err(e) if e.kind() == std::io::ErrorKind::InvalidInput));
     }
+    let error = prepare(json!({
+        "path":"/caf\u{e9}.sock","client_tls":{"sni_hostname":"caf\u{e9}.example"}
+    }))
+    .err()
+    .expect("invalid TLS name accepted");
+    assert_eq!(
+        error.to_string(),
+        r#"Invalid backend TLS server name "caf\u{e9}.example" for "/caf\u{e9}.sock"; configure a valid sni_hostname"#
+    );
     let (connector, name) = prepare(json!({
         "address":"backend.0xff:443","client_tls":{"sni_hostname":"backend.example."}
     }))

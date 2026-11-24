@@ -1089,8 +1089,9 @@ fn backend_server_name(
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
-                "Invalid backend TLS server name {name:?} for {:?}; configure a valid sni_hostname",
-                location.to_string()
+                "Invalid backend TLS server name \"{}\" for \"{}\"; configure a valid sni_hostname",
+                name.escape_default(),
+                location.to_string().escape_default()
             ),
         )
     })
