@@ -100,6 +100,8 @@ records, not only rejection of oversized record-length fields. The CLI's
 authentication-failure check counts raw backend TCP accepts, including connections
 whose TLS handshake never completes. It also verifies that auto-migrated optional
 TLS forwarding targets receive unmatched and malformed TLS at their raw backend.
+The same client SNI ending in a hexadecimal-number label must fail a terminated
+handshake but reach an independent TLS server on a passthrough route.
 
 Configuration CLI checks also require `openssl`. Preflight cases use `--dry-run`
 without binding listeners. They cover shortcut exposure diagnostics, CIDR

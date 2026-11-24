@@ -23,6 +23,11 @@ Explicit `sni_hostname: null` suppresses SNI but does not disable certificate
 verification. Set a hostname for a UNIX-socket TLS backend when its certificate
 needs hostname verification.
 
+An invalid explicit or address-derived TLS server name rejects the configuration;
+Tobaru does not retry verification under a different name. One trailing dot is
+accepted and removed. A final hexadecimal-number label such as `backend.0xff`
+is not a valid DNS identity.
+
 ## Shorthand Forms
 
 ```yaml
